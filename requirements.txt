@@ -1,0 +1,9 @@
+aiogram>=3.10
+aiosqlite
+apscheduler>=3.10
+google-genai
+aiohttp
+python-dotenv
+feedparser
+telethon
+beautifulsoup4
