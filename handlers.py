@@ -32,6 +32,7 @@ from keyboards import (
 )
 from parsers.hh_login import HHLoginManager
 from parsers.hh_resume import HHResumeManager, extract_text_from_pdf
+from ai_handler import extract_search_keywords_from_resume
 
 logger = logging.getLogger(__name__)
 
@@ -268,7 +269,7 @@ async def cb_preview_resume(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("select_res_"))
 async def cb_select_resume(callback: CallbackQuery):
-    """Выбор активного резюме с hh.ru для автооткликов."""
+    """Выбор активного резюме с hh.ru и автоматическая подстройка ключевых слов поиска через Gemini."""
     try:
         idx = int(callback.data.replace("select_res_", ""))
         user = await get_or_create_user(callback.from_user.id)
@@ -278,16 +279,26 @@ async def cb_select_resume(callback: CallbackQuery):
         
         if 0 <= idx < len(resumes_list):
             selected = resumes_list[idx]
+            
+            # Извлекаем динамические ключевые слова под выбранное резюме через Gemini 3.5 Flash Lite
+            ai_kw = extract_search_keywords_from_resume(user.get("resume_text", ""), selected["title"])
+            kw_setting = ", ".join(ai_kw) if ai_kw else user.get("keywords", "")
+
             await update_user_settings(
                 callback.from_user.id,
                 active_resume_url=selected["href"],
-                active_resume_title=selected["title"]
+                active_resume_title=selected["title"],
+                keywords=kw_setting
             )
             
             await callback.message.edit_reply_markup(
                 reply_markup=get_resume_inline_keyboard(resumes_list, selected_href=selected["href"])
             )
-            await callback.answer(f"✅ Резюме «{selected['title']}» выбрано основным для автооткликов!", show_alert=True)
+            
+            msg = f"✅ Резюме «{selected['title']}» выбрано основным!"
+            if ai_kw:
+                msg += f"\n🤖 ИИ сформировал ключевые слова поиска: {kw_setting}"
+            await callback.answer(msg, show_alert=True)
         else:
             await callback.answer("Резюме не найдено.", show_alert=True)
     except Exception as e:
@@ -459,6 +470,19 @@ async def cb_toggle_remote(callback: CallbackQuery):
     updated_user = await get_or_create_user(callback.from_user.id)
     await callback.message.edit_reply_markup(reply_markup=get_settings_inline_keyboard(updated_user))
     await callback.answer("Статус удаленки изменен!")
+
+
+@router.callback_query(F.data == "toggle_cover_letter")
+async def cb_toggle_cover_letter(callback: CallbackQuery):
+    """Переключение опции генерации сопроводительного письма."""
+    user = await get_or_create_user(callback.from_user.id)
+    new_cover = 0 if user.get("send_cover_letter", 1) else 1
+    await update_user_settings(callback.from_user.id, send_cover_letter=new_cover)
+    
+    updated_user = await get_or_create_user(callback.from_user.id)
+    await callback.message.edit_reply_markup(reply_markup=get_settings_inline_keyboard(updated_user))
+    status_text = "Включено (ИИ письмо)" if new_cover else "Выключено (отправляется точка .)"
+    await callback.answer(f"Сопроводительное письмо: {status_text}")
 
 
 @router.callback_query(F.data == "set_limit")

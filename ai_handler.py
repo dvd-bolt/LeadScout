@@ -107,3 +107,46 @@ def generate_hh_job_application(
             can_auto_submit=False,
             confidence_score=0.0
         )
+
+
+class SearchKeywordsPayload(BaseModel):
+    keywords: list[str] = Field(description="Список из 3-6 наиболее эффективных ключевых слов для поиска вакансий на hh.ru под данное резюме")
+
+
+def extract_search_keywords_from_resume(resume_text: str, resume_title: str = "") -> list[str]:
+    """
+    Использует gemini-3.5-flash-lite для динамического извлечения ключевых слов под конкретное резюме.
+    """
+    if not GEMINI_API_KEY or not resume_text:
+        return []
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        prompt = f"""
+Проанализируйте резюме соискателя и извлеките 3-6 самых целевых ключевых слов и названий ролей для поиска подходящих вакансий на hh.ru.
+Ключевые слова должны строго соответствовать специализации, стеку и роли в резюме.
+
+ЗАГОЛОВОК РЕЗЮМЕ:
+{resume_title}
+
+ТЕКСТ РЕЗЮМЕ:
+{resume_text[:2500]}
+"""
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=SearchKeywordsPayload,
+                temperature=0.1
+            )
+        )
+        result: SearchKeywordsPayload = response.parsed
+        if result and result.keywords:
+            clean_kw = [k.strip() for k in result.keywords if k.strip()]
+            logger.info("ИИ Gemini извлек ключевые слова для резюме '%s': %s", resume_title, clean_kw)
+            return clean_kw
+    except Exception as e:
+        logger.error("Ошибка при извлечении ключевых слов через Gemini: %s", e)
+
+    return []

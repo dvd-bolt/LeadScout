@@ -116,6 +116,7 @@ async def init_db() -> None:
             "active_resume_url TEXT DEFAULT ''",
             "active_resume_title TEXT DEFAULT ''",
             "auto_apply_enabled INTEGER DEFAULT 0",
+            "send_cover_letter INTEGER DEFAULT 1",
         ]
         for col_sql in columns_to_add:
             try:
@@ -177,7 +178,7 @@ async def update_user_settings(user_id: int, **kwargs) -> None:
     allowed_fields = {
         "resume_text", "session_status", "daily_limit", "applied_today",
         "min_salary", "only_remote", "stop_words", "keywords", "proxy_url", "hh_account",
-        "active_resume_url", "active_resume_title", "auto_apply_enabled"
+        "active_resume_url", "active_resume_title", "auto_apply_enabled", "send_cover_letter"
     }
     updates = []
     params = []

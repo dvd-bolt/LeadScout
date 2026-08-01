@@ -16,6 +16,7 @@ from database import (
     get_or_create_user,
     get_user_session,
     update_user_session,
+    update_user_settings,
     save_hh_apply,
     increment_applied_today,
     is_already_applied,
@@ -27,6 +28,8 @@ from keyboards import get_questionnaire_confirmation_keyboard
 from utils.security import SessionSecurityManager
 from parsers.hh_browser import HHBrowserEngine
 from parsers.hh_applicant import apply_to_hh_vacancy, submit_approved_questionnaire
+
+from ai_handler import extract_search_keywords_from_resume
 
 logger = logging.getLogger(__name__)
 
@@ -99,10 +102,21 @@ async def process_user_hh_applications(user_id: int) -> dict:
         context = await engine.create_context(storage_state=storage_state)
         search_tab = await context.new_page()
 
-        keywords_str = user.get("keywords", "Python")
+        # Динамическое ИИ-извлечение ключевых слов из текста резюме через Gemini 3.5 Flash Lite
+        keywords_str = user.get("keywords")
+        if not keywords_str or keywords_str.strip() in ["", "Python", "Python, Backend, FastAPI, Django"]:
+            resume_text = user.get("resume_text", "")
+            resume_title = user.get("active_resume_title", "")
+            ai_keywords = extract_search_keywords_from_resume(resume_text, resume_title)
+            if ai_keywords:
+                keywords_str = ", ".join(ai_keywords)
+                await update_user_settings(user_id, keywords=keywords_str)
+            else:
+                keywords_str = resume_title or "Python"
+
         kw_list = [k.strip() for k in keywords_str.split(",") if k.strip()]
         if not kw_list:
-            kw_list = ["Python"]
+            kw_list = [user.get("active_resume_title") or "Python"]
 
         stop_words = [w.strip().lower() for w in user.get("stop_words", "").split(",") if w.strip()]
 
@@ -110,25 +124,45 @@ async def process_user_hh_applications(user_id: int) -> dict:
         seen_urls_in_run = set()
 
         for kw in kw_list:
-            if user["applied_today"] >= user["daily_limit"]:
-                logger.info("Пользователь %d достиг суточного лимита (%d). Завершение.", user_id, user["daily_limit"])
+            urls_with_titles = []
+
+            # Проверка, не остановил ли пользователь автоотклик во время выполнения
+            current_user = await get_or_create_user(user_id)
+            if not current_user.get("auto_apply_enabled"):
+                logger.info("Пользователь %d остановил автоотклик. Прерывание работы воркера.", user_id)
+                break
+
+            if current_user["applied_today"] >= current_user["daily_limit"]:
+                logger.info("Пользователь %d достиг суточного лимита (%d). Завершение.", user_id, current_user["daily_limit"])
                 break
 
             encoded_kw = urllib.parse.quote_plus(kw)
 
             # Пагинация по страницам поисковой выдачи для каждого ключевого слова
             for page_num in range(3):
-                if user["applied_today"] >= user["daily_limit"]:
+                current_user = await get_or_create_user(user_id)
+                if not current_user.get("auto_apply_enabled"):
+                    logger.info("Пользователь %d остановил автоотклик. Выход из пагинации.", user_id)
+                    break
+
+                if current_user["applied_today"] >= current_user["daily_limit"]:
                     break
 
                 search_url = f"https://hh.ru/search/vacancy?text={encoded_kw}&order_by=publication_time&search_period=3&page={page_num}"
-                if user.get("min_salary"):
-                    search_url += f"&salary={user['min_salary']}&currency_code=RUR"
-                if user.get("only_remote"):
+                if current_user.get("min_salary"):
+                    search_url += f"&salary={current_user['min_salary']}&currency_code=RUR"
+                if current_user.get("only_remote"):
                     search_url += "&schedule=remote"
 
                 logger.info("Поиск вакансий по ключу '%s' (Стр. %d): %s", kw, page_num + 1, search_url)
-                await search_tab.goto(search_url, wait_until="domcontentloaded")
+                try:
+                    await search_tab.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+                except Exception as nav_err:
+                    logger.warning("Таймаут перехода на %s: %s. Повторная попытка...", search_url, nav_err)
+                    try:
+                        await search_tab.goto(search_url, wait_until="commit", timeout=15000)
+                    except Exception:
+                        continue
                 await search_tab.wait_for_timeout(1500)
 
                 # Перехват возможной инвалидации сессии
@@ -151,7 +185,6 @@ async def process_user_hh_applications(user_id: int) -> dict:
                     logger.info("На странице %d для ключевого слова '%s' больше нет вакансий.", page_num + 1, kw)
                     break
 
-                urls_with_titles = []
                 for link in vacancy_cards:
                     href = await link.get_attribute("href")
                     title = await link.text_content() or ""
@@ -162,7 +195,12 @@ async def process_user_hh_applications(user_id: int) -> dict:
                             urls_with_titles.append((clean_url, title.strip().lower()))
 
             for vacancy_url, vac_title_lower in urls_with_titles:
-                if user["applied_today"] >= user["daily_limit"]:
+                current_user = await get_or_create_user(user_id)
+                if not current_user.get("auto_apply_enabled"):
+                    logger.info("Пользователь %d остановил автоотклик во время обработки вакансий. Прерывание.", user_id)
+                    break
+
+                if current_user["applied_today"] >= current_user["daily_limit"]:
                     break
 
                 # 1. Ранняя фильтрация по стоп-словам
@@ -180,9 +218,10 @@ async def process_user_hh_applications(user_id: int) -> dict:
                 try:
                     status_code, cover_letter, extra = await apply_to_hh_vacancy(
                         page=vac_page,
-                        resume_context=user.get("resume_text", "Python разработчик с опытом."),
+                        resume_context=user.get("resume_text", "Разработчик с опытом."),
                         vacancy_url=vacancy_url,
-                        target_resume_title=user.get("active_resume_title")
+                        target_resume_title=user.get("active_resume_title"),
+                        send_cover_letter=bool(user.get("send_cover_letter", 1))
                     )
                 finally:
                     await vac_page.close()

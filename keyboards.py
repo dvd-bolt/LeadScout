@@ -23,12 +23,14 @@ def get_settings_inline_keyboard(user_data: dict) -> InlineKeyboardMarkup:
     """Инлайн-меню настроек hh.ru."""
     daily_limit = user_data.get("daily_limit", 50)
     remote_status = "✅ Да" if user_data.get("only_remote") else "❌ Нет"
+    cover_status = "✅ Вкл" if user_data.get("send_cover_letter", 1) else "❌ Выкл (только точка)"
     min_salary = user_data.get("min_salary", 0)
     proxy_url = "✅ Задан" if user_data.get("proxy_url") else "❌ Не задан"
 
     buttons = [
         [InlineKeyboardButton(text=f"🎯 Лимит/день: {daily_limit}", callback_data="set_limit")],
         [InlineKeyboardButton(text=f"🏡 Только удаленка: {remote_status}", callback_data="toggle_remote")],
+        [InlineKeyboardButton(text=f"✍️ Письмо к отклику: {cover_status}", callback_data="toggle_cover_letter")],
         [InlineKeyboardButton(text=f"💰 Мин. ЗП: {min_salary} ₽", callback_data="set_salary")],
         [InlineKeyboardButton(text=f"🌐 Прокси: {proxy_url}", callback_data="set_proxy")],
         [InlineKeyboardButton(text="📝 Ключевые слова поиска", callback_data="set_keywords")],
