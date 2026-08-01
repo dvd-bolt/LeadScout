@@ -40,6 +40,10 @@ DEFAULT_MIN_DELAY_SEC: int = 30
 DEFAULT_MAX_DELAY_SEC: int = 180
 DEFAULT_PROXY_URL: str | None = os.getenv("PROXY_URL", None)
 
+# Параметры мульти-аккаунтности и браузеров
+MAX_CONCURRENT_BROWSERS: int = int(os.getenv("MAX_CONCURRENT_BROWSERS", "2"))
+MAX_ACCOUNTS_PER_USER: int = int(os.getenv("MAX_ACCOUNTS_PER_USER", "5"))
+
 # Путь к хранилищу браузерных данных
 PLAYWRIGHT_DATA_DIR: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "browser_profiles")
 

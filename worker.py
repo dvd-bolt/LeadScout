@@ -34,6 +34,13 @@ from ai_handler import extract_search_keywords_from_resume
 logger = logging.getLogger(__name__)
 
 
+def _escape_md(text: str) -> str:
+    """Экранирует спецсимволы Markdown V1 для безопасной отправки в Telegram."""
+    for ch in ('_', '*', '`', '['):
+        text = text.replace(ch, f'\\{ch}')
+    return text
+
+
 def _is_redis_available(host: str = "127.0.0.1", port: int = 6379) -> bool:
     """Проверяет доступность порта Redis."""
     try:
@@ -247,17 +254,26 @@ async def process_user_hh_applications(user_id: int) -> dict:
                     if BOT_TOKEN:
                         company_name = extra.get("company", "Работодатель") if isinstance(extra, dict) else "Работодатель"
                         vac_title = extra.get("title", "Вакансия") if isinstance(extra, dict) else "Вакансия"
+                        safe_company = _escape_md(company_name)
+                        safe_title = _escape_md(vac_title)
+                        safe_letter = _escape_md((cover_letter or "")[:300])
                         
                         bot = Bot(token=BOT_TOKEN)
                         msg_text = (
-                            f"🎯 **Отклик отправлен в компанию {company_name}!**\n\n"
-                            f"📌 **Вакансия:** [{vac_title}]({vacancy_url})\n"
+                            f"🎯 *Отклик отправлен в компанию {safe_company}!*\n\n"
+                            f"📌 *Вакансия:* [{safe_title}]({vacancy_url})\n"
                             f"Статус: `{status_code}`\n"
                         )
                         if cover_letter:
-                            msg_text += f"\n📝 **Сопроводительное письмо:**\n`{cover_letter[:300]}...`"
+                            msg_text += f"\n📝 *Сопроводительное письмо:*\n{safe_letter}"
                         
-                        await bot.send_message(chat_id=user_id, text=msg_text, parse_mode="Markdown")
+                        try:
+                            await bot.send_message(chat_id=user_id, text=msg_text, parse_mode="Markdown")
+                        except Exception:
+                            plain = f"🎯 Отклик отправлен в компанию {company_name}!\n📌 Вакансия: {vac_title}\n{vacancy_url}\nСтатус: {status_code}"
+                            if cover_letter:
+                                plain += f"\n📝 Письмо: {(cover_letter or '')[:300]}"
+                            await bot.send_message(chat_id=user_id, text=plain)
                         await bot.session.close()
 
                     await asyncio.sleep(user.get("min_delay_sec", 30))
@@ -278,19 +294,29 @@ async def process_user_hh_applications(user_id: int) -> dict:
 
                     if BOT_TOKEN:
                         bot = Bot(token=BOT_TOKEN)
-                        q_text = "\n".join([f"• {q}" for q in questions[:3]])
+                        q_text = "\n".join([f"• {_escape_md(q)}" for q in questions[:3]])
+                        safe_v_title = _escape_md(v_title)
+                        safe_cl = _escape_md((cover_letter or '')[:250])
                         msg_text = (
-                            f"❓ **Требуется ваше подтверждение отклика!**\n\n"
-                            f"📌 **Вакансия:** [{v_title}]({vacancy_url})\n"
-                            f"❓ **Вопросы работодателя:**\n{q_text}\n\n"
-                            f"📝 **Предложенное письмо:**\n`{(cover_letter or '')[:250]}...`"
+                            f"❓ *Требуется ваше подтверждение отклика!*\n\n"
+                            f"📌 *Вакансия:* [{safe_v_title}]({vacancy_url})\n"
+                            f"❓ *Вопросы работодателя:*\n{q_text}\n\n"
+                            f"📝 *Предложенное письмо:*\n{safe_cl}"
                         )
-                        await bot.send_message(
-                            chat_id=user_id,
-                            text=msg_text,
-                            reply_markup=get_questionnaire_confirmation_keyboard(apply_id),
-                            parse_mode="Markdown"
-                        )
+                        try:
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=msg_text,
+                                reply_markup=get_questionnaire_confirmation_keyboard(apply_id),
+                                parse_mode="Markdown"
+                            )
+                        except Exception:
+                            plain = f"❓ Требуется подтверждение отклика!\n📌 Вакансия: {v_title}\n{vacancy_url}\n❓ Вопросы: {', '.join(questions[:3])}\n📝 Письмо: {(cover_letter or '')[:250]}"
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=plain,
+                                reply_markup=get_questionnaire_confirmation_keyboard(apply_id)
+                            )
                         await bot.session.close()
 
         # Обновляем сохраненные куки в шифрованном виде после работы
