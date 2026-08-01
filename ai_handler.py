@@ -1,112 +1,109 @@
 """
-LeadScout AI — Модуль интеграции с Google GenAI.
-Генерация персонализированных откликов через Gemini 3.1 Flash Lite.
+LeadScout AI — Модуль ИИ-интеграции с Google GenAI (gemini-3.5-flash-lite).
+Генерация персонализированных откликов на hh.ru, ответов на анкеты через Pydantic Structured Outputs.
 """
 
 import logging
 from pathlib import Path
-
+from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
-from config import GEMINI_API_KEY, GEMINI_MODEL, SYSTEM_PROMPT, RESUME_PATH
+from config import GEMINI_API_KEY, GEMINI_MODEL, HH_COVER_LETTER_SYSTEM_PROMPT, RESUME_PATH
 
 logger = logging.getLogger(__name__)
 
-# Кэш резюме (загружается один раз)
-_resume_cache: str | None = None
+
+class FormAnswer(BaseModel):
+    field_id: str = Field(description="Идентификатор или точный текст вопроса из анкеты работодателя")
+    answer_type: str = Field(description="Тип ответа: text, radio, checkbox")
+    value: str = Field(description="Значение ответа для ввода или точный текст опции выбора")
 
 
-def _load_resume() -> str:
-    """Загружает текст резюме из файла (с кэшированием)."""
-    global _resume_cache
-    if _resume_cache is not None:
-        return _resume_cache
-
-    resume_file = Path(RESUME_PATH)
-    if not resume_file.exists():
-        logger.warning("Файл резюме не найден: %s", RESUME_PATH)
-        _resume_cache = "Резюме не указано."
-        return _resume_cache
-
-    _resume_cache = resume_file.read_text(encoding="utf-8").strip()
-    logger.info("Резюме загружено из %s (%d символов)", RESUME_PATH, len(_resume_cache))
-    return _resume_cache
+class JobApplicationPayload(BaseModel):
+    is_relevant: bool = Field(description="True если вакансия строго соответствует профессии, стеку и направлению из резюме кандидата, иначе False")
+    relevance_reason: str = Field(description="Краткое обоснование релевантности или причины отклонения вакансии")
+    cover_letter: str = Field(description="Персонализированное сопроводительное письмо на русском языке (150-250 слов)")
+    answers: list[FormAnswer] = Field(default_factory=list, description="Список ответов на дополнительные вопросы анкеты")
+    can_auto_submit: bool = Field(description="True если все вопросы понятны и подтверждены резюме, False если требуется участие человека")
+    confidence_score: float = Field(description="Оценка уверенности модели от 0.0 до 1.0")
 
 
-async def generate_response(order_text: str) -> str:
+def generate_hh_job_application(
+    resume_context: str,
+    vacancy_description: str,
+    questions_list: list[str] | None = None
+) -> JobApplicationPayload:
     """
-    Генерирует отклик на фриланс-заказ с помощью Gemini.
-
-    Args:
-        order_text: Текст заказа (заголовок + описание).
-
-    Returns:
-        Текст персонализированного отклика или сообщение об ошибке.
+    Генерирует Pydantic-структурированный ответ для отклика на hh.ru с использованием gemini-3.5-flash-lite.
     """
+    if not questions_list:
+        questions_list = []
+
     if not GEMINI_API_KEY:
-        return "❌ Ошибка: GEMINI_API_KEY не задан в .env"
-
-    try:
-        resume = _load_resume()
-
-        user_prompt = (
-            f"--- РЕЗЮМЕ ИСПОЛНИТЕЛЯ ---\n{resume}\n\n"
-            f"--- ТЕКСТ ЗАКАЗА ---\n{order_text}\n\n"
-            f"Напиши отклик на этот заказ."
+        return JobApplicationPayload(
+            is_relevant=False,
+            relevance_reason="GEMINI_API_KEY не задан",
+            cover_letter="Ошибка: GEMINI_API_KEY не задан в .env",
+            answers=[],
+            can_auto_submit=False,
+            confidence_score=0.0
         )
-
-        client = genai.Client(api_key=GEMINI_API_KEY)
-
-        response = await client.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=user_prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                temperature=0.7,
-                max_output_tokens=1024,
-            ),
-        )
-
-        result = response.text
-        if not result:
-            return "❌ Gemini вернул пустой ответ."
-
-        logger.info("Отклик сгенерирован (%d символов)", len(result))
-        return result
-
-    except Exception as e:
-        logger.error("Ошибка генерации отклика: %s", e)
-        return f"❌ Ошибка генерации: {e}"
-
-
-async def estimate_market_price(title: str, description: str) -> str:
-    """Оценивает средний рыночный бюджет и сроки для задачи с помощью Gemini."""
-    if not GEMINI_API_KEY:
-        return "не определен"
-
-    prompt = (
-        f"Проанализируй заголовок и описание фриланс-задачи по программированию и напиши ориентировочный средний чек "
-        f"(реалистичную вилку цен на рынке в рублях или долларах) и примерные сроки выполнения. "
-        f"Ответь очень коротко, в одну строчку, строго в формате: 'ЦЕНА (СРОКИ)'. "
-        f"Например: '15 000 - 30 000 руб (3-5 дней)' или '500 - 1000$ (1-2 недели)'. "
-        f"Ничего лишнего не пиши, только эту строчку.\n\n"
-        f"Задача: {title}\n"
-        f"Описание: {description}"
-    )
 
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
-        response = await client.aio.models.generate_content(
+        
+        prompt = f"""
+Вы — строгий профессиональный HR-ассистент кандидата.Проанализируйте резюме кандидата и описание вакансии на hh.ru.
+
+РЕЗЮМЕ КАНДИДАТА:
+{resume_context}
+
+ОПИСАНИЕ ВАКАНСИИ:
+{vacancy_description}
+
+СПИСОК ВОПРОСОВ ИЗ АНКЕТЫ РАБОТОДАТЕЛЯ:
+{questions_list}
+
+ИНСТРУКЦИЯ ПО ОЦЕНКЕ РЕЛЕВАНТНОСТИ (ОЧЕНЬ ВАЖНО):
+1. Сначала определите, соответствует ли вакансия профессии и компетенциям из резюме кандидата.
+2. Если вакансия кардинально из другой сферы или требует другой стековой специализации (например, резюме Python/ML, а вакансия C++ драйверы, Бухгалтер, Дизайнер, QA тестер) — установите is_relevant = false и укажите причину в relevance_reason.
+3. Если вакансия релевантна (is_relevant = true) — сгенерируйте персонализированное сопроводительное письмо и дайте точные ответы на вопросы анкеты.
+4. Строго опирайтесь только на факты из резюме кандидата. Запрещено выдумывать несуществующие навыки, годы опыта или зарплатные ожидания.
+"""
+
+        response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                temperature=0.3,
-                max_output_tokens=80,
-            ),
+                response_mime_type="application/json",
+                response_schema=JobApplicationPayload,
+                temperature=0.2,
+                system_instruction=HH_COVER_LETTER_SYSTEM_PROMPT
+            )
         )
-        result = response.text.strip()
-        return result if result else "не определен"
+
+        result: JobApplicationPayload = response.parsed
+        if not result:
+            return JobApplicationPayload(
+                is_relevant=False,
+                relevance_reason="Пустой ответ от модели",
+                cover_letter="Ошибка: Модель вернула пустой ответ.",
+                answers=[],
+                can_auto_submit=False,
+                confidence_score=0.0
+            )
+
+        logger.info("Успешно сгенерирован отклик hh.ru через %s (уверенность: %.2f)", GEMINI_MODEL, result.confidence_score)
+        return result
+
     except Exception as e:
-        logger.error("Ошибка при оценке рыночного чека: %s", e)
-        return "не определен"
+        logger.error("Ошибка при генерации отклика hh.ru через Gemini: %s", e)
+        return JobApplicationPayload(
+            is_relevant=False,
+            relevance_reason=f"Ошибка модели: {e}",
+            cover_letter=f"Ошибка генерации: {e}",
+            answers=[],
+            can_auto_submit=False,
+            confidence_score=0.0
+        )

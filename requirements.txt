@@ -1,9 +1,16 @@
 aiogram>=3.10
 aiosqlite
 apscheduler>=3.10
-google-genai
+google-genai>=0.6.0
 aiohttp
 python-dotenv
 feedparser
 telethon
 beautifulsoup4
+patchright
+cryptography
+redis
+taskiq
+taskiq-redis
+pydantic>=2.0
+pypdf
