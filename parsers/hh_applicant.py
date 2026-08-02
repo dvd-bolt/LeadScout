@@ -107,7 +107,8 @@ async def apply_to_hh_vacancy(
     resume_context: str,
     vacancy_url: str,
     target_resume_title: str | None = None,
-    send_cover_letter: bool = True
+    send_cover_letter: bool = True,
+    stop_words: list[str] | None = None
 ) -> tuple[str, str | None, dict | None]:
     """
     Полный цикл автоматического отклика на вакансию hh.ru:
@@ -121,6 +122,13 @@ async def apply_to_hh_vacancy(
         await human_scroll(page, steps=3)
 
         vacancy_info = await extract_vacancy_details(page)
+
+        # Проверка стоп-слов в заголовке и описании до совершения отклика
+        if stop_words:
+            full_text = (vacancy_info.get("title", "") + " " + vacancy_info.get("description", "")).lower()
+            if any(sw in full_text for sw in stop_words):
+                logger.info("Вакансия %s пропущена из-за стоп-слова в описании/заголовке", vacancy_url)
+                return "SKIPPED_STOP_WORD", None, vacancy_info
         
         # Проверка, откликался ли пользователь ранее
         already_applied = page.locator('[data-qa="vacancy-response-link-view-topic"]').first

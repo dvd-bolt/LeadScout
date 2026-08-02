@@ -1,26 +1,29 @@
 """
 LeadScout AI — Асинхронный воркер Taskiq (Redis Broker / InMemory Broker Fallback).
-Выполняет фоновые задачи по браузерной автотизации hh.ru, первичной OTP-авторизации, автооткликам
+Выполняет фоновые задачи по браузерной автотизации hh.ru, автооткликам для мульти-аккаунтов
 и повторной отправке подтвержденных анкет из Telegram.
 """
 
 import asyncio
 import logging
 import json
+import random
 import socket
+import urllib.parse
 from taskiq import InMemoryBroker
 from aiogram import Bot
 
-from config import REDIS_URL, BOT_TOKEN
+from config import REDIS_URL, BOT_TOKEN, MAX_CONCURRENT_BROWSERS
 from database import (
     get_or_create_user,
-    get_user_session,
-    update_user_session,
-    update_user_settings,
-    save_hh_apply,
-    increment_applied_today,
-    is_already_applied,
-    save_pending_questionnaire,
+    get_user_accounts,
+    get_account_by_id,
+    update_account_session,
+    update_account_settings,
+    save_account_hh_apply,
+    increment_account_applied_today,
+    is_account_already_applied,
+    save_pending_questionnaire_account,
     get_pending_questionnaire,
     update_pending_questionnaire_status,
 )
@@ -28,10 +31,12 @@ from keyboards import get_questionnaire_confirmation_keyboard
 from utils.security import SessionSecurityManager
 from parsers.hh_browser import HHBrowserEngine
 from parsers.hh_applicant import apply_to_hh_vacancy, submit_approved_questionnaire
-
 from ai_handler import extract_search_keywords_from_resume
 
 logger = logging.getLogger(__name__)
+
+# Семафор контроля параллельных браузеров (по умолчанию 2 на 1 IP)
+browser_semaphore = asyncio.Semaphore(MAX_CONCURRENT_BROWSERS)
 
 
 def _escape_md(text: str) -> str:
@@ -70,270 +75,297 @@ else:
 security_mgr = SessionSecurityManager()
 
 
-import urllib.parse
+active_browsers_count = 0
 
 
 @broker.task
-async def process_user_hh_applications(user_id: int) -> dict:
+async def process_account_hh_applications(account_id: int) -> dict:
     """
-    Фоновая задача: запуск цикла поиска вакансий и откликов для конкретного пользователя hh.ru.
+    Фоновая задача: запуск цикла поиска вакансий и откликов для конкретного аккаунта hh.ru.
+    Работает под семафором (до 2 браузеров одновременно).
+    При 1 аккаунте запуск мгновенный (0 сек), при 2+ аккаунтах — рассинхронизация 5-15 сек.
     """
-    user = await get_or_create_user(user_id)
-    if user["session_status"] != "ACTIVE":
-        logger.info("Пользователь %d не авторизован в hh.ru (статус: %s). Пропуск.", user_id, user["session_status"])
+    global active_browsers_count
+    account = await get_account_by_id(account_id)
+    if not account:
+        logger.error("Аккаунт id=%d не найден в БД.", account_id)
+        return {"status": "NOT_FOUND"}
+
+    user_id = account["user_id"]
+    account_name = account.get("account_name") or account.get("phone_or_email") or f"ID {account_id}"
+
+    if account.get("session_status") != "ACTIVE":
+        logger.info("Аккаунт %s (user %d) не авторизован в hh.ru (статус: %s). Пропуск.", account_name, user_id, account.get("session_status"))
         return {"status": "SKIPPED_NOT_AUTHORIZED"}
 
-    if not user.get("auto_apply_enabled"):
-        logger.info("Автоотклик остановлен пользователем %d. Пропуск выполнения.", user_id)
+    if not account.get("auto_apply_enabled"):
+        logger.info("Автоотклик остановлен для аккаунта %s (user %d). Пропуск выполнения.", account_name, user_id)
         return {"status": "SKIPPED_STOPPED_BY_USER"}
 
-    if user["applied_today"] >= user["daily_limit"]:
-        logger.info("Пользователь %d достиг суточного лимита откликов (%d/%d).", user_id, user["applied_today"], user["daily_limit"])
+    if account.get("applied_today", 0) >= account.get("daily_limit", 50):
+        logger.info("Аккаунт %s (user %d) достиг суточного лимита откликов (%d/%d).", account_name, user_id, account["applied_today"], account["daily_limit"])
         return {"status": "SKIPPED_LIMIT_REACHED"}
 
-    encrypted_state, status = await get_user_session(user_id)
+    encrypted_state = account.get("encrypted_storage_state")
     if not encrypted_state:
         return {"status": "SKIPPED_NO_SESSION"}
 
     try:
         storage_state = security_mgr.decrypt_storage_state(encrypted_state)
     except Exception as e:
-        logger.error("Не удалось расшифровать сессию для user_id %d: %s", user_id, e)
-        await update_user_session(user_id, b"", "EXPIRED")
+        logger.error("Не удалось расшифровать сессию для аккаунта %s: %s", account_name, e)
+        await update_account_session(account_id, b"", "EXPIRED")
         return {"status": "EXPIRED_SESSION"}
 
-    engine = HHBrowserEngine(proxy_url=user.get("proxy_url"))
-    context = None
-    try:
-        await engine.start()
-        context = await engine.create_context(storage_state=storage_state)
-        search_tab = await context.new_page()
+    # Захват семафора контроля количества параллельных браузеров (до 2)
+    async with browser_semaphore:
+        if active_browsers_count > 0:
+            stagger_delay = random.uniform(5.0, 15.0)
+            logger.info("Параллельный браузер #%d для '%s' (стартовая рассинхронизация: %.1f сек)...", active_browsers_count + 1, account_name, stagger_delay)
+            await asyncio.sleep(stagger_delay)
+        else:
+            logger.info("Единственный браузер для '%s' запущен мгновенно (без задержки)...", account_name)
 
-        # Динамическое ИИ-извлечение ключевых слов из текста резюме через Gemini 3.5 Flash Lite
-        keywords_str = user.get("keywords")
-        if not keywords_str or keywords_str.strip() in ["", "Python", "Python, Backend, FastAPI, Django"]:
-            resume_text = user.get("resume_text", "")
-            resume_title = user.get("active_resume_title", "")
-            ai_keywords = extract_search_keywords_from_resume(resume_text, resume_title)
-            if ai_keywords:
-                keywords_str = ", ".join(ai_keywords)
-                await update_user_settings(user_id, keywords=keywords_str)
-            else:
-                keywords_str = resume_title or "Python"
+        active_browsers_count += 1
+        engine = HHBrowserEngine(proxy_url=account.get("proxy_url"))
+        context = None
+        try:
+            await engine.start()
+            context = await engine.create_context(storage_state=storage_state)
+            search_tab = await context.new_page()
 
-        kw_list = [k.strip() for k in keywords_str.split(",") if k.strip()]
-        if not kw_list:
-            kw_list = [user.get("active_resume_title") or "Python"]
+            # Извлечение/формирование ключевых слов
+            keywords_str = account.get("keywords")
+            if not keywords_str or keywords_str.strip() in ["", "Python", "Python, Backend, FastAPI, Django"]:
+                resume_text = account.get("resume_text", "")
+                resume_title = account.get("active_resume_title", "")
+                ai_keywords = extract_search_keywords_from_resume(resume_text, resume_title)
+                if ai_keywords:
+                    keywords_str = ", ".join(ai_keywords)
+                    await update_account_settings(account_id, keywords=keywords_str)
+                else:
+                    keywords_str = resume_title or "Python"
 
-        stop_words = [w.strip().lower() for w in user.get("stop_words", "").split(",") if w.strip()]
+            kw_list = [k.strip() for k in keywords_str.split(",") if k.strip()]
+            if not kw_list:
+                kw_list = [account.get("active_resume_title") or "Python"]
 
-        processed_count = 0
-        seen_urls_in_run = set()
+            stop_words = [w.strip().lower() for w in account.get("stop_words", "").split(",") if w.strip()]
 
-        for kw in kw_list:
-            urls_with_titles = []
+            processed_count = 0
+            seen_urls_in_run = set()
 
-            # Проверка, не остановил ли пользователь автоотклик во время выполнения
-            current_user = await get_or_create_user(user_id)
-            if not current_user.get("auto_apply_enabled"):
-                logger.info("Пользователь %d остановил автоотклик. Прерывание работы воркера.", user_id)
-                break
+            for kw in kw_list:
+                urls_with_titles = []
 
-            if current_user["applied_today"] >= current_user["daily_limit"]:
-                logger.info("Пользователь %d достиг суточного лимита (%d). Завершение.", user_id, current_user["daily_limit"])
-                break
-
-            encoded_kw = urllib.parse.quote_plus(kw)
-
-            # Пагинация по страницам поисковой выдачи для каждого ключевого слова
-            for page_num in range(3):
-                current_user = await get_or_create_user(user_id)
-                if not current_user.get("auto_apply_enabled"):
-                    logger.info("Пользователь %d остановил автоотклик. Выход из пагинации.", user_id)
+                # Проверка флага автооткликов перед каждым ключевым словом
+                curr_acc = await get_account_by_id(account_id)
+                if not curr_acc or not curr_acc.get("auto_apply_enabled"):
+                    logger.info("Автоотклик остановлен для %s во время выполнения. Прерывание.", account_name)
                     break
 
-                if current_user["applied_today"] >= current_user["daily_limit"]:
+                if curr_acc["applied_today"] >= curr_acc["daily_limit"]:
+                    logger.info("Аккаунт %s достиг лимита (%d). Завершение.", account_name, curr_acc["daily_limit"])
                     break
 
-                search_url = f"https://hh.ru/search/vacancy?text={encoded_kw}&order_by=publication_time&search_period=3&page={page_num}"
-                if current_user.get("min_salary"):
-                    search_url += f"&salary={current_user['min_salary']}&currency_code=RUR"
-                if current_user.get("only_remote"):
-                    search_url += "&schedule=remote"
+                encoded_kw = urllib.parse.quote_plus(kw)
 
-                logger.info("Поиск вакансий по ключу '%s' (Стр. %d): %s", kw, page_num + 1, search_url)
-                try:
-                    await search_tab.goto(search_url, wait_until="domcontentloaded", timeout=20000)
-                except Exception as nav_err:
-                    logger.warning("Таймаут перехода на %s: %s. Повторная попытка...", search_url, nav_err)
+                for page_num in range(3):
+                    curr_acc = await get_account_by_id(account_id)
+                    if not curr_acc or not curr_acc.get("auto_apply_enabled") or curr_acc["applied_today"] >= curr_acc["daily_limit"]:
+                        break
+
+                    search_url = f"https://hh.ru/search/vacancy?text={encoded_kw}&order_by=publication_time&search_period=3&page={page_num}"
+                    if curr_acc.get("min_salary"):
+                        search_url += f"&salary={curr_acc['min_salary']}&currency_code=RUR"
+                    if curr_acc.get("only_remote"):
+                        search_url += "&schedule=remote"
+
+                    logger.info("Поиск вакансий [%s] по ключу '%s' (Стр. %d)...", account_name, kw, page_num + 1)
                     try:
-                        await search_tab.goto(search_url, wait_until="commit", timeout=15000)
-                    except Exception:
-                        continue
-                await search_tab.wait_for_timeout(1500)
+                        await search_tab.goto(search_url, wait_until="domcontentloaded", timeout=20000)
+                    except Exception as nav_err:
+                        logger.warning("Таймаут перехода [%s] на %s: %s", account_name, search_url, nav_err)
+                        try:
+                            await search_tab.goto(search_url, wait_until="commit", timeout=15000)
+                        except Exception:
+                            continue
+                    await search_tab.wait_for_timeout(1500)
 
-                # Перехват возможной инвалидации сессии
-                if "account/login" in search_tab.url:
-                    logger.warning("Сессия пользователя %d истекла.", user_id)
-                    await update_user_session(user_id, b"", "EXPIRED")
-                    
-                    if BOT_TOKEN:
-                        bot = Bot(token=BOT_TOKEN)
-                        await bot.send_message(
-                            chat_id=user_id,
-                            text="⚠️ **Сессия hh.ru истекла.** Пожалуйста, пройдите повторную авторизацию."
-                        )
-                        await bot.session.close()
+                    # Проверка инвалидации сессии
+                    if "account/login" in search_tab.url:
+                        logger.warning("Сессия аккаунта %s (%d) истекла.", account_name, user_id)
+                        await update_account_session(account_id, b"", "EXPIRED")
+                        if BOT_TOKEN:
+                            bot = Bot(token=BOT_TOKEN)
+                            safe_name = _escape_md(account_name)
+                            await bot.send_message(
+                                chat_id=user_id,
+                                text=f"⚠️ **Сессия аккаунта `{safe_name}` истекла.** Пожалуйста, войдите повторно через `👤 Мои аккаунты`."
+                            )
+                            await bot.session.close()
                         return {"status": "SESSION_EXPIRED"}
 
-                # Извлечение карточек вакансий через актуальные DOM-селекторы hh.ru
-                vacancy_cards = await search_tab.locator('[data-qa="serp-item__title"], [data-qa="vacancy-serp__vacancy-title"], a[data-qa*="vacancy-title"]').all()
-                if not vacancy_cards:
-                    logger.info("На странице %d для ключевого слова '%s' больше нет вакансий.", page_num + 1, kw)
-                    break
+                    vacancy_cards = await search_tab.locator('[data-qa="serp-item__title"], [data-qa="vacancy-serp__vacancy-title"], a[data-qa*="vacancy-title"]').all()
+                    if not vacancy_cards:
+                        break
 
-                for link in vacancy_cards:
-                    href = await link.get_attribute("href")
-                    title = await link.text_content() or ""
-                    if href and "/vacancy/" in href and "/response" not in href:
-                        clean_url = href.split("?")[0] if href.startswith("http") else f"https://hh.ru{href.split('?')[0]}"
-                        if clean_url not in seen_urls_in_run:
-                            seen_urls_in_run.add(clean_url)
-                            urls_with_titles.append((clean_url, title.strip().lower()))
+                    for link in vacancy_cards:
+                        href = await link.get_attribute("href")
+                        title = await link.text_content() or ""
+                        if href and "/vacancy/" in href and "/response" not in href:
+                            clean_url = href.split("?")[0] if href.startswith("http") else f"https://hh.ru{href.split('?')[0]}"
+                            if clean_url not in seen_urls_in_run:
+                                seen_urls_in_run.add(clean_url)
+                                urls_with_titles.append((clean_url, title.strip().lower()))
 
-            for vacancy_url, vac_title_lower in urls_with_titles:
-                current_user = await get_or_create_user(user_id)
-                if not current_user.get("auto_apply_enabled"):
-                    logger.info("Пользователь %d остановил автоотклик во время обработки вакансий. Прерывание.", user_id)
-                    break
+                for vacancy_url, vac_title_lower in urls_with_titles:
+                    curr_acc = await get_account_by_id(account_id)
+                    if not curr_acc or not curr_acc.get("auto_apply_enabled") or curr_acc["applied_today"] >= curr_acc["daily_limit"]:
+                        break
 
-                if current_user["applied_today"] >= current_user["daily_limit"]:
-                    break
-
-                # 1. Ранняя фильтрация по стоп-словам
-                if stop_words and any(sw in vac_title_lower for sw in stop_words):
-                    logger.info("Вакансия '%s' пропущена (стоп-слово: %s).", vacancy_url, vac_title_lower)
-                    continue
-
-                already = await is_already_applied(user_id, vacancy_url)
-                if already:
-                    logger.debug("Пользователь %d уже откликался на %s. Пропуск.", user_id, vacancy_url)
-                    continue
-
-                # Отдельная изоляция вкладки браузера для предотвращения утечки RAM
-                vac_page = await context.new_page()
-                try:
-                    status_code, cover_letter, extra = await apply_to_hh_vacancy(
-                        page=vac_page,
-                        resume_context=user.get("resume_text", "Разработчик с опытом."),
-                        vacancy_url=vacancy_url,
-                        target_resume_title=user.get("active_resume_title"),
-                        send_cover_letter=bool(user.get("send_cover_letter", 1))
-                    )
-                finally:
-                    await vac_page.close()
-
-                # Вторичная проверка стоп-слов в полном описании
-                if extra and isinstance(extra, dict) and stop_words:
-                    full_desc = (extra.get("title", "") + " " + extra.get("description", "")).lower()
-                    if any(sw in full_desc for sw in stop_words):
-                        logger.info("Вакансия %s пропущена из-за наличия стоп-слова в описании.", vacancy_url)
+                    # 1. Фильтрация по стоп-словам
+                    if stop_words and any(sw in vac_title_lower for sw in stop_words):
                         continue
 
-                if status_code == "SKIPPED_IRRELEVANT":
-                    reason = extra.get("reason", "Не соответствует профилю") if isinstance(extra, dict) else "Не соответствует профилю"
-                    logger.info("Пользователь %d: вакансия %s пропущена как нерелевантная резюме (Причина: %s).", user_id, vacancy_url, reason)
-                    continue
+                    already = await is_account_already_applied(account_id, vacancy_url)
+                    if already:
+                        continue
 
-                if status_code in ["APPLIED_DIRECT", "APPLIED_WITH_LETTER"]:
-                    await save_hh_apply(user_id, vacancy_url, cover_letter or "", status_code)
-                    current_applied = await increment_applied_today(user_id)
-                    user["applied_today"] = current_applied
-                    processed_count += 1
-                    
-                    if BOT_TOKEN:
-                        company_name = extra.get("company", "Работодатель") if isinstance(extra, dict) else "Работодатель"
-                        vac_title = extra.get("title", "Вакансия") if isinstance(extra, dict) else "Вакансия"
-                        safe_company = _escape_md(company_name)
-                        safe_title = _escape_md(vac_title)
-                        safe_letter = _escape_md((cover_letter or "")[:300])
-                        
-                        bot = Bot(token=BOT_TOKEN)
-                        msg_text = (
-                            f"🎯 *Отклик отправлен в компанию {safe_company}!*\n\n"
-                            f"📌 *Вакансия:* [{safe_title}]({vacancy_url})\n"
-                            f"Статус: `{status_code}`\n"
+                    vac_page = await context.new_page()
+                    try:
+                        status_code, cover_letter, extra = await apply_to_hh_vacancy(
+                            page=vac_page,
+                            resume_context=account.get("resume_text", "Разработчик с опытом."),
+                            vacancy_url=vacancy_url,
+                            target_resume_title=account.get("active_resume_title"),
+                            send_cover_letter=bool(account.get("send_cover_letter", 1)),
+                            stop_words=stop_words
                         )
-                        if cover_letter:
-                            msg_text += f"\n📝 *Сопроводительное письмо:*\n{safe_letter}"
-                        
-                        try:
-                            await bot.send_message(chat_id=user_id, text=msg_text, parse_mode="Markdown")
-                        except Exception:
-                            plain = f"🎯 Отклик отправлен в компанию {company_name}!\n📌 Вакансия: {vac_title}\n{vacancy_url}\nСтатус: {status_code}"
+                    finally:
+                        await vac_page.close()
+
+                    if status_code == "SKIPPED_STOP_WORD":
+                        logger.info("Аккаунт %s: вакансия %s пропущена из-за стоп-слова в описании.", account_name, vacancy_url)
+                        continue
+
+                    if status_code == "SKIPPED_IRRELEVANT":
+                        reason = extra.get("reason", "Не соответствует профилю") if isinstance(extra, dict) else "Не соответствует профилю"
+                        logger.info("Аккаунт %s: вакансия %s пропущена как нерелевантная (%s)", account_name, vacancy_url, reason)
+                        continue
+
+                    if status_code in ["APPLIED_DIRECT", "APPLIED_WITH_LETTER"]:
+                        await save_account_hh_apply(user_id, account_id, vacancy_url, cover_letter or "", status_code)
+                        current_applied = await increment_account_applied_today(account_id)
+                        processed_count += 1
+
+                        if BOT_TOKEN:
+                            company_name = extra.get("company", "Работодатель") if isinstance(extra, dict) else "Работодатель"
+                            vac_title = extra.get("title", "Вакансия") if isinstance(extra, dict) else "Вакансия"
+                            safe_acc_name = _escape_md(account_name)
+                            safe_company = _escape_md(company_name)
+                            safe_title = _escape_md(vac_title)
+                            safe_letter = _escape_md((cover_letter or "")[:300])
+
+                            bot = Bot(token=BOT_TOKEN)
+                            msg_text = (
+                                f"🎯 *Отклик отправлен с аккаунта `{safe_acc_name}`!*\n\n"
+                                f"🏢 *Компания:* {safe_company}\n"
+                                f"📌 *Вакансия:* [{safe_title}]({vacancy_url})\n"
+                                f"📊 *Всего сегодня:* `{current_applied}/{account.get('daily_limit', 50)}`\n"
+                            )
                             if cover_letter:
-                                plain += f"\n📝 Письмо: {(cover_letter or '')[:300]}"
-                            await bot.send_message(chat_id=user_id, text=plain)
-                        await bot.session.close()
+                                msg_text += f"\n📝 *Сопроводительное письмо:*\n{safe_letter}"
 
-                    await asyncio.sleep(user.get("min_delay_sec", 30))
+                            try:
+                                await bot.send_message(chat_id=user_id, text=msg_text, parse_mode="Markdown")
+                            except Exception:
+                                plain = f"🎯 Отклик отправлен (Аккаунт: {account_name})!\n🏢 Компания: {company_name}\n📌 Вакансия: {vac_title}\n{vacancy_url}"
+                                await bot.send_message(chat_id=user_id, text=plain)
+                            await bot.session.close()
 
-                elif status_code == "QUESTIONNAIRE_REQUIRED" and extra:
-                    v_title = extra.get("vacancy", {}).get("title", "Вакансия с анкетой")
-                    questions = extra.get("questions", [])
-                    ai_payload = extra.get("ai_payload", {})
+                        await asyncio.sleep(account.get("min_delay_sec", 30))
 
-                    apply_id = await save_pending_questionnaire(
-                        user_id=user_id,
-                        vacancy_url=vacancy_url,
-                        vacancy_title=v_title,
-                        cover_letter=cover_letter or "",
-                        questions=questions,
-                        ai_payload=ai_payload
-                    )
+                    elif status_code == "QUESTIONNAIRE_REQUIRED" and extra:
+                        v_title = extra.get("vacancy", {}).get("title", "Вакансия с анкетой")
+                        questions = extra.get("questions", [])
+                        ai_payload = extra.get("ai_payload", {})
 
-                    if BOT_TOKEN:
-                        bot = Bot(token=BOT_TOKEN)
-                        q_text = "\n".join([f"• {_escape_md(q)}" for q in questions[:3]])
-                        safe_v_title = _escape_md(v_title)
-                        safe_cl = _escape_md((cover_letter or '')[:250])
-                        msg_text = (
-                            f"❓ *Требуется ваше подтверждение отклика!*\n\n"
-                            f"📌 *Вакансия:* [{safe_v_title}]({vacancy_url})\n"
-                            f"❓ *Вопросы работодателя:*\n{q_text}\n\n"
-                            f"📝 *Предложенное письмо:*\n{safe_cl}"
+                        apply_id = await save_pending_questionnaire_account(
+                            user_id=user_id,
+                            account_id=account_id,
+                            vacancy_url=vacancy_url,
+                            vacancy_title=v_title,
+                            cover_letter=cover_letter or "",
+                            questions=questions,
+                            ai_payload=ai_payload
                         )
-                        try:
-                            await bot.send_message(
-                                chat_id=user_id,
-                                text=msg_text,
-                                reply_markup=get_questionnaire_confirmation_keyboard(apply_id),
-                                parse_mode="Markdown"
+
+                        if BOT_TOKEN:
+                            bot = Bot(token=BOT_TOKEN)
+                            q_text = "\n".join([f"• {_escape_md(q)}" for q in questions[:3]])
+                            safe_v_title = _escape_md(v_title)
+                            safe_acc_name = _escape_md(account_name)
+                            safe_cl = _escape_md((cover_letter or '')[:250])
+                            msg_text = (
+                                f"❓ *Требуется подтверждение отклика (`{safe_acc_name}`)*!\n\n"
+                                f"📌 *Вакансия:* [{safe_v_title}]({vacancy_url})\n"
+                                f"❓ *Вопросы работодателя:*\n{q_text}\n\n"
+                                f"📝 *Предложенное письмо:*\n{safe_cl}"
                             )
-                        except Exception:
-                            plain = f"❓ Требуется подтверждение отклика!\n📌 Вакансия: {v_title}\n{vacancy_url}\n❓ Вопросы: {', '.join(questions[:3])}\n📝 Письмо: {(cover_letter or '')[:250]}"
-                            await bot.send_message(
-                                chat_id=user_id,
-                                text=plain,
-                                reply_markup=get_questionnaire_confirmation_keyboard(apply_id)
-                            )
-                        await bot.session.close()
+                            try:
+                                await bot.send_message(
+                                    chat_id=user_id,
+                                    text=msg_text,
+                                    reply_markup=get_questionnaire_confirmation_keyboard(apply_id),
+                                    parse_mode="Markdown"
+                                )
+                            except Exception:
+                                plain = f"❓ Требуется подтверждение отклика ({account_name})!\n📌 Вакансия: {v_title}\n{vacancy_url}"
+                                await bot.send_message(
+                                    chat_id=user_id,
+                                    text=plain,
+                                    reply_markup=get_questionnaire_confirmation_keyboard(apply_id)
+                                )
+                            await bot.session.close()
 
-        # Обновляем сохраненные куки в шифрованном виде после работы
-        new_state = await context.storage_state()
-        encrypted_new_state = security_mgr.encrypt_storage_state(new_state)
-        await update_user_session(user_id, encrypted_new_state, "ACTIVE")
+            # Обновление сохраненных кук после работы
+            new_state = await context.storage_state()
+            encrypted_new_state = security_mgr.encrypt_storage_state(new_state)
+            await update_account_session(account_id, encrypted_new_state, "ACTIVE")
 
-        return {"status": "SUCCESS", "processed": processed_count}
+            return {"status": "SUCCESS", "processed": processed_count}
 
-    except Exception as e:
-        logger.error("Ошибка при выполнении задачи для %d: %s", user_id, e)
-        return {"status": f"ERROR: {e}"}
+        except Exception as e:
+            logger.error("Ошибка при выполнении задачи для аккаунта %s (id=%d): %s", account_name, account_id, e)
+            return {"status": f"ERROR: {e}"}
 
-    finally:
-        if context:
-            await context.close()
-        await engine.close()
+        finally:
+            active_browsers_count = max(0, active_browsers_count - 1)
+            if context:
+                await context.close()
+            await engine.close()
+
+
+@broker.task
+async def process_user_hh_applications(user_id: int) -> dict:
+    """
+    Фоновая задача для пользователя: запускает поисковые задачи для всех его активных аккаунтов.
+    """
+    accounts = await get_user_accounts(user_id)
+    active_accs = [acc for acc in accounts if acc.get("session_status") == "ACTIVE" and acc.get("auto_apply_enabled")]
+
+    if not active_accs:
+        logger.info("Пользователь %d не имеет активных аккаунтов для автоотклика.", user_id)
+        return {"status": "NO_ACTIVE_ACCOUNTS"}
+
+    for acc in active_accs:
+        try:
+            await process_account_hh_applications.kiq(acc["id"])
+        except Exception:
+            asyncio.create_task(process_account_hh_applications(acc["id"]))
+
+    return {"status": "SUCCESS", "launched_accounts": len(active_accs)}
 
 
 @broker.task
@@ -345,7 +377,17 @@ async def submit_approved_hh_questionnaire(user_id: int, apply_id: int) -> dict:
     if not item:
         return {"status": "NOT_FOUND"}
 
-    encrypted_state, status = await get_user_session(user_id)
+    account_id = item.get("account_id")
+    account = await get_account_by_id(account_id) if account_id else None
+
+    if account:
+        encrypted_state = account.get("encrypted_storage_state")
+        proxy_url = account.get("proxy_url")
+    else:
+        user = await get_or_create_user(user_id)
+        encrypted_state = user.get("encrypted_storage_state")
+        proxy_url = user.get("proxy_url")
+
     if not encrypted_state:
         return {"status": "NO_SESSION"}
 
@@ -362,8 +404,7 @@ async def submit_approved_hh_questionnaire(user_id: int, apply_id: int) -> dict:
         except Exception:
             answers = []
 
-    user = await get_or_create_user(user_id)
-    engine = HHBrowserEngine(proxy_url=user.get("proxy_url"))
+    engine = HHBrowserEngine(proxy_url=proxy_url)
     context = None
     try:
         await engine.start()
@@ -378,8 +419,9 @@ async def submit_approved_hh_questionnaire(user_id: int, apply_id: int) -> dict:
         )
 
         if success:
-            await save_hh_apply(user_id, item["vacancy_url"], item.get("cover_letter", ""), "APPLIED_WITH_QUESTIONNAIRE")
-            await increment_applied_today(user_id)
+            await save_account_hh_apply(user_id, account_id or 0, item["vacancy_url"], item.get("cover_letter", ""), "APPLIED_WITH_QUESTIONNAIRE")
+            if account_id:
+                await increment_account_applied_today(account_id)
             await update_pending_questionnaire_status(apply_id, "SUBMITTED")
 
             if BOT_TOKEN:

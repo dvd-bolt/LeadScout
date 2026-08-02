@@ -150,3 +150,253 @@ def extract_search_keywords_from_resume(resume_text: str, resume_title: str = ""
         logger.error("Ошибка при извлечении ключевых слов через Gemini: %s", e)
 
     return []
+
+
+# ── 📊 Спецификация и Pydantic-схемы для Аудита IT-резюме ───────────────
+
+class CategoryScores(BaseModel):
+    hard_skills: int = Field(description="Оценка Hard Skills и стека технологий от 0 до 100")
+    impact_metrics: int = Field(description="Оценка результативности и Google XYZ/STAR от 0 до 100")
+    parseability: int = Field(description="Оценка технической читаемости ATS и формата от 0 до 100")
+    timeline: int = Field(description="Оценка хронологии и карьерного трека от 0 до 100")
+    style: int = Field(description="Оценка стиля, объема и Soft Skills от 0 до 100")
+
+
+class ActionableInsight(BaseModel):
+    tier: int = Field(description="Приоритет: 1 (Срочные блокеры), 2 (Оптимизация контента XYZ), 3 (Стилистическая полировка)")
+    title: str = Field(description="Короткий заголовок проблемы или рекомендации")
+    description: str = Field(description="Детальное объяснение и конкретный пример улучшения")
+    score_impact: str = Field(description="Оценка влияния на балл, например '+15 баллов'")
+
+
+class ResumeAuditPayload(BaseModel):
+    is_it_profession: bool = Field(description="True если резюме строго относится к IT-сфере (ПО, Data, DevOps, QA, Product), иначе False")
+    profession_name: str = Field(description="Определенная моделью IT-специализация (например 'Backend Python Developer') или 'Не IT'")
+    rejection_reason: str = Field(default="", description="Пояснение отказа если is_it_profession=False")
+    overall_score: int = Field(default=0, description="Итоговый взвешенный балл резюме от 0 до 100 с учетом штрафов")
+    category_scores: CategoryScores = Field(default_factory=lambda: CategoryScores(hard_skills=0, impact_metrics=0, parseability=0, timeline=0, style=0), description="Баллы по 5 основным категориям")
+    penalties: list[str] = Field(default_factory=list, description="Список выявленных барьеров ATS и штрафов")
+    top_recommendations: list[str] = Field(default_factory=list, description="Топ-3 главных совета для немедленного исправления")
+    insights: list[ActionableInsight] = Field(default_factory=list, description="Пошаговая матрица Actionable Insights")
+    summary_text: str = Field(default="", description="Краткий аналитический вывод о резюме (2-3 предложения)")
+
+
+class VacancyMatchPayload(BaseModel):
+    match_score: int = Field(description="Процент соответствия резюме требованиям вакансии от 0 до 100")
+    is_suitable: bool = Field(description="True если кандидат подходит на роль, False если критический некомплект навыков")
+    matching_skills: list[str] = Field(default_factory=list, description="Совпавшие ключевые навыки и стек технологий")
+    missing_skills: list[str] = Field(default_factory=list, description="Отсутствующие важные навыки из описания вакансии")
+    advice_for_apply: str = Field(description="Практический совет по адаптации резюме и отклика под данную позицию")
+
+
+def analyze_resume_quality(resume_text: str) -> ResumeAuditPayload:
+    """
+    Проводит глубокий аудит качества IT-резюме через Gemini по стандартам ATS и макросам Google XYZ/STAR.
+    Использует 2-уровневый движок: ИИ-извлечение показателей + строгая математическая калибровка Python.
+    """
+    if not GEMINI_API_KEY or not resume_text or len(resume_text.strip()) < 50:
+        return ResumeAuditPayload(
+            is_it_profession=False,
+            profession_name="НЕДОСТАТОЧНО ДАННЫХ",
+            rejection_reason="Текст резюме слишком короткий или отсутствует."
+        )
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        prompt = f"""
+Вы — БЕСКОМПРОМИССНЫЙ И СТРОГИЙ СИСТЕМНЫЙ ATS-АУДИТОР коммерческого уровня (аналог Jobscan, Resume Worded, HireHi, CV-Scanner).
+Ваша задача — НЕ завышать баллы и НЕ потакать кандидату, а провести СТРОГИЙ, СУХОЙ И ОБЪЕКТИВНЫЙ АНАЛИЗ по правилам корпоративных ATS.
+
+ПРАВИЛА ОЦЕНКИ ПО КАТЕГОРИЯМ И ЖЕСТКИХ СНИЖЕНИЙ:
+
+1. ВАЛИДАЦИЯ IT-СФЕРЫ (КРИТИЧНО):
+   - Проверьте, относится ли резюме к IT-профессии. Если нет (Бухгалтер, Юрист, Повар и т.д.) — установите is_it_profession = false.
+
+2. СТРОГИЕ КРИТЕРИИ ОЦЕНКИ КАТЕГОРИЙ (0-100):
+   - hard_skills (30%): Оценивайте ТОЛЬКО технологии, подкрепленные описанием реальных задач в опыте работы. Огромный список ключевиков (50+ слов) на вершине резюме без детального раскрытия в проектах — СНИЖАЙТЕ БАЛЛ ДО 70-75 (риск переспама/Keyword Stuffing)!
+   - impact_metrics (25%): Оценивайте оцифровку результатов (%/$/время/RPS/мс). За процессуальные глаголы ("разрабатывал", "настраивал", "отвечал за") вместо результативных ("спроектировал", "сократил на 40%", "снизил latency с X до Y") — СНИЖАЙТЕ БАЛЛ ДО 60-75!
+   - parseability (15%): Проверьте заголовки и контакты. Смешение английских и русских заголовков ("О СЕБЕ / SUMMARY"), атипичные названия секций — СНИЖАЙТЕ БАЛЛ ДО 75-80.
+   - timeline (15%): Рассчитайте средний стаж на роль. Если кандидат меняет работу каждые 1.5–1.8 года (например, 3 места работы за 5 лет) — СТАЖ НЕ СЧИТАЕТСЯ СТАБИЛЬНЫМ, БАЛЛ НЕ ВЫШЕ 65-75 (риск Job Hopping)!
+   - style (15%): Наличие размытых Soft Skills без примеров управления или лидеровства — СНИЖАЙТЕ БАЛЛ ДО 70-75.
+
+3. ПЕНАЛЬТИИ И РИСКИ (penalties):
+   - Перечислите конкретные недостатки (например: "Массивный блок ключевых слов без привязки к ролям", "Средний стаж менее 2 лет на место", "Смешанные двуязычные заголовки секций").
+
+4. ACTIONABLE INSIGHTS (insights):
+   - Дайте рекомендации Tier 1 (Блокеры), Tier 2 (Оцифровка XYZ) и Tier 3 (Полировка).
+
+ТЕКСТ РЕЗЮМЕ ДЛЯ СТРОГОГО АУДИТА:
+{resume_text[:6000]}
+"""
+
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ResumeAuditPayload,
+                temperature=0.10
+            )
+        )
+
+        result: ResumeAuditPayload = response.parsed
+        if not result or not result.is_it_profession:
+            return result or ResumeAuditPayload(
+                is_it_profession=False,
+                profession_name="Ошибка ИИ",
+                rejection_reason="Модель вернула пустой результат."
+            )
+
+        # ── СТРОГИЙ МАТЕМАТИЧЕСКИЙ ПЕРЕСЧЕТ В PYTHON (по спецификации) ──
+        cats = result.category_scores
+        weighted_score = (
+            0.30 * cats.hard_skills +
+            0.25 * cats.impact_metrics +
+            0.15 * cats.parseability +
+            0.15 * cats.timeline +
+            0.15 * cats.style
+        )
+        
+        # Вычет за обнаруженные штрафы (максимум -20 баллов суммарно)
+        penalty_deduction = min(20, len(result.penalties) * 3)
+        calculated_overall = round(weighted_score - penalty_deduction)
+        
+        result.overall_score = max(0, min(100, calculated_overall))
+
+
+        logger.info("Успешно выполнен ИИ-аудит резюме '%s' (IT: %s, Калькулируемый балл: %d)", result.profession_name, result.is_it_profession, result.overall_score)
+        return result
+
+    except Exception as e:
+        logger.error("Ошибка при ИИ-аудите резюме через Gemini: %s", e)
+        return ResumeAuditPayload(
+            is_it_profession=False,
+            profession_name="Ошибка анализа",
+            rejection_reason=f"Сбой ИИ-модуля: {e}"
+        )
+
+
+
+def match_resume_to_vacancy(resume_text: str, vacancy_text: str) -> VacancyMatchPayload:
+    """
+    Проводит ИИ-сравнение (Job Matching) резюме кандидата с текстом вакансии/JD.
+    """
+    if not GEMINI_API_KEY or not resume_text or not vacancy_text:
+        return VacancyMatchPayload(
+            match_score=0,
+            is_suitable=False,
+            advice_for_apply="Отсутствуют необходимые данные резюме или вакансии."
+        )
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        prompt = f"""
+Вы — опытный IT-рекрутер. Сравните резюме кандидата с требованиями вакансии.
+
+РЕЗЮМЕ КАНДИДАТА:
+{resume_text[:4500]}
+
+ОПИСАНИЕ ВАКАНСИИ:
+{vacancy_text[:4500]}
+
+ЗАДАЧА:
+1. Вычислите процент соответствия кандидату этой роли (match_score 0-100).
+2. Выделите совпавшие ключевые технологии и требования (matching_skills).
+3. Выделите критические отсутствующие навыки или нехватку опыта из требований вакансии (missing_skills).
+4. Дайте практический совет (advice_for_apply), как адаптировать отклик под эту роль.
+"""
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=VacancyMatchPayload,
+                temperature=0.15
+            )
+        )
+
+        result: VacancyMatchPayload = response.parsed
+        if not result:
+            return VacancyMatchPayload(
+                match_score=0,
+                is_suitable=False,
+                advice_for_apply="Пустой ответ от модели."
+            )
+
+        logger.info("Успешно выполнен ИИ-матчинг резюме с вакансией (Score: %d%%)", result.match_score)
+        return result
+
+    except Exception as e:
+        logger.error("Ошибка при ИИ-матчинге резюме с вакансией: %s", e)
+        return VacancyMatchPayload(
+            match_score=0,
+            is_suitable=False,
+            advice_for_apply=f"Ошибка анализа: {e}"
+        )
+
+
+class WorkExperienceItem(BaseModel):
+    company: str = Field(description="Название компании")
+    position: str = Field(description="Должность или профессия")
+    city: str = Field(default="Москва", description="Город или регион")
+    start_month: str = Field(description="Месяц начала работы (например: 'Январь', 'Февраль')")
+    start_year: str = Field(description="Год начала работы (например: '2021')")
+    is_current: bool = Field(default=False, description="True если работает по настоящее время")
+    end_month: str | None = Field(default=None, description="Месяц окончания работы")
+    end_year: str | None = Field(default=None, description="Год окончания работы")
+    description: str = Field(description="Подробные обязанности и достижения на месте работы")
+
+
+class EducationItem(BaseModel):
+    level: str = Field(default="Высшее", description="Уровень образования: Высшее, Среднее специальное")
+    institution: str = Field(description="Название учебного заведения / вуза")
+    faculty: str = Field(default="", description="Факультет")
+    specialization: str = Field(default="", description="Специализация / направление")
+    end_year: str = Field(default="2020", description="Год окончания")
+
+
+class FullStructuredResume(BaseModel):
+    title: str = Field(description="Основная желаемая должность / профессия кандидата")
+    salary: int | None = Field(default=None, description="Желаемый уровень дохода в рублях")
+    city: str = Field(default="Москва", description="Город проживания")
+    experiences: list[WorkExperienceItem] = Field(default_factory=list, description="Список мест работы кандидата")
+    education: list[EducationItem] = Field(default_factory=list, description="Список учебных заведений")
+    skills: list[str] = Field(default_factory=list, description="Список ключевых профессиональных навыков (теги)")
+    about: str = Field(default="", description="Краткая информация о себе")
+
+
+def extract_full_structured_resume(resume_text: str) -> FullStructuredResume | None:
+    """
+    Извлекает полную структуру резюме из текста с помощью Gemini 3.5 Flash Lite
+    для дальнейшего пошагового автозаполнения форм на hh.ru.
+    """
+    if not GEMINI_API_KEY or not resume_text:
+        return None
+
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        prompt = f"""
+Вы — профильный ассистент по разбору резюме. Внимательно проанализируйте текст резюме кандидата
+и извлеките все структурные поля (Желаемая должность, список мест работы с датами и обязанностями, образование, список навыков и текст О себе).
+
+ТЕКСТ РЕЗЮМЕ КАНДИДАТА:
+{resume_text[:10000]}
+"""
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=FullStructuredResume,
+                temperature=0.1
+            )
+        )
+
+        result: FullStructuredResume = response.parsed
+        logger.info("Успешно извлечена структура резюме для ИИ-создания: %s (%d мест работы)", result.title if result else "None", len(result.experiences) if result else 0)
+        return result
+    except Exception as e:
+        logger.error("Ошибка при ИИ-извлечении структуры резюме: %s", e)
+        return None
+
+

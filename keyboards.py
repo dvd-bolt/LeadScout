@@ -1,5 +1,6 @@
 """
 LeadScout AI — Меню и клавиатуры Telegram-бота (aiogram 3.x).
+Поддерживает управление мульти-аккаунтами, смену аккаунтов без разлогина и инлайн-настройки.
 """
 
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -10,24 +11,60 @@ def get_main_keyboard(is_auto_apply_running: bool = False) -> ReplyKeyboardMarku
     action_btn_text = "⛔️ Остановить автоотклик" if is_auto_apply_running else "🚀 Запустить автоотклик"
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=action_btn_text), KeyboardButton(text="📊 Статистика")],
-            [KeyboardButton(text="📜 История откликов"), KeyboardButton(text="📄 Мое резюме")],
-            [KeyboardButton(text="🔑 Авторизация hh.ru"), KeyboardButton(text="⚙️ Настройки")],
-            [KeyboardButton(text="🔄 Перезапустить бота"), KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text=action_btn_text), KeyboardButton(text="📊 Проверить резюме (IT)")],
+            [KeyboardButton(text="👤 Мои аккаунты"), KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text="📄 Мое резюме"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="🔑 Авторизация hh.ru"), KeyboardButton(text="🔄 Перезапустить бота")],
+            [KeyboardButton(text="📜 История откликов"), KeyboardButton(text="❓ Помощь")],
         ],
         resize_keyboard=True
     )
 
 
-def get_settings_inline_keyboard(user_data: dict) -> InlineKeyboardMarkup:
-    """Инлайн-меню настроек hh.ru."""
-    daily_limit = user_data.get("daily_limit", 50)
-    remote_status = "✅ Да" if user_data.get("only_remote") else "❌ Нет"
-    cover_status = "✅ Вкл" if user_data.get("send_cover_letter", 1) else "❌ Выкл (только точка)"
-    min_salary = user_data.get("min_salary", 0)
-    proxy_url = "✅ Задан" if user_data.get("proxy_url") else "❌ Не задан"
+
+def get_accounts_inline_keyboard(accounts: list[dict], active_account_id: int | None = None) -> InlineKeyboardMarkup:
+    """Инлайн-меню управления мульти-аккаунтами hh.ru."""
+    buttons = []
+
+    if accounts:
+        for acc in accounts:
+            acc_id = acc.get("id")
+            name = acc.get("account_name") or acc.get("phone_or_email") or f"Аккаунт {acc_id}"
+            status = acc.get("session_status", "NOT_AUTHORIZED")
+
+            is_active = (acc_id == active_account_id)
+            is_running = bool(acc.get("auto_apply_enabled"))
+
+            status_icon = "🟢" if status == "ACTIVE" else ("🟡" if status == "WAITING_FOR_OTP" else "🔴")
+            active_prefix = "⭐ [АКТИВЕН] " if is_active else ""
+            running_prefix = "🚀 " if is_running else ""
+
+            btn_text = f"{active_prefix}{status_icon} {running_prefix}{name}"
+            buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"select_acc_{acc_id}")])
+
+    buttons.append([
+        InlineKeyboardButton(text="➕ Добавить новый аккаунт hh.ru", callback_data="add_new_account")
+    ])
+    buttons.append([
+        InlineKeyboardButton(text="🚀 Запустить ВСЕ", callback_data="start_all_accounts"),
+        InlineKeyboardButton(text="⛔️ Остановить ВСЕ", callback_data="stop_all_accounts")
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_settings_inline_keyboard(account_data: dict) -> InlineKeyboardMarkup:
+    """Инлайн-меню настроек активного аккаунта hh.ru."""
+    acc_id = account_data.get("id")
+    daily_limit = account_data.get("daily_limit", 50)
+    remote_status = "✅ Да" if account_data.get("only_remote") else "❌ Нет"
+    cover_status = "✅ Вкл" if account_data.get("send_cover_letter", 1) else "❌ Выкл (только точка)"
+    min_salary = account_data.get("min_salary", 0)
+    proxy_url = "✅ Задан" if account_data.get("proxy_url") else "❌ Не задан"
+    auto_status = "🚀 Включен" if account_data.get("auto_apply_enabled") else "⛔️ Остановлен"
 
     buttons = [
+        [InlineKeyboardButton(text=f"⚡️ Автоотклик: {auto_status}", callback_data="toggle_account_auto_apply")],
         [InlineKeyboardButton(text=f"🎯 Лимит/день: {daily_limit}", callback_data="set_limit")],
         [InlineKeyboardButton(text=f"🏡 Только удаленка: {remote_status}", callback_data="toggle_remote")],
         [InlineKeyboardButton(text=f"✍️ Письмо к отклику: {cover_status}", callback_data="toggle_cover_letter")],
@@ -35,7 +72,19 @@ def get_settings_inline_keyboard(user_data: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"🌐 Прокси: {proxy_url}", callback_data="set_proxy")],
         [InlineKeyboardButton(text="📝 Ключевые слова поиска", callback_data="set_keywords")],
         [InlineKeyboardButton(text="🚫 Стоп-слова", callback_data="set_stop_words")],
-        [InlineKeyboardButton(text="🚪 Выйти из аккаунта hh.ru", callback_data="logout_hh")],
+        [InlineKeyboardButton(text="🔄 Сменить аккаунт (Список аккаунтов)", callback_data="switch_account_menu")],
+        [InlineKeyboardButton(text="🗑 Удалить этот аккаунт из бота", callback_data=f"confirm_delete_acc_{acc_id}")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_delete_confirmation_keyboard(account_id: int) -> InlineKeyboardMarkup:
+    """Инлайн-клавиатура подтверждения удаления аккаунта."""
+    buttons = [
+        [
+            InlineKeyboardButton(text="❌ ДА, удалить аккаунт", callback_data=f"delete_acc_{account_id}"),
+            InlineKeyboardButton(text="↩️ Отмена", callback_data="switch_account_menu")
+        ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -76,16 +125,73 @@ def get_resume_inline_keyboard(resumes: list[dict] | None = None, selected_href:
             is_active = (href == selected_href) or (idx == 0 and not selected_href)
             prefix = "🟢 [АКТИВНО] " if is_active else "📄 "
             btn_text = f"{prefix}{title} ({status})"
-            # Обрезаем callback_data до допустимого размера в aiogram
-            cb_data = f"select_res_{idx}"
+            cb_data = f"manage_res_{idx}"
             buttons.append([InlineKeyboardButton(text=btn_text, callback_data=cb_data)])
 
     buttons.append([
-        InlineKeyboardButton(text="📎 Загрузить PDF резюме", callback_data="upload_pdf_resume"),
-        InlineKeyboardButton(text="✍️ Ввести текст вручную", callback_data="input_text_resume")
+        InlineKeyboardButton(text="📎 Загрузить PDF резюме", callback_data="upload_pdf_resume")
     ])
     buttons.append([
-        InlineKeyboardButton(text="👁 Просмотр текста резюме ИИ", callback_data="preview_resume"),
+        InlineKeyboardButton(text="👁 Просмотр текста ИИ", callback_data="preview_resume"),
         InlineKeyboardButton(text="🔄 Синхронизировать с hh.ru", callback_data="sync_hh_resumes")
     ])
+
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_resume_action_keyboard(idx: int, is_active: bool = False) -> InlineKeyboardMarkup:
+    """Инлайн-меню действий с конкретным резюме."""
+    buttons = []
+    if not is_active:
+        buttons.append([InlineKeyboardButton(text="🎯 Сделать основным резюме", callback_data=f"select_res_{idx}")])
+    
+    buttons.append([InlineKeyboardButton(text="🗑 Удалить резюме (с hh.ru и из бота)", callback_data=f"req_del_res_{idx}")])
+    buttons.append([InlineKeyboardButton(text="↩️ Назад к списку резюме", callback_data="sync_hh_resumes")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_confirm_delete_resume_keyboard(idx: int) -> InlineKeyboardMarkup:
+    """Инлайн-клавиатура подтверждения удаления резюме с hh.ru и бота."""
+    buttons = [
+        [InlineKeyboardButton(text="🗑 ДА, удалить везде (с hh.ru и бота)", callback_data=f"do_del_res_{idx}")],
+        [InlineKeyboardButton(text="↩️ Отмена", callback_data=f"manage_res_{idx}")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+
+
+def get_resume_audit_start_keyboard(has_active_resume: bool = True) -> InlineKeyboardMarkup:
+    """Клавиатура перед стартом ИИ-аудита резюме."""
+    buttons = []
+    if has_active_resume:
+        buttons.append([InlineKeyboardButton(text="🚀 Начать экспресс-проверку (активное)", callback_data="start_resume_audit")])
+    
+    buttons.append([
+        InlineKeyboardButton(text="📎 Проверить PDF (без HH)", callback_data="audit_custom_pdf"),
+        InlineKeyboardButton(text="✍️ Ввести текст (без HH)", callback_data="audit_custom_text")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_resume_audit_result_keyboard(audit_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура результатов аудита резюме."""
+    buttons = [
+        [InlineKeyboardButton(text="💡 Подробные рекомендации (Tier 1-3)", callback_data=f"show_audit_insights_{audit_id}")],
+        [InlineKeyboardButton(text="🎯 Сравнить с вакансией (hh.ru / JD)", callback_data=f"match_with_vacancy_{audit_id}")],
+        [
+            InlineKeyboardButton(text="🚀 Экспресс-проверка", callback_data="start_resume_audit"),
+            InlineKeyboardButton(text="📎 Проверить другой PDF", callback_data="audit_custom_pdf")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+
+def get_cancel_vacancy_matching_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура отмены ввода вакансии для матчинга."""
+    buttons = [
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_vacancy_matching")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+

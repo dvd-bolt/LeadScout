@@ -17,11 +17,12 @@ logger = logging.getLogger(__name__)
 
 
 class HHLoginSession:
-    """Сессия авторизации hh.ru для конкретного пользователя."""
+    """Сессия авторизации hh.ru для конкретного пользователя и аккаунта."""
 
-    def __init__(self, user_id: int, phone_or_email: str):
+    def __init__(self, user_id: int, phone_or_email: str, account_id: int | None = None):
         self.user_id = user_id
         self.phone_or_email = phone_or_email
+        self.account_id = account_id
         self.engine: HHBrowserEngine | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
@@ -271,7 +272,11 @@ class HHLoginSession:
                 sec_mgr = SessionSecurityManager()
                 encrypted_state = sec_mgr.encrypt_storage_state(storage_state)
                 
-                await update_user_session(self.user_id, encrypted_state, status="ACTIVE")
+                from database import update_account_session
+                if self.account_id:
+                    await update_account_session(self.account_id, encrypted_state, status="ACTIVE")
+                else:
+                    await update_user_session(self.user_id, encrypted_state, status="ACTIVE")
                 await self.cleanup()
                 return {"status": "SUCCESS"}
             else:
@@ -302,11 +307,11 @@ class HHLoginManager:
     _sessions: dict[int, HHLoginSession] = {}
 
     @classmethod
-    async def start_login(cls, user_id: int, phone_or_email: str) -> dict[str, Any]:
+    async def start_login(cls, user_id: int, phone_or_email: str, account_id: int | None = None) -> dict[str, Any]:
         if user_id in cls._sessions:
             await cls._sessions[user_id].cleanup()
         
-        session = HHLoginSession(user_id, phone_or_email)
+        session = HHLoginSession(user_id, phone_or_email, account_id=account_id)
         cls._sessions[user_id] = session
         return await session.start_login_flow()
 

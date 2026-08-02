@@ -40,3 +40,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Scratch and temporary media
+scratch/
+*.png
+
