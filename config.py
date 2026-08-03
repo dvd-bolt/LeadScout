@@ -24,10 +24,10 @@ GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # Сессионное шифрование (AES-256 Fernet)
-SESSION_ENCRYPTION_KEY: str = os.getenv(
-    "SESSION_ENCRYPTION_KEY",
-    "8Yx_5m-H83m1m2Xv7A9y0Z1W2V3U4T5S6R7Q8P9O0N1="
-)
+DEFAULT_ENCRYPTION_KEY = "8Yx_5m-H83m1m2Xv7A9y0Z1W2V3U4T5S6R7Q8P9O0N1="
+SESSION_ENCRYPTION_KEY: str = os.getenv("SESSION_ENCRYPTION_KEY", DEFAULT_ENCRYPTION_KEY)
+
+
 
 # Совместимость с наследуемыми переменными
 FREELANCEHUNT_TOKEN: str = os.getenv("FREELANCEHUNT_TOKEN", "")

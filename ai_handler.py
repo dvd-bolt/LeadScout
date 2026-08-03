@@ -1,9 +1,12 @@
 """
 LeadScout AI — Модуль ИИ-интеграции с Google GenAI (gemini-3.5-flash-lite).
 Генерация персонализированных откликов на hh.ru, ответов на анкеты через Pydantic Structured Outputs.
+Поддерживает неблокирующие асинхронные вызовы (asyncio.to_thread).
 """
 
+import asyncio
 import logging
+import time
 from pathlib import Path
 from pydantic import BaseModel, Field
 from google import genai
@@ -12,6 +15,29 @@ from google.genai import types
 from config import GEMINI_API_KEY, GEMINI_MODEL, HH_COVER_LETTER_SYSTEM_PROMPT, RESUME_PATH
 
 logger = logging.getLogger(__name__)
+
+
+def _generate_content_with_retry(
+    client: genai.Client,
+    model: str,
+    contents: str,
+    config: types.GenerateContentConfig,
+    retries: int = 3,
+    delay: float = 1.5
+):
+    """Выполняет запрос к Gemini API с повторными попытками при таймаутах или сетевых ошибках."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            return client.models.generate_content(model=model, contents=contents, config=config)
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                logger.warning("Сбой обращения к Gemini API (попытка %d/%d): %s. Повтор через %.1f сек...", attempt, retries, e, delay * attempt)
+                time.sleep(delay * attempt)
+            else:
+                logger.error("Критический сбой Gemini API после %d попыток: %s", retries, e)
+                raise last_err
 
 
 class FormAnswer(BaseModel):
@@ -29,14 +55,11 @@ class JobApplicationPayload(BaseModel):
     confidence_score: float = Field(description="Оценка уверенности модели от 0.0 до 1.0")
 
 
-def generate_hh_job_application(
+def _sync_generate_hh_job_application(
     resume_context: str,
     vacancy_description: str,
     questions_list: list[str] | None = None
 ) -> JobApplicationPayload:
-    """
-    Генерирует Pydantic-структурированный ответ для отклика на hh.ru с использованием gemini-3.5-flash-lite.
-    """
     if not questions_list:
         questions_list = []
 
@@ -66,13 +89,14 @@ def generate_hh_job_application(
 {questions_list}
 
 ИНСТРУКЦИЯ ПО ОЦЕНКЕ РЕЛЕВАНТНОСТИ (ОЧЕНЬ ВАЖНО):
-1. Сначала определите, соответствует ли вакансия профессии и компетенциям из резюме кандидата.
-2. Если вакансия кардинально из другой сферы или требует другой стековой специализации (например, резюме Python/ML, а вакансия C++ драйверы, Бухгалтер, Дизайнер, QA тестер) — установите is_relevant = false и укажите причину в relevance_reason.
-3. Если вакансия релевантна (is_relevant = true) — сгенерируйте персонализированное сопроводительное письмо и дайте точные ответы на вопросы анкеты.
+1. Оценивайте вакансии ГИБКО и ЛОЯЛЬНО. Устанавливайте is_relevant = true для любых вакансий в сфере IT, разработки ПО, программирования, Python, Backend, AI/ML, Data, DevOps, MLOps, Инженерии и смежных технических специальностей.
+2. Устанавливайте is_relevant = false ТОЛЬКО в случаях, когда вакансия относится к КАРДИНАЛЬНО НЕПРОФИЛЬНОЙ НЕ-IT сфере (например: Бухгалтер, Повар, Водитель, Уборщик, Креативный продюсер/TikTok, Личный помощник, Юрист, Продавец).
+3. НЕ отклоняйте IT-вакансии из-за мелких несовпадений отдельных фреймворков, конкретных библиотек или смежных языков. Для IT-вакансий всегда генерируйте персонализированное сопроводительное письмо и давайте ответы на вопросы анкеты.
 4. Строго опирайтесь только на факты из резюме кандидата. Запрещено выдумывать несуществующие навыки, годы опыта или зарплатные ожидания.
 """
 
-        response = client.models.generate_content(
+        response = _generate_content_with_retry(
+            client=client,
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -109,14 +133,25 @@ def generate_hh_job_application(
         )
 
 
+async def generate_hh_job_application(
+    resume_context: str,
+    vacancy_description: str,
+    questions_list: list[str] | None = None
+) -> JobApplicationPayload:
+    """Неблокирующая асинхронная обертка для генерации отклика."""
+    return await asyncio.to_thread(
+        _sync_generate_hh_job_application,
+        resume_context,
+        vacancy_description,
+        questions_list
+    )
+
+
 class SearchKeywordsPayload(BaseModel):
     keywords: list[str] = Field(description="Список из 3-6 наиболее эффективных ключевых слов для поиска вакансий на hh.ru под данное резюме")
 
 
-def extract_search_keywords_from_resume(resume_text: str, resume_title: str = "") -> list[str]:
-    """
-    Использует gemini-3.5-flash-lite для динамического извлечения ключевых слов под конкретное резюме.
-    """
+def _sync_extract_search_keywords_from_resume(resume_text: str, resume_title: str = "") -> list[str]:
     if not GEMINI_API_KEY or not resume_text:
         return []
 
@@ -132,7 +167,8 @@ def extract_search_keywords_from_resume(resume_text: str, resume_title: str = ""
 ТЕКСТ РЕЗЮМЕ:
 {resume_text[:2500]}
 """
-        response = client.models.generate_content(
+        response = _generate_content_with_retry(
+            client=client,
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -152,7 +188,10 @@ def extract_search_keywords_from_resume(resume_text: str, resume_title: str = ""
     return []
 
 
-# ── 📊 Спецификация и Pydantic-схемы для Аудита IT-резюме ───────────────
+async def extract_search_keywords_from_resume(resume_text: str, resume_title: str = "") -> list[str]:
+    """Неблокирующая асинхронная обертка для извлечения ключевых слов."""
+    return await asyncio.to_thread(_sync_extract_search_keywords_from_resume, resume_text, resume_title)
+
 
 class CategoryScores(BaseModel):
     hard_skills: int = Field(description="Оценка Hard Skills и стека технологий от 0 до 100")
@@ -189,11 +228,7 @@ class VacancyMatchPayload(BaseModel):
     advice_for_apply: str = Field(description="Практический совет по адаптации резюме и отклика под данную позицию")
 
 
-def analyze_resume_quality(resume_text: str) -> ResumeAuditPayload:
-    """
-    Проводит глубокий аудит качества IT-резюме через Gemini по стандартам ATS и макросам Google XYZ/STAR.
-    Использует 2-уровневый движок: ИИ-извлечение показателей + строгая математическая калибровка Python.
-    """
+def _sync_analyze_resume_quality(resume_text: str) -> ResumeAuditPayload:
     if not GEMINI_API_KEY or not resume_text or len(resume_text.strip()) < 50:
         return ResumeAuditPayload(
             is_it_profession=False,
@@ -229,7 +264,8 @@ def analyze_resume_quality(resume_text: str) -> ResumeAuditPayload:
 {resume_text[:6000]}
 """
 
-        response = client.models.generate_content(
+        response = _generate_content_with_retry(
+            client=client,
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -247,7 +283,6 @@ def analyze_resume_quality(resume_text: str) -> ResumeAuditPayload:
                 rejection_reason="Модель вернула пустой результат."
             )
 
-        # ── СТРОГИЙ МАТЕМАТИЧЕСКИЙ ПЕРЕСЧЕТ В PYTHON (по спецификации) ──
         cats = result.category_scores
         weighted_score = (
             0.30 * cats.hard_skills +
@@ -257,12 +292,10 @@ def analyze_resume_quality(resume_text: str) -> ResumeAuditPayload:
             0.15 * cats.style
         )
         
-        # Вычет за обнаруженные штрафы (максимум -20 баллов суммарно)
         penalty_deduction = min(20, len(result.penalties) * 3)
         calculated_overall = round(weighted_score - penalty_deduction)
         
         result.overall_score = max(0, min(100, calculated_overall))
-
 
         logger.info("Успешно выполнен ИИ-аудит резюме '%s' (IT: %s, Калькулируемый балл: %d)", result.profession_name, result.is_it_profession, result.overall_score)
         return result
@@ -276,11 +309,12 @@ def analyze_resume_quality(resume_text: str) -> ResumeAuditPayload:
         )
 
 
+async def analyze_resume_quality(resume_text: str) -> ResumeAuditPayload:
+    """Неблокирующая асинхронная обертка для аудита резюме."""
+    return await asyncio.to_thread(_sync_analyze_resume_quality, resume_text)
 
-def match_resume_to_vacancy(resume_text: str, vacancy_text: str) -> VacancyMatchPayload:
-    """
-    Проводит ИИ-сравнение (Job Matching) резюме кандидата с текстом вакансии/JD.
-    """
+
+def _sync_match_resume_to_vacancy(resume_text: str, vacancy_text: str) -> VacancyMatchPayload:
     if not GEMINI_API_KEY or not resume_text or not vacancy_text:
         return VacancyMatchPayload(
             match_score=0,
@@ -305,7 +339,8 @@ def match_resume_to_vacancy(resume_text: str, vacancy_text: str) -> VacancyMatch
 3. Выделите критические отсутствующие навыки или нехватку опыта из требований вакансии (missing_skills).
 4. Дайте практический совет (advice_for_apply), как адаптировать отклик под эту роль.
 """
-        response = client.models.generate_content(
+        response = _generate_content_with_retry(
+            client=client,
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -333,6 +368,11 @@ def match_resume_to_vacancy(resume_text: str, vacancy_text: str) -> VacancyMatch
             is_suitable=False,
             advice_for_apply=f"Ошибка анализа: {e}"
         )
+
+
+async def match_resume_to_vacancy(resume_text: str, vacancy_text: str) -> VacancyMatchPayload:
+    """Неблокирующая асинхронная обертка для матчинга вакансии."""
+    return await asyncio.to_thread(_sync_match_resume_to_vacancy, resume_text, vacancy_text)
 
 
 class WorkExperienceItem(BaseModel):
@@ -365,11 +405,7 @@ class FullStructuredResume(BaseModel):
     about: str = Field(default="", description="Краткая информация о себе")
 
 
-def extract_full_structured_resume(resume_text: str) -> FullStructuredResume | None:
-    """
-    Извлекает полную структуру резюме из текста с помощью Gemini 3.5 Flash Lite
-    для дальнейшего пошагового автозаполнения форм на hh.ru.
-    """
+def _sync_extract_full_structured_resume(resume_text: str) -> FullStructuredResume | None:
     if not GEMINI_API_KEY or not resume_text:
         return None
 
@@ -382,7 +418,8 @@ def extract_full_structured_resume(resume_text: str) -> FullStructuredResume | N
 ТЕКСТ РЕЗЮМЕ КАНДИДАТА:
 {resume_text[:10000]}
 """
-        response = client.models.generate_content(
+        response = _generate_content_with_retry(
+            client=client,
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -400,3 +437,6 @@ def extract_full_structured_resume(resume_text: str) -> FullStructuredResume | N
         return None
 
 
+async def extract_full_structured_resume(resume_text: str) -> FullStructuredResume | None:
+    """Неблокирующая асинхронная обертка для извлечения структуры резюме."""
+    return await asyncio.to_thread(_sync_extract_full_structured_resume, resume_text)

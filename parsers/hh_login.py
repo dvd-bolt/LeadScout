@@ -4,6 +4,7 @@ LeadScout AI — Модуль интерактивной OTP-авторизац�
 """
 
 import asyncio
+import time
 import logging
 from typing import Dict, Any
 from patchright.async_api import Page, BrowserContext
@@ -30,6 +31,8 @@ class HHLoginSession:
         self.otp_code: str | None = None
         self.result: dict[str, Any] = {}
         self.is_done = False
+        self.created_at = time.time()
+
 
     async def start_login_flow(self) -> dict[str, Any]:
         """Первая фаза: запуск браузера и ввод номера телефона / email."""
@@ -307,12 +310,26 @@ class HHLoginManager:
     _sessions: dict[int, HHLoginSession] = {}
 
     @classmethod
+    async def _auto_cleanup_session(cls, user_id: int, timeout: float = 600.0) -> None:
+        """Автоматическое закрытие брошенной сессии авторизации по таймауту (10 мин)."""
+        await asyncio.sleep(timeout)
+        session = cls._sessions.get(user_id)
+        if session and not session.is_done:
+            logger.info("Сессия входа пользователя %d не активна %d сек. Автоматическое освобождение ресурсов Chrome...", user_id, int(timeout))
+            await session.cleanup()
+            cls._sessions.pop(user_id, None)
+
+    @classmethod
     async def start_login(cls, user_id: int, phone_or_email: str, account_id: int | None = None) -> dict[str, Any]:
         if user_id in cls._sessions:
             await cls._sessions[user_id].cleanup()
         
         session = HHLoginSession(user_id, phone_or_email, account_id=account_id)
         cls._sessions[user_id] = session
+
+        # Запуск таски автоочистки через 10 минут
+        asyncio.create_task(cls._auto_cleanup_session(user_id, timeout=600.0))
+
         return await session.start_login_flow()
 
     @classmethod

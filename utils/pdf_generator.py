@@ -18,21 +18,35 @@ from reportlab.pdfbase.ttfonts import TTFont
 
 logger = logging.getLogger(__name__)
 
-# Регистрация кириллических шрифтов Arial из системы Windows
+# Регистрация кириллических шрифтов (Windows Arial / Linux DejaVu / Liberation)
 FONT_REGULAR = "Helvetica"
 FONT_BOLD = "Helvetica-Bold"
 
-try:
-    font_path_regular = "C:/Windows/Fonts/arial.ttf"
-    font_path_bold = "C:/Windows/Fonts/arialbd.ttf"
-    if os.path.exists(font_path_regular) and os.path.exists(font_path_bold):
-        pdfmetrics.registerFont(TTFont("ArialCyr", font_path_regular))
-        pdfmetrics.registerFont(TTFont("ArialCyr-Bold", font_path_bold))
+regular_candidates = [
+    "C:/Windows/Fonts/arial.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+]
+bold_candidates = [
+    "C:/Windows/Fonts/arialbd.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+]
+
+found_reg = next((p for p in regular_candidates if os.path.exists(p)), None)
+found_bold = next((p for p in bold_candidates if os.path.exists(p)), None)
+
+if found_reg and found_bold:
+    try:
+        pdfmetrics.registerFont(TTFont("ArialCyr", found_reg))
+        pdfmetrics.registerFont(TTFont("ArialCyr-Bold", found_bold))
         FONT_REGULAR = "ArialCyr"
         FONT_BOLD = "ArialCyr-Bold"
-        logger.info("Успешно зарегистрированы шрифты ArialCyr для ReportLab PDF.")
-except Exception as e:
-    logger.warning("Не удалось зарегистрировать шрифты ArialCyr (%s). Задействованы стандартные шрифты.", e)
+        logger.info("Успешно зарегистрированы шрифты %s / %s для ReportLab PDF.", found_reg, found_bold)
+    except Exception as e:
+        logger.warning("Не удалось зарегистрировать кириллические шрифты (%s). Используются стандартные.", e)
 
 
 

@@ -10,6 +10,7 @@ import json
 import random
 import socket
 import urllib.parse
+import html
 from taskiq import InMemoryBroker
 from aiogram import Bot
 
@@ -117,6 +118,8 @@ async def process_account_hh_applications(account_id: int) -> dict:
         await update_account_session(account_id, b"", "EXPIRED")
         return {"status": "EXPIRED_SESSION"}
 
+    browser_counted = False
+
     # Захват семафора контроля количества параллельных браузеров (до 2)
     async with browser_semaphore:
         if active_browsers_count > 0:
@@ -127,6 +130,7 @@ async def process_account_hh_applications(account_id: int) -> dict:
             logger.info("Единственный браузер для '%s' запущен мгновенно (без задержки)...", account_name)
 
         active_browsers_count += 1
+        browser_counted = True
         engine = HHBrowserEngine(proxy_url=account.get("proxy_url"))
         context = None
         try:
@@ -139,7 +143,7 @@ async def process_account_hh_applications(account_id: int) -> dict:
             if not keywords_str or keywords_str.strip() in ["", "Python", "Python, Backend, FastAPI, Django"]:
                 resume_text = account.get("resume_text", "")
                 resume_title = account.get("active_resume_title", "")
-                ai_keywords = extract_search_keywords_from_resume(resume_text, resume_title)
+                ai_keywords = await extract_search_keywords_from_resume(resume_text, resume_title)
                 if ai_keywords:
                     keywords_str = ", ".join(ai_keywords)
                     await update_account_settings(account_id, keywords=keywords_str)
@@ -198,10 +202,11 @@ async def process_account_hh_applications(account_id: int) -> dict:
                         await update_account_session(account_id, b"", "EXPIRED")
                         if BOT_TOKEN:
                             bot = Bot(token=BOT_TOKEN)
-                            safe_name = _escape_md(account_name)
+                            safe_name = html.escape(account_name)
                             await bot.send_message(
                                 chat_id=user_id,
-                                text=f"⚠️ **Сессия аккаунта `{safe_name}` истекла.** Пожалуйста, войдите повторно через `👤 Мои аккаунты`."
+                                text=f"⚠️ <b>Сессия аккаунта <code>{safe_name}</code> истекла.</b> Пожалуйста, войдите повторно через <code>👤 Мои аккаунты</code>.",
+                                parse_mode="HTML"
                             )
                             await bot.session.close()
                         return {"status": "SESSION_EXPIRED"}
@@ -262,23 +267,23 @@ async def process_account_hh_applications(account_id: int) -> dict:
                         if BOT_TOKEN:
                             company_name = extra.get("company", "Работодатель") if isinstance(extra, dict) else "Работодатель"
                             vac_title = extra.get("title", "Вакансия") if isinstance(extra, dict) else "Вакансия"
-                            safe_acc_name = _escape_md(account_name)
-                            safe_company = _escape_md(company_name)
-                            safe_title = _escape_md(vac_title)
-                            safe_letter = _escape_md((cover_letter or "")[:300])
+                            safe_acc_name = html.escape(account_name)
+                            safe_company = html.escape(company_name)
+                            safe_title = html.escape(vac_title)
+                            safe_letter = html.escape((cover_letter or "")[:300])
 
                             bot = Bot(token=BOT_TOKEN)
                             msg_text = (
-                                f"🎯 *Отклик отправлен с аккаунта `{safe_acc_name}`!*\n\n"
-                                f"🏢 *Компания:* {safe_company}\n"
-                                f"📌 *Вакансия:* [{safe_title}]({vacancy_url})\n"
-                                f"📊 *Всего сегодня:* `{current_applied}/{account.get('daily_limit', 50)}`\n"
+                                f"🎯 <b>Отклик отправлен с аккаунта <code>{safe_acc_name}</code>!</b>\n\n"
+                                f"🏢 <b>Компания:</b> {safe_company}\n"
+                                f"📌 <b>Вакансия:</b> <a href=\"{vacancy_url}\">{safe_title}</a>\n"
+                                f"📊 <b>Всего сегодня:</b> <code>{current_applied}/{account.get('daily_limit', 50)}</code>\n"
                             )
                             if cover_letter:
-                                msg_text += f"\n📝 *Сопроводительное письмо:*\n{safe_letter}"
+                                msg_text += f"\n📝 <b>Сопроводительное письмо:</b>\n{safe_letter}"
 
                             try:
-                                await bot.send_message(chat_id=user_id, text=msg_text, parse_mode="Markdown")
+                                await bot.send_message(chat_id=user_id, text=msg_text, parse_mode="HTML")
                             except Exception:
                                 plain = f"🎯 Отклик отправлен (Аккаунт: {account_name})!\n🏢 Компания: {company_name}\n📌 Вакансия: {vac_title}\n{vacancy_url}"
                                 await bot.send_message(chat_id=user_id, text=plain)
@@ -303,22 +308,22 @@ async def process_account_hh_applications(account_id: int) -> dict:
 
                         if BOT_TOKEN:
                             bot = Bot(token=BOT_TOKEN)
-                            q_text = "\n".join([f"• {_escape_md(q)}" for q in questions[:3]])
-                            safe_v_title = _escape_md(v_title)
-                            safe_acc_name = _escape_md(account_name)
-                            safe_cl = _escape_md((cover_letter or '')[:250])
+                            q_text = "\n".join([f"• {html.escape(q)}" for q in questions[:3]])
+                            safe_v_title = html.escape(v_title)
+                            safe_acc_name = html.escape(account_name)
+                            safe_cl = html.escape((cover_letter or '')[:250])
                             msg_text = (
-                                f"❓ *Требуется подтверждение отклика (`{safe_acc_name}`)*!\n\n"
-                                f"📌 *Вакансия:* [{safe_v_title}]({vacancy_url})\n"
-                                f"❓ *Вопросы работодателя:*\n{q_text}\n\n"
-                                f"📝 *Предложенное письмо:*\n{safe_cl}"
+                                f"❓ <b>Требуется подтверждение отклика (<code>{safe_acc_name}</code>)</b>!\n\n"
+                                f"📌 <b>Вакансия:</b> <a href=\"{vacancy_url}\">{safe_v_title}</a>\n"
+                                f"❓ <b>Вопросы работодателя:</b>\n{q_text}\n\n"
+                                f"📝 <b>Предложенное письмо:</b>\n{safe_cl}"
                             )
                             try:
                                 await bot.send_message(
                                     chat_id=user_id,
                                     text=msg_text,
                                     reply_markup=get_questionnaire_confirmation_keyboard(apply_id),
-                                    parse_mode="Markdown"
+                                    parse_mode="HTML"
                                 )
                             except Exception:
                                 plain = f"❓ Требуется подтверждение отклика ({account_name})!\n📌 Вакансия: {v_title}\n{vacancy_url}"
@@ -341,7 +346,8 @@ async def process_account_hh_applications(account_id: int) -> dict:
             return {"status": f"ERROR: {e}"}
 
         finally:
-            active_browsers_count = max(0, active_browsers_count - 1)
+            if browser_counted:
+                active_browsers_count = max(0, active_browsers_count - 1)
             if context:
                 await context.close()
             await engine.close()

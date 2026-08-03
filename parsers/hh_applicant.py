@@ -102,6 +102,27 @@ async def fill_questionnaire_form(page: Page, answers: list[dict | FormAnswer]) 
             logger.warning("Ошибка при заполнении поля анкеты '%s': %s", field_id, err)
 
 
+async def verify_hh_application_success(page: Page) -> bool:
+    """Проверяет, подтвержден ли отклик на самой странице hh.ru."""
+    await page.wait_for_timeout(1500)
+
+    # 1. Проверка состояния кнопки "Вы откликнулись" / "Посмотреть отклик"
+    applied = page.locator('[data-qa="vacancy-response-link-view-topic"], a:has-text("Вы откликнулись"), a:has-text("Посмотреть отклик")').first
+    if await applied.count() > 0 and await applied.is_visible():
+        return True
+
+    # 2. Проверка текстов уведомлений
+    success_msg = page.locator('text="Отклик отправлен", text="Ваш отклик отправлен", text="Вы уже откликались"').first
+    if await success_msg.count() > 0 and await success_msg.is_visible():
+        return True
+
+    # 3. Проверка URL
+    if "vacancy_response" in page.url or "response" in page.url:
+        return True
+
+    return False
+
+
 async def apply_to_hh_vacancy(
     page: Page,
     resume_context: str,
@@ -170,7 +191,7 @@ async def apply_to_hh_vacancy(
                         questions_list.append(q_text.strip())
 
             # Генерация отклика через Gemini 3.5 Flash Lite
-            ai_payload: JobApplicationPayload = generate_hh_job_application(
+            ai_payload: JobApplicationPayload = await generate_hh_job_application(
                 resume_context=resume_context,
                 vacancy_description=vacancy_info["description"],
                 questions_list=questions_list
@@ -215,15 +236,72 @@ async def apply_to_hh_vacancy(
                 await page.wait_for_timeout(500)
 
             # Финальный клик по синей кнопке 'Откликнуться' внутри модального окна
-            modal_submit = page.locator('[data-qa="vacancy-response-submit-popup"]').first
-            if await modal_submit.count() > 0 and await modal_submit.is_visible():
-                logger.info("Отправка отклика через синюю кнопку модального окна...")
-                await human_click(page, modal_submit)
-                await page.wait_for_timeout(2000)
-                return "APPLIED_WITH_LETTER", ai_payload.cover_letter, vacancy_info
+            modal_submit_selectors = [
+                '[data-qa="vacancy-response-submit-popup"]',
+                '[data-qa="response-submit-popup"]',
+                '[data-qa*="response-submit"]',
+                '[data-qa*="submit-popup"]',
+                'button[type="submit"]',
+                'button:has-text("Откликнуться")',
+                'button:has-text("Отправить отклик")',
+                'button:has-text("Отправить")',
+            ]
 
-        # 4. Сценарий: Прямой отклик без открывающегося модального окна
-        return "APPLIED_DIRECT", None, vacancy_info
+            submitted = False
+            for sel in modal_submit_selectors:
+                submit_btn = page.locator(sel).first
+                if await submit_btn.count() > 0 and await submit_btn.is_visible():
+                    logger.info("Отправка отклика через синюю кнопку модального окна (%s)...", sel)
+                    await human_click(page, submit_btn)
+                    await page.wait_for_timeout(2500)
+                    submitted = True
+                    break
+
+
+            if submitted:
+                if await verify_hh_application_success(page):
+                    return "APPLIED_WITH_LETTER", ai_payload.cover_letter, vacancy_info
+                else:
+                    logger.warning("Кнопка отклика нажата, но hh.ru не подтвердил отправку для %s", vacancy_url)
+                    return "ERROR_SUBMIT_UNCONFIRMED", None, vacancy_info
+            else:
+                logger.warning("Не удалось найти и кликнуть кнопку отправки в модальном окне: %s", vacancy_url)
+                return "ERROR_SUBMIT_FAILED", None, vacancy_info
+
+        # 4. Сценарий: Прямой отклик без сразу появившегося модального окна
+        # Дополнительное ожидание на случай задержки отрисовки модалки
+        await page.wait_for_timeout(1500)
+        late_modal = page.locator(DATA_QA["modal_popup"]).first
+        if await late_modal.count() > 0 or await page.locator(DATA_QA["letter_toggle"]).count() > 0:
+            logger.info("Модальное окно отклика открылось с задержкой. Обработка...")
+            # Повторный вызов логики модального окна
+            letter_toggle = page.locator(DATA_QA["letter_toggle"]).first
+            if await letter_toggle.count() > 0 and await letter_toggle.is_visible():
+                await human_click(page, letter_toggle)
+                await page.wait_for_timeout(800)
+            
+            modal_submit_selectors = [
+                '[data-qa="vacancy-response-submit-popup"]',
+                '[data-qa="response-submit-popup"]',
+                '[data-qa*="response-submit"]',
+                '[data-qa*="submit-popup"]',
+                'button[type="submit"]',
+                'button:has-text("Откликнуться")',
+                'button:has-text("Отправить отклик")',
+                'button:has-text("Отправить")',
+            ]
+            for sel in modal_submit_selectors:
+                submit_btn = page.locator(sel).first
+                if await submit_btn.count() > 0 and await submit_btn.is_visible():
+                    await human_click(page, submit_btn)
+                    await page.wait_for_timeout(2500)
+                    break
+
+        if await verify_hh_application_success(page):
+            return "APPLIED_DIRECT", None, vacancy_info
+        else:
+            logger.warning("Прямой отклик на %s не был подтвержден сайтом hh.ru", vacancy_url)
+            return "ERROR_DIRECT_UNCONFIRMED", None, vacancy_info
 
     except Exception as e:
         logger.error("Ошибка при обработке вакансии %s: %s", vacancy_url, e)

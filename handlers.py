@@ -735,7 +735,7 @@ async def cb_select_resume(callback: CallbackQuery):
 
         if 0 <= idx < len(resumes_list):
             selected = resumes_list[idx]
-            ai_kw = extract_search_keywords_from_resume(acc.get("resume_text", ""), selected["title"])
+            ai_kw = await extract_search_keywords_from_resume(acc.get("resume_text", ""), selected["title"])
             kw_setting = ", ".join(ai_kw) if ai_kw else acc.get("keywords", "")
 
             await update_account_settings(
@@ -748,8 +748,7 @@ async def cb_select_resume(callback: CallbackQuery):
             await callback.message.edit_reply_markup(
                 reply_markup=get_resume_inline_keyboard(
                     resumes_list,
-                    selected_href=selected["href"],
-                    has_local_text=bool(acc.get("resume_text"))
+                    selected_href=selected["href"]
                 )
             )
 
@@ -815,7 +814,7 @@ async def _process_and_send_resume_audit(event: CallbackQuery | Message, resume_
     )
 
     # 1. Запуск 2-уровневого ИИ-анализа через Gemini + Python Math
-    audit_res = analyze_resume_quality(resume_text)
+    audit_res = await analyze_resume_quality(resume_text)
 
     # 2. Валидация на IT-профессию
     if not audit_res.is_it_profession:
@@ -1107,7 +1106,7 @@ async def process_vacancy_input_for_matching(message: Message, state: FSMContext
 
     status_msg = await message.answer("🎯 **ИИ сравнивает резюме с требованиями вакансии...**\n*Пожалуйста, подождите...*", parse_mode="Markdown")
 
-    match_res = match_resume_to_vacancy(resume_text, vacancy_input)
+    match_res = await match_resume_to_vacancy(resume_text, vacancy_input)
 
     bar = _make_progress_bar(match_res.match_score)
     status_str = "Высокое соответствие 🚀" if match_res.is_suitable else "Требуется адаптация отклика ⚠️"
@@ -1321,14 +1320,16 @@ async def cmd_applies_history(message: Message):
         await message.answer("📜 **История откликов пока пуста.**\nЗапустите автоотклик кнопкой `🚀 Запустить автоотклик`!")
         return
 
-    text = f"📜 **Последние отклики ({len(applies)} шт.):**\n\n"
+    import html
+    text = f"📜 <b>Последние отклики ({len(applies)} шт.):</b>\n\n"
     for idx, app in enumerate(applies, 1):
-        url = app.get("vacancy_hh_id", "#")
-        status = app.get("status", "APPLIED")
-        date_str = app.get("applied_at", "")[:16]
-        text += f"{idx}. 🔗 [{url}]({url})\n   📌 Статус: `{status}` | 🕒 `{date_str}`\n\n"
+        raw_url = app.get("vacancy_hh_id", "#")
+        safe_url = html.escape(raw_url)
+        status = html.escape(app.get("status", "APPLIED"))
+        date_str = html.escape(str(app.get("applied_at", ""))[:16])
+        text += f"{idx}. 🔗 <a href=\"{safe_url}\">{safe_url}</a>\n   📌 Статус: <code>{status}</code> | 🕒 <code>{date_str}</code>\n\n"
 
-    await message.answer(text, parse_mode="Markdown", disable_web_page_preview=True)
+    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 # ── 🚀 Запуск и остановка ─────────────────────────────────────────────

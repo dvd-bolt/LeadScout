@@ -233,7 +233,7 @@ class HHResumeManager:
                 logger.info("Пользователь %d: инпут прямой загрузки файла недоступен. Запуск ИИ-пошагового автозаполнения...", user_id)
                 resume_text = account.get("resume_text", "")
                 from ai_handler import extract_full_structured_resume
-                structured = extract_full_structured_resume(resume_text)
+                structured = await extract_full_structured_resume(resume_text)
 
                 if not structured:
                     return {"status": "WARNING", "message": "Текст резюме сохранен в боте для ИИ, но не удалось найти прямую форму выгрузки и извлечь структуру."}
