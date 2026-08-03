@@ -17,14 +17,19 @@ class SessionSecurityManager:
     """Менеджер шифрования и расшифровки браузерных сессий."""
 
     def __init__(self, key_str: str = SESSION_ENCRYPTION_KEY):
-        cleaned_key = key_str.strip() if key_str else "leadscout_default_secret_key_2026"
+        cleaned_key = key_str.strip() if key_str else ""
+        if not cleaned_key:
+            # Предупреждение в лог, если SESSION_ENCRYPTION_KEY не задан в .env
+            logger.warning("SESSION_ENCRYPTION_KEY не задан в .env! Инициализируется резервный сессионный ключ.")
+            cleaned_key = "LeadScout_AI_Secure_Default_Session_Key_2026"
+
         if cleaned_key.startswith("b'") and cleaned_key.endswith("'"):
             cleaned_key = cleaned_key[2:-1]
 
         try:
             self.cipher = Fernet(cleaned_key.encode("utf-8"))
         except Exception:
-            # Создаем устойчивый (детерминированный) 32-байтовый Fernet-ключ через SHA-256
+            # Создаем устойчивый 32-байтовый Fernet-ключ через SHA-256
             hashed = hashlib.sha256(cleaned_key.encode("utf-8")).digest()
             valid_fernet_key = base64.urlsafe_b64encode(hashed)
             self.cipher = Fernet(valid_fernet_key)

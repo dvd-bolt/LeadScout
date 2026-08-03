@@ -118,8 +118,6 @@ async def process_account_hh_applications(account_id: int) -> dict:
         await update_account_session(account_id, b"", "EXPIRED")
         return {"status": "EXPIRED_SESSION"}
 
-    browser_counted = False
-
     # Захват семафора контроля количества параллельных браузеров (до 2)
     async with browser_semaphore:
         if active_browsers_count > 0:
