@@ -62,7 +62,10 @@ class HHResumeManager:
 
             logger.info("Пользователь %d: загрузка списка резюме с hh.ru...", user_id)
             await page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded")
-            await asyncio.sleep(2.0)
+            try:
+                await page.wait_for_selector('[data-qa="resume-list-action-more"], a[href*="/resume/"]', timeout=2500)
+            except Exception:
+                await asyncio.sleep(1.0)
 
             # Проверка редиректа на логин
             if "account/login" in page.url:

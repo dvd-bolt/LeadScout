@@ -36,6 +36,10 @@ from database import (
 )
 from keyboards import (
     get_main_keyboard,
+    get_accounts_resume_hub_keyboard,
+    get_settings_analytics_hub_keyboard,
+    get_autoapply_launch_keyboard,
+    get_autoapply_manage_keyboard,
     get_accounts_inline_keyboard,
     get_settings_inline_keyboard,
     get_delete_confirmation_keyboard,
@@ -128,14 +132,102 @@ async def cmd_restart(message: Message, state: FSMContext):
 async def cmd_help(message: Message):
     """Справка по использованию бота."""
     help_text = (
-        "💡 **Инструкция по LeadScout AI:**\n\n"
-        "1️⃣ **👤 Мои аккаунты / 🔑 Авторизация**: Привяжите один или несколько аккаунтов hh.ru через СМС.\n"
-        "2️⃣ **🔄 Сменить аккаунт**: Выбирайте нужный аккаунт для быстрой настройки без разлогина!\n"
-        "3️⃣ **📄 Мое резюме**: Загрузите PDF-резюме или укажите резюме с hh.ru.\n"
-        "4️⃣ **⚙️ Настройки**: Укажите ключевые слова, ЗП, прокси и лимиты.\n"
-        "5️⃣ **🚀 Запустить автоотклик**: Бот параллельно (до 2 браузеров на 1 IP со сдвигом старта) находит вакансии, пишет ИИ-письма Gemini и делает отклики!"
+        "💡 **Инструкция по использованию LeadScout AI:**\n\n"
+        "1️⃣ **`🚀 Запустить` / `⛔️ Остановить`**: Быстрый запуск и остановка ИИ-автоотклика.\n"
+        "2️⃣ **`📊 Проверить резюме (IT)`**: Экспресс-аудит резюме по стандартам ATS и Google XYZ с генерацией PDF-отчета.\n"
+        "3️⃣ **`👤 Аккаунты и Резюме`**: Привязка аккаунтов hh.ru по СМС/капче, выбор активного профиля и резюме.\n"
+        "4️⃣ **`⚙️ Настройки и Аналитика`**: Настройка фильтров поиска (ЗП, удаленка, прокси, ключевые и стоп-слова), просмотр статистики и истории откликов."
     )
     await message.answer(help_text, parse_mode="Markdown")
+
+
+# ── 🎛 Хабы Главного Меню (Аккаунты, Резюме, Настройки, Аналитика) ──
+
+@router.message(F.text.in_({"👤 Аккаунты и Резюме", "👤 Мои аккаунты"}))
+async def cmd_accounts_and_resume_hub(message: Message):
+    """Хаб с вложенными кнопками управления аккаунтами и резюме."""
+    acc = await get_active_account(message.from_user.id)
+    acc_name = acc.get("account_name") if acc else "Не авторизован"
+    text = (
+        f"👤 **Центр управления аккаунтами и резюме**\n\n"
+        f"⭐ **Текущий активный аккаунт:** `{acc_name}`\n\n"
+        f"Выберите нужное действие из вложенного меню ниже:"
+    )
+    await message.answer(text, reply_markup=get_accounts_resume_hub_keyboard(), parse_mode="Markdown")
+
+
+@router.message(F.text.in_({"⚙️ Настройки и Аналитика", "⚙️ Настройки"}))
+async def cmd_settings_and_analytics_hub(message: Message):
+    """Хаб с вложенными кнопками настроек, статистики и справки."""
+    text = (
+        f"⚙️ **Настройки бота и Аналитика**\n\n"
+        f"Управляйте параметрами поиска, смотрите статистику откликов или открывайте справку:"
+    )
+    await message.answer(text, reply_markup=get_settings_analytics_hub_keyboard(), parse_mode="Markdown")
+
+
+@router.callback_query(F.data == "start_hh_auth_hub")
+async def cb_start_hh_auth_hub(callback: CallbackQuery, state: FSMContext):
+    """Старт авторизации из инлайн-хаба."""
+    await callback.message.answer(
+        "🔑 **Авторизация hh.ru**\n\n"
+        "Отправьте ваш **номер телефона** (например: `+79991112233`) или **email**, привязанный к аккаунту hh.ru:",
+        parse_mode="Markdown"
+    )
+    await state.set_state(UserState.waiting_for_phone_or_email)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "open_settings_menu_hub")
+async def cb_open_settings_menu_hub(callback: CallbackQuery):
+    """Открытие меню настроек активного аккаунта."""
+    acc = await get_active_account(callback.from_user.id)
+    if not acc:
+        await callback.message.answer("⚠️ **У вас нет активного аккаунта.** Нажмите `🔑 Авторизоваться в hh.ru`.")
+        await callback.answer()
+        return
+    acc_name = acc.get("account_name") or acc.get("phone_or_email")
+    await callback.message.answer(
+        f"⚙️ **Настройки аккаунта `{acc_name}`:**",
+        reply_markup=get_settings_inline_keyboard(acc),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "show_stats_inline")
+async def cb_show_stats_inline(callback: CallbackQuery):
+    """Вывод статистики из инлайн-хаба."""
+    await cmd_stats(callback.message, user_id=callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "show_history_inline")
+async def cb_show_history_inline(callback: CallbackQuery):
+    """Вывод истории откликов из инлайн-хаба."""
+    await cmd_applies_history(callback.message, user_id=callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "show_help_inline")
+async def cb_show_help_inline(callback: CallbackQuery):
+    """Вывод справки из инлайн-хаба."""
+    await cmd_help(callback.message)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "restart_bot_hub")
+async def cb_restart_bot_hub(callback: CallbackQuery, state: FSMContext):
+    """Перезапуск состояния бота из инлайн-хаба."""
+    await state.clear()
+    accounts = await get_user_accounts(callback.from_user.id)
+    is_running = any(a.get("auto_apply_enabled") for a in accounts)
+    await callback.message.answer(
+        "🔄 **Состояние бота перезапущено!**",
+        reply_markup=get_main_keyboard(is_running),
+        parse_mode="Markdown"
+    )
+    await callback.answer("Бот перезапущен!")
 
 
 # ── 👤 Мульти-аккаунты hh.ru ──────────────────────────────────────────
@@ -151,7 +243,7 @@ async def cmd_accounts(message: Message):
     if not accounts:
         text = (
             "👤 **У вас пока нет привязанных аккаунтов hh.ru!**\n\n"
-            "Нажмите `🔑 Авторизация hh.ru` или кнопку ниже, чтобы привязать ваш первый аккаунт:"
+            "Нажмите `🔑 Авторизоваться в hh.ru` или `➕ Добавить аккаунт`, чтобы привязать ваш первый аккаунт:"
         )
     else:
         text = (
@@ -525,33 +617,54 @@ async def cb_upload_pdf_resume(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "sync_hh_resumes")
 async def cb_sync_hh_resumes(callback: CallbackQuery):
     try:
-        await callback.answer("🔄 Синхронизация списка резюме с hh.ru...")
+        await callback.answer()
     except Exception:
         pass
 
     acc = await get_active_account(callback.from_user.id)
     if not acc:
-        await callback.message.edit_text("⚠️ Аккаунт не выбран. Авторизуйтесь заново.")
+        await callback.message.edit_text("⚠️ Аккаунт не выбран. Перейдите в `👤 Аккаунты и Резюме` -> `🔑 Авторизоваться в hh.ru`.")
         return
+
+    # Мгновенно выводим сообщение об активном процессе, чтобы пользователь понимал, что запрос обрабатывается
+    try:
+        await callback.message.edit_text(
+            f"🔄 **Синхронизация списка резюме с hh.ru...**\n"
+            f"Подключаемся к профилю `{acc.get('account_name')}`...",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
 
     hh_res = await HHResumeManager.fetch_user_resumes(callback.from_user.id, account_id=acc["id"])
     resumes_list = hh_res.get("resumes", []) if hh_res.get("status") == "SUCCESS" else []
-
     active_title = acc.get("active_resume_title") or (resumes_list[0]["title"] if resumes_list else "Не выбрано")
+    resume_len = len(acc.get("resume_text") or "")
     text = (
         f"📄 **Управление резюме для аккаунта `{acc.get('account_name')}`:**\n\n"
         f"🎯 **Выбранное резюме:** `{active_title}`\n"
-        f"📊 **Текст для ИИ:** `{len(acc.get('resume_text', ''))} символов`\n"
-        f"📌 **Резюме на hh.ru:** `{len(resumes_list)} шт.`"
+        f"📊 **Текст для ИИ:** `{resume_len} символов`\n"
+        f"📌 **Резюме на hh.ru:** `{len(resumes_list)} шт.`\n\n"
+        f"Выберите резюме для настройки или загрузите новое:"
     )
-    await callback.message.edit_text(
-        text,
-        reply_markup=get_resume_inline_keyboard(
-            resumes_list,
-            selected_href=acc.get("active_resume_url")
-        ),
-        parse_mode="Markdown"
-    )
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=get_resume_inline_keyboard(
+                resumes_list,
+                selected_href=acc.get("active_resume_url")
+            ),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await callback.message.answer(
+            text,
+            reply_markup=get_resume_inline_keyboard(
+                resumes_list,
+                selected_href=acc.get("active_resume_url")
+            ),
+            parse_mode="Markdown"
+        )
 
 
 
@@ -1135,7 +1248,7 @@ async def process_vacancy_input_for_matching(message: Message, state: FSMContext
 async def cmd_settings(message: Message):
     acc = await get_active_account(message.from_user.id)
     if not acc:
-        await message.answer("⚠️ У вас нет активного аккаунта hh.ru. Нажмите `🔑 Авторизация hh.ru`.")
+        await message.answer("⚠️ У вас нет активного аккаунта hh.ru. Перейдите в `👤 Аккаунты и Резюме` -> `🔑 Авторизоваться в hh.ru`.")
         return
 
     await message.answer(
@@ -1289,12 +1402,13 @@ async def process_proxy_input(message: Message, state: FSMContext):
 # ── 📊 Статистика и История ───────────────────────────────────────────
 
 @router.message(F.text == "📊 Статистика")
-async def cmd_stats(message: Message):
-    acc = await get_active_account(message.from_user.id)
-    accounts = await get_user_accounts(message.from_user.id)
+async def cmd_stats(message: Message, user_id: int | None = None):
+    target_user_id = user_id or message.from_user.id
+    acc = await get_active_account(target_user_id)
+    accounts = await get_user_accounts(target_user_id)
 
     if not acc:
-        await message.answer("📊 У вас нет привязанных аккаунтов. Нажмите `🔑 Авторизация hh.ru`.")
+        await message.answer("📊 У вас нет привязанных аккаунтов. Перейдите в `👤 Аккаунты и Резюме` -> `🔑 Авторизоваться в hh.ru`.")
         return
 
     stats_text = (
@@ -1311,11 +1425,12 @@ async def cmd_stats(message: Message):
 
 
 @router.message(F.text == "📜 История откликов")
-async def cmd_applies_history(message: Message):
-    acc = await get_active_account(message.from_user.id)
+async def cmd_applies_history(message: Message, user_id: int | None = None):
+    target_user_id = user_id or message.from_user.id
+    acc = await get_active_account(target_user_id)
     acc_id = acc.get("id") if acc else None
 
-    applies = await get_user_recent_applies(message.from_user.id, limit=10, account_id=acc_id)
+    applies = await get_user_recent_applies(target_user_id, limit=10, account_id=acc_id)
     if not applies:
         await message.answer("📜 **История откликов пока пуста.**\nЗапустите автоотклик кнопкой `🚀 Запустить автоотклик`!")
         return
@@ -1334,58 +1449,192 @@ async def cmd_applies_history(message: Message):
 
 # ── 🚀 Запуск и остановка ─────────────────────────────────────────────
 
-@router.message(F.text == "🚀 Запустить автоотклик")
-async def cmd_start_autoapply(message: Message):
+# ── 🚀 Запуск и остановка автооткликов ─────────────────────────────────
+
+@router.message(F.text.in_({"🚀 Запустить автоотклик", "⛔️ Остановить автоотклик"}))
+async def cmd_autoapply_menu(message: Message):
+    """Показ информационного меню выбора режима или управления автооткликом."""
     accounts = await get_user_accounts(message.from_user.id)
     active_acc = await get_active_account(message.from_user.id)
 
     if not accounts:
-        await message.answer("⚠️ **Вы пока не авторизованы в hh.ru!**\nНажмите `🔑 Авторизация hh.ru`.")
+        await message.answer(
+            "⚠️ **Вы пока не авторизованы в hh.ru!**\nПерейдите в `👤 Аккаунты и Резюме` -> `🔑 Авторизоваться в hh.ru`.",
+            parse_mode="Markdown"
+        )
         return
 
-    if active_acc:
-        await update_account_settings(active_acc["id"], auto_apply_enabled=1)
+    running_accounts = [a for a in accounts if a.get("auto_apply_enabled")]
+    active_name = active_acc.get("account_name") or active_acc.get("phone_or_email") if active_acc else "Не выбран"
 
-    from worker import process_account_hh_applications, process_user_hh_applications
-    try:
-        if active_acc:
-            await process_account_hh_applications.kiq(active_acc["id"])
-        else:
-            await process_user_hh_applications.kiq(message.from_user.id)
-    except Exception as e:
-        logger.info("Запуск фоновой задачи напрямую: %s", e)
-        if active_acc:
-            asyncio.create_task(process_account_hh_applications(active_acc["id"]))
-
-    acc_name = active_acc.get("account_name") if active_acc else "hh.ru"
-    all_accs = await get_user_accounts(message.from_user.id)
-    active_count = sum(1 for a in all_accs if a.get("auto_apply_enabled") and a.get("session_status") == "ACTIVE")
-
-    if active_count <= 1:
-        details = "Бот открывает 1 браузер Patchright Stealth (мгновенный запуск)."
-    elif active_count == 2:
-        details = "Бот поднимет 2 параллельных браузера со случайным сдвигом старта (5-15 сек) для защиты IP."
+    if not running_accounts:
+        # Режим предложения запуска
+        text = (
+            f"🚀 **Параметры запуска ИИ-автооткликов**\n\n"
+            f"⭐ **Активный аккаунт:** `{active_name}`\n"
+            f"👥 **Всего аккаунтов hh.ru:** `{len(accounts)} шт.`\n\n"
+            f"🌐 **Режимы браузера Patchright Stealth:**\n"
+            f"• **1 браузер:** Запускает автопоиск только для активного аккаунта.\n"
+            f"• **2 параллельных браузера:** Запускает одновременно ВСЕ аккаунты со сдвигом старта 5–15 сек (для защиты IP).\n\n"
+            f"Выберите нужный режим запуска ниже:"
+        )
+        await message.answer(
+            text,
+            reply_markup=get_autoapply_launch_keyboard(accounts, active_acc),
+            parse_mode="Markdown"
+        )
     else:
-        details = f"Бот запустит задачи для {active_count} аккаунтов в режиме очереди (максимум 2 параллельных браузера)."
+        # Режим управления уже запущенным автооткликом
+        running_names = ", ".join([f"`{a.get('account_name') or a.get('phone_or_email')}`" for a in running_accounts])
+        browsers_count = min(len(running_accounts), 2)
+        text = (
+            f"⚡️ **ИИ-Автоотклик СЕЙЧАС АКТИВЕН!**\n\n"
+            f"🚀 **Работает аккаунтов:** `{len(running_accounts)} шт.` ({running_names})\n"
+            f"🌐 **Поднято браузеров:** `{browsers_count} параллельных Patchright Chrome`\n\n"
+            f"Выберите нужное действие для остановки или просмотра:"
+        )
+        await message.answer(
+            text,
+            reply_markup=get_autoapply_manage_keyboard(accounts, active_acc),
+            parse_mode="Markdown"
+        )
 
-    await message.answer(
-        f"🚀 **Автоотклик запущен для аккаунта `{acc_name}`!**\n\n{details}",
+
+@router.callback_query(F.data.startswith("start_single_acc_"))
+async def cb_start_single_account(callback: CallbackQuery):
+    """Запуск автоотклика только для одного выбранного аккаунта."""
+    acc_id = int(callback.data.replace("start_single_acc_", ""))
+    acc = await get_account_by_id(acc_id)
+    if not acc or acc.get("user_id") != callback.from_user.id:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+
+    await update_account_settings(acc_id, auto_apply_enabled=1)
+    await set_active_account(callback.from_user.id, acc_id)
+
+    from worker import process_account_hh_applications
+    try:
+        await process_account_hh_applications.kiq(acc_id)
+    except Exception:
+        asyncio.create_task(process_account_hh_applications(acc_id))
+
+    acc_name = acc.get("account_name") or acc.get("phone_or_email")
+    try:
+        await callback.message.edit_text(
+            f"🚀 **Автоотклик запущен для аккаунта `{acc_name}`!**\n\n"
+            f"🌐 Бот открывает **1 скрытый браузер Patchright Stealth** (мгновенный запуск).",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    # Отправляем сообщение для обновления нижней Reply Keyboard
+    await callback.message.answer(
+        f"⚡️ **Панель обновлена:** Кнопка установлена в положение `⛔️ Остановить автоотклик`.",
         reply_markup=get_main_keyboard(is_auto_apply_running=True),
         parse_mode="Markdown"
     )
+    await callback.answer("Автоотклик запущен!")
 
 
-@router.message(F.text == "⛔️ Остановить автоотклик")
-async def cmd_stop_autoapply(message: Message):
-    accounts = await get_user_accounts(message.from_user.id)
+@router.callback_query(F.data == "start_all_accounts_hub")
+async def cb_start_all_accounts_hub(callback: CallbackQuery):
+    """Запуск автооткликов для ВСЕХ привязанных аккаунтов."""
+    accounts = await get_user_accounts(callback.from_user.id)
+    active_accs = [a for a in accounts if a.get("session_status") == "ACTIVE"]
+
+    if not active_accs:
+        await callback.answer("У вас нет авторизованных аккаунтов!", show_alert=True)
+        return
+
+    from worker import process_account_hh_applications
+    for acc in active_accs:
+        await update_account_settings(acc["id"], auto_apply_enabled=1)
+        try:
+            await process_account_hh_applications.kiq(acc["id"])
+        except Exception:
+            asyncio.create_task(process_account_hh_applications(acc["id"]))
+
+    count = len(active_accs)
+    if count == 1:
+        details = "Бот поднимет 1 скрытый браузер Chrome."
+    elif count == 2:
+        details = "Бот поднимет **2 параллельных браузера** со случайным сдвигом старта (5–15 сек) для защиты IP."
+    else:
+        details = f"Бот запустит задачи для **{count} аккаунтов** в режиме очереди (максимум 2 параллельных браузера)."
+
+    try:
+        await callback.message.edit_text(
+            f"🌐 **Автоотклик запущен для ВСЕХ аккаунтов ({count} шт.)!**\n\n{details}",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    await callback.message.answer(
+        f"⚡️ **Панель обновлена:** Кнопка установлена в положение `⛔️ Остановить автоотклик`.",
+        reply_markup=get_main_keyboard(is_auto_apply_running=True),
+        parse_mode="Markdown"
+    )
+    await callback.answer("ВСЕ аккаунты запущены!")
+
+
+@router.callback_query(F.data.startswith("stop_single_acc_"))
+async def cb_stop_single_account(callback: CallbackQuery):
+    """Остановка автоотклика для одного конкретного аккаунта."""
+    acc_id = int(callback.data.replace("stop_single_acc_", ""))
+    await update_account_settings(acc_id, auto_apply_enabled=0)
+
+    accounts = await get_user_accounts(callback.from_user.id)
+    is_any_running = any(a.get("auto_apply_enabled") for a in accounts)
+
+    try:
+        await callback.message.edit_text(
+            "⛔️ **Автоотклик для выбранного аккаунта остановлен.**",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    await callback.message.answer(
+        "⛔️ **Автоотклик остановлен.**",
+        reply_markup=get_main_keyboard(is_auto_apply_running=is_any_running),
+        parse_mode="Markdown"
+    )
+    await callback.answer("Остановлено!")
+
+
+@router.callback_query(F.data == "stop_all_accounts_hub")
+async def cb_stop_all_accounts_hub(callback: CallbackQuery):
+    """Остановка автооткликов для ВСЕХ аккаунтов."""
+    accounts = await get_user_accounts(callback.from_user.id)
     for acc in accounts:
         await update_account_settings(acc["id"], auto_apply_enabled=0)
 
-    await message.answer(
-        "⛔️ **Автоотклик успешно остановлен.**",
+    try:
+        await callback.message.edit_text(
+            "⛔️ **Автоотклики успешно остановлены для ВСЕХ аккаунтов.**",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    await callback.message.answer(
+        "⛔️ **Все автоотклики остановлены.**",
         reply_markup=get_main_keyboard(is_auto_apply_running=False),
         parse_mode="Markdown"
     )
+    await callback.answer("Все аккаунты остановлены!")
+
+
+@router.callback_query(F.data == "cancel_launch_menu")
+async def cb_cancel_launch_menu(callback: CallbackQuery):
+    """Закрытие инлайн-меню запуска."""
+    try:
+        await callback.message.delete()
+    except Exception:
+        await callback.message.edit_text("❌ Действие отменено.")
+    await callback.answer()
 
 
 # ── ❓ Анкетирование ──────────────────────────────────────────────────

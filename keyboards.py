@@ -7,18 +7,92 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 
 
 def get_main_keyboard(is_auto_apply_running: bool = False) -> ReplyKeyboardMarkup:
-    """Главная клавиатура бота."""
+    """Главная оптимизированная клавиатура бота (4 кнопки)."""
     action_btn_text = "⛔️ Остановить автоотклик" if is_auto_apply_running else "🚀 Запустить автоотклик"
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=action_btn_text), KeyboardButton(text="📊 Проверить резюме (IT)")],
-            [KeyboardButton(text="👤 Мои аккаунты"), KeyboardButton(text="📊 Статистика")],
-            [KeyboardButton(text="📄 Мое резюме"), KeyboardButton(text="⚙️ Настройки")],
-            [KeyboardButton(text="🔑 Авторизация hh.ru"), KeyboardButton(text="🔄 Перезапустить бота")],
-            [KeyboardButton(text="📜 История откликов"), KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="👤 Аккаунты и Резюме"), KeyboardButton(text="⚙️ Настройки и Аналитика")],
         ],
         resize_keyboard=True
     )
+
+
+def get_accounts_resume_hub_keyboard() -> InlineKeyboardMarkup:
+    """Инлайн-меню Хаба Аккаунтов и Резюме."""
+    buttons = [
+        [InlineKeyboardButton(text="📄 Мое резюме (PDF / hh.ru)", callback_data="sync_hh_resumes")],
+        [InlineKeyboardButton(text="👤 Список аккаунтов hh.ru", callback_data="switch_account_menu")],
+        [InlineKeyboardButton(text="🔑 Авторизоваться в hh.ru", callback_data="start_hh_auth_hub")],
+        [InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="add_new_account")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_settings_analytics_hub_keyboard() -> InlineKeyboardMarkup:
+    """Инлайн-меню Хаба Настроек и Аналитики."""
+    buttons = [
+        [InlineKeyboardButton(text="⚙️ Настройки поиска", callback_data="open_settings_menu_hub")],
+        [InlineKeyboardButton(text="📊 Статистика откликов", callback_data="show_stats_inline")],
+        [InlineKeyboardButton(text="📜 История откликов", callback_data="show_history_inline")],
+        [InlineKeyboardButton(text="❓ Помощь и Справка", callback_data="show_help_inline")],
+        [InlineKeyboardButton(text="🔄 Перезапустить бота (/start)", callback_data="restart_bot_hub")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_autoapply_launch_keyboard(accounts: list[dict], active_account: dict | None) -> InlineKeyboardMarkup:
+    """Инлайн-меню выбора режима запуска автооткликов."""
+    buttons = []
+
+    if active_account:
+        acc_name = active_account.get("account_name") or active_account.get("phone_or_email") or f"ID {active_account.get('id')}"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🚀 Запустить ТОЛЬКО «{acc_name}» (1 браузер)",
+                callback_data=f"start_single_acc_{active_account.get('id')}"
+            )
+        ])
+
+    active_count = sum(1 for a in accounts if a.get("session_status") == "ACTIVE")
+    if len(accounts) > 1 and active_count > 1:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🌐 Запустить ВСЕ аккаунты ({active_count} шт., 2 браузера)",
+                callback_data="start_all_accounts_hub"
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_launch_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_autoapply_manage_keyboard(accounts: list[dict], active_account: dict | None) -> InlineKeyboardMarkup:
+    """Инлайн-меню управления уже работающим автооткликом."""
+    buttons = []
+
+    if active_account and active_account.get("auto_apply_enabled"):
+        acc_name = active_account.get("account_name") or active_account.get("phone_or_email") or f"ID {active_account.get('id')}"
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"⛔️ Остановить «{acc_name}»",
+                callback_data=f"stop_single_acc_{active_account.get('id')}"
+            )
+        ])
+
+    running_count = sum(1 for a in accounts if a.get("auto_apply_enabled"))
+    if running_count > 1:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"⛔️ Остановить ВСЕ аккаунты ({running_count} шт.)",
+                callback_data="stop_all_accounts_hub"
+            )
+        ])
+
+    buttons.append([InlineKeyboardButton(text="📊 Посмотреть статистику", callback_data="show_stats_inline")])
+    buttons.append([InlineKeyboardButton(text="❌ Закрыть", callback_data="cancel_launch_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 
 
