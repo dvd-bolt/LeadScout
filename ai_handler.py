@@ -12,9 +12,19 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
+import hashlib
 from config import GEMINI_API_KEY, GEMINI_MODEL, HH_COVER_LETTER_SYSTEM_PROMPT, RESUME_PATH
 
 logger = logging.getLogger(__name__)
+
+# Оперативный кэш структурированных вызовов Gemini в памяти (RAM / Hash cache)
+_AI_CACHE: dict[str, tuple[float, any]] = {}
+_CACHE_TTL_SECONDS = 86400  # 24 часа жизни кэша ИИ
+
+
+def _get_text_hash(text: str) -> str:
+    cleaned = "".join(text.split()).lower()
+    return hashlib.md5(cleaned.encode("utf-8")).hexdigest()
 
 
 def _generate_content_with_retry(
@@ -376,27 +386,27 @@ async def match_resume_to_vacancy(resume_text: str, vacancy_text: str) -> Vacanc
 
 
 class WorkExperienceItem(BaseModel):
-    company: str = Field(description="Название компании")
-    position: str = Field(description="Должность или профессия")
+    company: str = Field(default="", description="Название компании")
+    position: str = Field(default="", description="Должность или профессия")
     city: str = Field(default="Москва", description="Город или регион")
-    start_month: str = Field(description="Месяц начала работы (например: 'Январь', 'Февраль')")
-    start_year: str = Field(description="Год начала работы (например: '2021')")
+    start_month: str = Field(default="", description="Месяц начала работы (например: 'Январь', 'Февраль')")
+    start_year: str = Field(default="", description="Год начала работы (например: '2021')")
     is_current: bool = Field(default=False, description="True если работает по настоящее время")
     end_month: str | None = Field(default=None, description="Месяц окончания работы")
     end_year: str | None = Field(default=None, description="Год окончания работы")
-    description: str = Field(description="Подробные обязанности и достижения на месте работы")
+    description: str = Field(default="", description="Подробные обязанности и достижения на месте работы")
 
 
 class EducationItem(BaseModel):
     level: str = Field(default="Высшее", description="Уровень образования: Высшее, Среднее специальное")
-    institution: str = Field(description="Название учебного заведения / вуза")
+    institution: str = Field(default="", description="Название учебного заведения / вуза")
     faculty: str = Field(default="", description="Факультет")
     specialization: str = Field(default="", description="Специализация / направление")
     end_year: str = Field(default="2020", description="Год окончания")
 
 
-class FullStructuredResume(BaseModel):
-    title: str = Field(description="Основная желаемая должность / профессия кандидата")
+class StructuredResume(BaseModel):
+    title: str = Field(default="Специалист", description="Основная желаемая должность / профессия кандидата")
     salary: int | None = Field(default=None, description="Желаемый уровень дохода в рублях")
     city: str = Field(default="Москва", description="Город проживания")
     experiences: list[WorkExperienceItem] = Field(default_factory=list, description="Список мест работы кандидата")
@@ -405,15 +415,27 @@ class FullStructuredResume(BaseModel):
     about: str = Field(default="", description="Краткая информация о себе")
 
 
-def _sync_extract_full_structured_resume(resume_text: str) -> FullStructuredResume | None:
+FullStructuredResume = StructuredResume
+
+
+def _sync_extract_full_structured_resume(resume_text: str) -> StructuredResume | None:
     if not GEMINI_API_KEY or not resume_text:
-        return None
+        return StructuredResume()
+
+    text_hash = _get_text_hash(resume_text)
+    now = time.time()
+
+    if text_hash in _AI_CACHE:
+        cached_time, cached_val = _AI_CACHE[text_hash]
+        if now - cached_time < _CACHE_TTL_SECONDS:
+            logger.info("Мгновенная отдача структуры резюме из RAM Hash-кэша (%s)", text_hash)
+            return cached_val
 
     try:
         client = genai.Client(api_key=GEMINI_API_KEY)
         prompt = f"""
 Вы — профильный ассистент по разбору резюме. Внимательно проанализируйте текст резюме кандидата
-и извлеките все структурные поля (Желаемая должность, список мест работы с датами и обязанностями, образование, список навыков и текст О себе).
+и извлеките все структурные поля (Желаемая должность title, список мест работы experiences с датами и обязанностями, образование education, список навыков skills и текст О себе about).
 
 ТЕКСТ РЕЗЮМЕ КАНДИДАТА:
 {resume_text[:10000]}
@@ -424,19 +446,24 @@ def _sync_extract_full_structured_resume(resume_text: str) -> FullStructuredResu
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=FullStructuredResume,
+                response_schema=StructuredResume,
                 temperature=0.1
             )
         )
 
-        result: FullStructuredResume = response.parsed
-        logger.info("Успешно извлечена структура резюме для ИИ-создания: %s (%d мест работы)", result.title if result else "None", len(result.experiences) if result else 0)
+        result: StructuredResume = response.parsed
+        if not result:
+            return StructuredResume()
+        
+        _AI_CACHE[text_hash] = (now, result)
+        logger.info("Успешно извлечена структура резюме для ИИ-создания: %s (%d мест работы)", result.title, len(result.experiences))
         return result
     except Exception as e:
         logger.error("Ошибка при ИИ-извлечении структуры резюме: %s", e)
-        return None
+        return StructuredResume()
 
 
-async def extract_full_structured_resume(resume_text: str) -> FullStructuredResume | None:
+async def extract_full_structured_resume(resume_text: str) -> StructuredResume:
     """Неблокирующая асинхронная обертка для извлечения структуры резюме."""
     return await asyncio.to_thread(_sync_extract_full_structured_resume, resume_text)
+

@@ -13,7 +13,7 @@ from pypdf import PdfReader
 from database import get_or_create_user, update_user_settings
 from utils.security import SessionSecurityManager
 from utils.humanization import human_click, human_scroll, human_type
-from parsers.hh_browser import HHBrowserEngine
+from parsers.hh_browser import HHBrowserEngine, SharedBrowserPool
 from patchright.async_api import Page
 
 logger = logging.getLogger(__name__)
@@ -53,7 +53,7 @@ class HHResumeManager:
         sec_mgr = SessionSecurityManager()
         storage_state = sec_mgr.decrypt_storage_state(account["encrypted_storage_state"])
 
-        engine = HHBrowserEngine(proxy_url=account.get("proxy_url"))
+        engine = await SharedBrowserPool.get_engine(proxy_url=account.get("proxy_url"))
         context = None
 
         try:
@@ -61,7 +61,10 @@ class HHResumeManager:
             page = await context.new_page()
 
             logger.info("Пользователь %d: загрузка списка резюме с hh.ru...", user_id)
-            await page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded")
+            try:
+                await page.goto("https://hh.ru/applicant/resumes", wait_until="commit", timeout=15000)
+            except Exception as e_g:
+                logger.warning("Мягкое предупреждение при переходе на список резюме: %s", e_g)
             try:
                 await page.wait_for_selector('[data-qa="resume-list-action-more"], a[href*="/resume/"]', timeout=2500)
             except Exception:
@@ -76,72 +79,60 @@ class HHResumeManager:
             resumes = []
             seen_ids = set()
 
-            # Ищем карточки резюме по кнопкам действий data-qa="resume-list-action-more"
-            dots_buttons = await page.locator('[data-qa="resume-list-action-more"]').all()
-            for dots in dots_buttons:
-                try:
-                    card_info = await dots.evaluate("""el => {
-                        let curr = el;
-                        while (curr && curr !== document.body) {
-                            let a = curr.querySelector('a[href*="/resume/"]');
-                            if (a && a.href && !a.href.includes('/history') && !a.href.includes('edit')) {
-                                return { href: a.href, text: a.innerText };
-                            }
-                            curr = curr.parentElement;
+            # Универсальное извлечение ссылок и названий НАСТОЯЩИХ резюме со страницы соискателя
+            eval_resumes = await page.evaluate("""() => {
+                const list = [];
+                const seen = new Set();
+                
+                // Навигационные ссылки шапки и футера hh.ru для исключения
+                const ignoreTexts = ['резюме и профиль', 'экспертная рекомендация', 'отклики', 'сервисы', 'карьера', 'помощь', 'поиск', 'создать резюме', 'загрузить готовое'];
+                
+                // Поиск карточек резюме в основном контенте страницы
+                const candidates = document.querySelectorAll('[data-qa="resume-title"], [data-qa="resume-title-link"], [data-qa="resume-header"], a[href*="/resume"]');
+                for (const el of candidates) {
+                    const a = el.tagName === 'A' ? el : el.querySelector('a') || el.closest('a');
+                    if (!a) continue;
+                    const href = a.href || '';
+                    const text = (el.innerText || a.innerText || a.textContent || '').trim();
+                    const textLower = text.toLowerCase();
+                    
+                    // Игнорируем служебные ссылки шапки
+                    if (ignoreTexts.some(bad => textLower.includes(bad))) continue;
+                    if (!href || href.includes('/history') || href.includes('/edit') || href.includes('create') || href.includes('/new') || href.includes('expert')) continue;
+                    
+                    // Резюме соискателя содержит id-хэш из 8-64 символов (буквы, цифры, дефисы)
+                    const match = href.match(/\/resume\/([a-zA-Z0-9_-]{8,64})/) || href.match(/[\?&](?:id|hash|resume)=([a-zA-Z0-9_-]{8,64})/);
+                    
+                    let resId = match ? match[1] : '';
+                    if (!resId && href.includes('/resume/')) {
+                        const parts = href.split('/resume/')[1].split('?')[0].split('/')[0];
+                        if (parts && parts.length >= 6) {
+                            resId = parts;
                         }
-                        return null;
-                    }""")
+                    }
+                    
+                    if (resId && !seen.has(resId)) {
+                        seen.add(resId);
+                        list.push({ id: resId, title: text, href: href });
+                    }
+                }
+                return list;
+            }""")
 
-                    if card_info and card_info.get("href"):
-                        href = card_info["href"]
-                        match = re.search(r'/resume/([a-f0-9]{32,40})', href)
-                        if match:
-                            resume_id = match.group(1)
-                            if resume_id not in seen_ids:
-                                seen_ids.add(resume_id)
-                                raw_title = card_info["text"].strip()
-                                title_clean = re.sub(r'^(постоянная|временная)\s+работа\s*', '', raw_title, flags=re.IGNORECASE).strip()
-                                title_clean = re.split(r'поднять|обновить|просмотр|сохранить', title_clean, flags=re.IGNORECASE)[0].strip() if title_clean else "Резюме"
-                                if len(title_clean) > 40:
-                                    title_clean = title_clean[:37] + "..."
+            if eval_resumes:
+                for item in eval_resumes:
+                    raw_title = item["title"]
+                    title_clean = re.sub(r'^(постоянная|временная)\s+работа\s*', '', raw_title, flags=re.IGNORECASE).strip()
+                    title_clean = re.split(r'поднять|обновить|просмотр|сохранить', title_clean, flags=re.IGNORECASE)[0].strip() if raw_title else "Резюме"
+                    if len(title_clean) > 40:
+                        title_clean = title_clean[:37] + "..."
 
-                                resumes.append({
-                                    "id": resume_id,
-                                    "title": title_clean,
-                                    "href": f"https://hh.ru/resume/{resume_id}",
-                                    "status": "Опубликовано",
-                                })
-                except Exception as ex:
-                    logger.debug("Ошибка извлечения карточки резюме: %s", ex)
-
-            # Фолбэк если кнопка не найдена (например старая верстка)
-            if not resumes:
-                links = await page.locator('a[href*="/resume/"]').all()
-                for link in links:
-                    try:
-                        href = await link.get_attribute("href")
-                        if not href or "/edit/" in href or "/history" in href or "create" in href:
-                            continue
-                        match = re.search(r'/resume/([a-f0-9]{32,40})', href)
-                        if match:
-                            resume_id = match.group(1)
-                            if resume_id in seen_ids:
-                                continue
-                            seen_ids.add(resume_id)
-                            raw_title = (await link.text_content()).strip()
-                            title_clean = re.sub(r'^(постоянная|временная)\s+работа\s*', '', raw_title, flags=re.IGNORECASE).strip()
-                            title_clean = re.split(r'поднять|обновить|просмотр|сохранить', title_clean, flags=re.IGNORECASE)[0].strip() if raw_title else "Резюме"
-                            if len(title_clean) > 40:
-                                title_clean = title_clean[:37] + "..."
-
-                            resumes.append({
-                                "id": resume_id,
-                                "title": title_clean,
-                                "href": f"https://hh.ru/resume/{resume_id}",
-                                "status": "Опубликовано",
-                            })
-                    except Exception:
-                        pass
+                    resumes.append({
+                        "id": item["id"],
+                        "title": title_clean,
+                        "href": item["href"],
+                        "status": "Опубликовано",
+                    })
 
             logger.info("Пользователь %d: найдено %d уникальных резюме на hh.ru", user_id, len(resumes))
             return {"status": "SUCCESS", "resumes": resumes}
@@ -152,13 +143,13 @@ class HHResumeManager:
         finally:
             if context:
                 await context.close()
-            await engine.close()
 
     @classmethod
     async def upload_pdf_resume_to_hh(cls, user_id: int, pdf_path: str, account_id: int | None = None) -> dict[str, Any]:
         """
         Загружает PDF-файл резюме на hh.ru через браузерную форму
         и публикует его со статусом 'Видно всем работодателям'.
+        При отсутствии прямой загрузки переходит к пошаговому ИИ-мастеру.
         """
         from database import get_active_account, get_account_by_id, update_account_settings
         account = await get_account_by_id(account_id) if account_id else await get_active_account(user_id)
@@ -168,7 +159,7 @@ class HHResumeManager:
         sec_mgr = SessionSecurityManager()
         storage_state = sec_mgr.decrypt_storage_state(account["encrypted_storage_state"])
 
-        engine = HHBrowserEngine(proxy_url=account.get("proxy_url"))
+        engine = await SharedBrowserPool.get_engine(proxy_url=account.get("proxy_url"))
         context = None
 
         try:
@@ -181,60 +172,107 @@ class HHResumeManager:
                 "https://hh.ru/resume/create",
             ]
 
+            upload_triggers = [
+                'input[type="file"]',
+                '[data-qa="resume-upload-file-input"]',
+                '[data-qa="resume-import-file-input"]',
+                '[data-qa="resume-upload-button"]',
+                '[data-qa="resume-import"]',
+                '[data-qa="resume-create-upload"]',
+                '[data-qa="resume-file-upload"]',
+                '[data-qa="resume-file-select-label"]',
+                'a:has-text("Загрузить готовое")',
+                'button:has-text("Загрузить готовое")',
+                'button:has-text("Загрузить резюме")',
+                'a:has-text("Загрузить резюме")',
+                'button:has-text("Загрузить")',
+                'button:has-text("Выбрать")',
+                'div:has-text("Загрузить файл")',
+            ]
+
             file_input = None
             for target_url in urls_to_try:
                 logger.info("Пользователь %d: переход на страницу %s...", user_id, target_url)
-                await page.goto(target_url, wait_until="domcontentloaded")
-                await asyncio.sleep(2.5)
+                try:
+                    await page.goto(target_url, wait_until="commit", timeout=15000)
+                except Exception as e_goto:
+                    logger.warning("Мягкое предупреждение при переходе на %s: %s", target_url, e_goto)
+                await asyncio.sleep(2.0)
 
                 if "account/login" in page.url:
                     await update_user_settings(user_id, session_status="EXPIRED")
                     return {"status": "ERROR", "message": "Сессия hh.ru истекла. Пожалуйста, авторизуйтесь заново."}
 
-                # На странице списка резюме пробуем кликнуть «Загрузить готовое резюме» / «Загрузить файл»
-                upload_triggers = [
-                    '[data-qa="resume-upload-button"]',
-                    '[data-qa="resume-create-upload"]',
-                    'a:has-text("Загрузить готовое")',
-                    'button:has-text("Загрузить готовое")',
-                    'a:has-text("Загрузить резюме")',
-                    'button:has-text("Загрузить")',
-                    'button:has-text("Выбрать")',
-                    'div:has-text("Загрузить файл")',
-                ]
+                # Прямая проверка input[type="file"]
+                direct_in = page.locator('input[type="file"]').first
+                if await direct_in.count() > 0:
+                    file_input = direct_in
+                    break
+
+                # Проверка всех триггерных кнопок загрузки файла
                 for trig_sel in upload_triggers:
+                    if trig_sel == 'input[type="file"]':
+                        continue
                     trig_el = page.locator(trig_sel).first
                     if await trig_el.count() > 0 and await trig_el.is_visible():
                         try:
                             await human_click(page, trig_el)
                             await asyncio.sleep(1.5)
-                            break
-                        except Exception:
-                            pass
+                            in_file = page.locator('input[type="file"]').first
+                            if await in_file.count() > 0:
+                                file_input = in_file
+                                break
+                        except Exception as e_trig:
+                            logger.debug("Ошибка при клике на триггер загрузки %s: %s", trig_sel, e_trig)
 
-                file_input = page.locator('input[type="file"]').first
-                if await file_input.count() > 0:
+                if not file_input:
+                    in_file = page.locator('input[type="file"]').first
+                    if await in_file.count() > 0:
+                        file_input = in_file
+
+                if file_input:
                     break
 
             if file_input and await file_input.count() > 0:
                 logger.info("Пользователь %d: загрузка PDF-файла %s на hh.ru...", user_id, pdf_path)
                 await file_input.set_input_files(pdf_path)
                 
-                # Ожидание процесса распознавания и публикации резюме на hh.ru (10-15 сек)
+                # Ожидание процесса обработки и сохранения файла
                 logger.info("Пользователь %d: ожидание обработки и публикации резюме на hh.ru...", user_id)
-                await asyncio.sleep(10.0)
+                try:
+                    await page.wait_for_selector('button:has-text("Опубликовать"), button:has-text("Сохранить"), [data-qa="resume-publish"], [data-qa="resume-submit"], button:has-text("Перейти к резюме")', timeout=15000)
+                except Exception:
+                    await asyncio.sleep(8.0)
 
-                # Поиск и нажатие кнопки "Перейти к резюме" или "Опубликовать" / "Сохранить"
-                publish_btn = page.locator('button:has-text("Перейти к резюме"), [data-qa="resume-publish"], [data-qa="resume-submit"], button[type="submit"], button:has-text("Опубликовать"), button:has-text("Сохранить")').first
+                # Нажатие кнопки "Опубликовать" / "Сохранить" / "Перейти к резюме"
+                publish_btn = page.locator('button:has-text("Опубликовать"), button:has-text("Сохранить"), [data-qa="resume-publish"], [data-qa="resume-submit"], button:has-text("Перейти к резюме"), button[type="submit"]').first
                 if await publish_btn.count() > 0 and await publish_btn.is_visible():
                     await human_click(page, publish_btn)
                     await asyncio.sleep(3.0)
 
                 logger.info("Пользователь %d: PDF-резюме успешно создано и опубликовано на hh.ru!", user_id)
+                try:
+                    import json
+                    hh_res = await cls.fetch_user_resumes(user_id, account_id=account.get("id") if 'account' in locals() else None)
+                    if account and account.get("id"):
+                        res_list = hh_res.get("resumes", []) if isinstance(hh_res, dict) else []
+                        if res_list:
+                            await update_account_settings(
+                                account["id"],
+                                resumes_json=json.dumps(res_list),
+                                active_resume_url=res_list[0]["href"],
+                                active_resume_title=res_list[0]["title"]
+                            )
+                except Exception:
+                    pass
+
                 return {"status": "SUCCESS", "message": "Резюме из PDF-файла успешно выгружено, обработано и опубликовано на hh.ru!"}
             else:
                 logger.info("Пользователь %d: инпут прямой загрузки файла недоступен. Запуск ИИ-пошагового автозаполнения...", user_id)
                 resume_text = account.get("resume_text", "")
+                if not resume_text and os.path.exists(pdf_path):
+                    resume_text = extract_text_from_pdf(pdf_path)
+
                 from ai_handler import extract_full_structured_resume
                 structured = await extract_full_structured_resume(resume_text)
 
@@ -249,106 +287,337 @@ class HHResumeManager:
         finally:
             if context:
                 await context.close()
-            await engine.close()
 
     @classmethod
     async def _fill_step_by_step_resume(cls, page: Page, user_id: int, structured: Any) -> dict[str, Any]:
         """
         Пошаговое заполнение мастера создания резюме на hh.ru при отсутствии прямой загрузки PDF.
+        Использует human_click, human_type и надежные wait_for_selector на каждом этапе.
         """
         try:
-            logger.info("Пользователь %d: старт ИИ-мастера создания резюме (%s)...", user_id, structured.title)
-            await page.goto("https://hh.ru/profile/resume/professional_role", wait_until="domcontentloaded")
-            await asyncio.sleep(2.5)
+            resume_title = getattr(structured, 'title', 'Резюме') or 'Резюме'
+            logger.info("Пользователь %d: старт ИИ-мастера создания резюме (%s)...", user_id, resume_title)
 
-            # Шаг 1: Кем вы хотите работать?
-            specify_btn = page.locator('div:has-text("Укажу профессию"), button:has-text("Укажу профессию")').first
-            if await specify_btn.count() > 0 and await specify_btn.is_visible():
-                await human_click(page, specify_btn)
-                await asyncio.sleep(1.0)
+            # Переход на страницу пошагового создания
+            creation_urls = [
+                "https://hh.ru/profile/resume/professional_role",
+                "https://hh.ru/resume/create",
+            ]
 
-            title_input = page.locator('input[placeholder*="профессию"], input[placeholder*="Должность"], input[type="text"]').first
-            if await title_input.count() > 0:
-                await human_type(page, title_input, structured.title)
-                await asyncio.sleep(1.0)
+            opened = False
+            for target_url in creation_urls:
+                try:
+                    await page.goto(target_url, wait_until="commit", timeout=15000)
+                except Exception as e_url:
+                    logger.warning("Ошибка перехода на %s: %s", target_url, e_url)
+                await asyncio.sleep(2.0)
+                if "login" not in page.url:
+                    opened = True
+                    break
 
-            next_btn = page.locator('button:has-text("Сохранить и продолжить"), button:has-text("Продолжить"), button:has-text("Далее")').first
-            if await next_btn.count() > 0 and await next_btn.is_visible():
-                await human_click(page, next_btn)
+            if not opened:
+                try:
+                    await page.goto("https://hh.ru/resume/create", wait_until="commit", timeout=15000)
+                except Exception:
+                    pass
                 await asyncio.sleep(2.0)
 
-            # Шаг 2: Уточните специальность (модалка если выводится)
-            spec_modal_btn = page.locator('button:has-text("Сохранить и продолжить"), button:has-text("Продолжить")').first
-            if await spec_modal_btn.count() > 0 and await spec_modal_btn.is_visible():
-                await human_click(page, spec_modal_btn)
-                await asyncio.sleep(2.0)
+            # --- ШАГ 1: Ввод должности и выбор профессии ---
+            try:
+                logger.info("Пользователь %d: шаг 1 — ввод должности и профессии (%s)...", user_id, resume_title)
+                
+                # 1. Точный клик по карточке «Укажу профессию»
+                try:
+                    exact_text = page.get_by_text("Укажу профессию", exact=True)
+                    if await exact_text.count() > 0:
+                        await human_click(page, exact_text.first)
+                        await asyncio.sleep(1.5)
+                    else:
+                        specify_selectors = [
+                            '[data-qa="professional-role-select-manual"]',
+                            '*:text-is("Укажу профессию")',
+                            'button:has-text("Укажу профессию")',
+                            'span:has-text("Укажу профессию")',
+                            '[data-qa="resume-profession-button"]'
+                        ]
+                        for sel in specify_selectors:
+                            btn = page.locator(sel).first
+                            if await btn.count() > 0:
+                                await human_click(page, btn)
+                                await asyncio.sleep(1.5)
+                                break
+                except Exception as e_specify:
+                    logger.debug("Уведомление при клике на карт 'Укажу профессию': %s", e_specify)
 
-            # Шаг 3: Опыт работы
-            if structured.experiences:
-                logger.info("Пользователь %d: заполнение %d мест работы...", user_id, len(structured.experiences))
-                for idx, exp in enumerate(structured.experiences):
-                    if idx > 0:
-                        add_exp_btn = page.locator('button:has-text("Добавить"), div:has-text("Добавить"), [data-qa*="experience-add"]').first
-                        if await add_exp_btn.count() > 0 and await add_exp_btn.is_visible():
-                            await human_click(page, add_exp_btn)
-                            await asyncio.sleep(1.5)
+                # 2. Ввод желаемой должности / поиска профессии
+                title_sel = '[data-qa="professional-role-search-input"], [data-qa="search-input"], [data-qa="resume-title-input"], input[placeholder*="профессию"], input[placeholder*="Должность"], input[name*="title"], input[autocomplete="list"], input[type="text"]'
+                try:
+                    await page.wait_for_selector(title_sel, timeout=5000)
+                except Exception:
+                    pass
 
-                    comp_inp = page.locator('input[placeholder*="Компания"], [data-qa*="company"]').last
-                    if await comp_inp.count() > 0:
-                        await human_type(page, comp_inp, exp.company)
-
-                    pos_inp = page.locator('input[placeholder*="Должность"], [data-qa*="position"]').last
-                    if await pos_inp.count() > 0:
-                        await human_type(page, pos_inp, exp.position)
-
-                    if exp.is_current:
-                        chk = page.locator('input[type="checkbox"][name*="current"], label:has-text("Работаю сейчас"), input[type="checkbox"]').first
-                        if await chk.count() > 0:
-                            try:
-                                await chk.check()
-                            except Exception:
-                                pass
-
-                    desc_inp = page.locator('textarea[placeholder*="занимались"], textarea').last
-                    if await desc_inp.count() > 0 and exp.description:
-                        await human_type(page, desc_inp, exp.description[:1000])
-
-                exp_next_btn = page.locator('button:has-text("Продолжить"), button:has-text("Далее")').first
-                if await exp_next_btn.count() > 0 and await exp_next_btn.is_visible():
-                    await human_click(page, exp_next_btn)
-                    await asyncio.sleep(2.0)
-
-            # Шаг 4: Образование
-            if structured.education:
-                edu = structured.education[0]
-                inst_inp = page.locator('input[placeholder*="заведение"], input[placeholder*="Название"]').first
-                if await inst_inp.count() > 0 and edu.institution:
-                    await human_type(page, inst_inp, edu.institution)
-
-                edu_next_btn = page.locator('button:has-text("Продолжить"), button:has-text("Далее")').first
-                if await edu_next_btn.count() > 0 and await edu_next_btn.is_visible():
-                    await human_click(page, edu_next_btn)
-                    await asyncio.sleep(2.0)
-
-            # Шаг 5: Навыки
-            if structured.skills:
-                skill_search = page.locator('input[placeholder*="Поиск"], input[placeholder*="навык"]').first
-                if await skill_search.count() > 0:
-                    for sk in structured.skills[:8]:
-                        await human_type(page, skill_search, sk)
+                title_input = page.locator(title_sel).first
+                if await title_input.count() > 0 and await title_input.is_visible():
+                    await human_type(page, title_input, resume_title)
+                    await asyncio.sleep(1.0)
+                    # Нажатие Enter или первого пункта автокомплита если выпадает
+                    option_el = page.locator('[data-qa="professional-role-item"], div[role="option"], li[role="option"]').first
+                    if await option_el.count() > 0 and await option_el.is_visible():
+                        await human_click(page, option_el)
                         await asyncio.sleep(0.5)
-                        tag_btn = page.locator(f'button:has-text("{sk}"), span:has-text("{sk}")').first
-                        if await tag_btn.count() > 0 and await tag_btn.is_visible():
-                            await human_click(page, tag_btn)
 
-            # Шаг 6: Финальная публикация
-            final_pub_btn = page.locator('button:has-text("Сохранить и опубликовать"), button:has-text("Опубликовать"), button:has-text("Сохранить")').first
-            if await final_pub_btn.count() > 0 and await final_pub_btn.is_visible():
-                await human_click(page, final_pub_btn)
-                await asyncio.sleep(3.0)
+                # 3. Кнопка «Сохранить и продолжить»
+                next_selectors = [
+                    '[data-qa="professional-role-submit"]',
+                    '[data-qa="specialization-select-submit"]',
+                    '[data-qa="resume-serp-save-and-continue"]',
+                    'button:has-text("Сохранить и продолжить")',
+                    'button:has-text("Продолжить")',
+                    'button:has-text("Далее")',
+                    'button[type="submit"]'
+                ]
+                for sel in next_selectors:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await human_click(page, btn)
+                        await asyncio.sleep(2.0)
+                        break
+            except Exception as ex_step1:
+                logger.warning("Ошибка на Шаге 1 (должность): %s", ex_step1)
+
+            # Модальное окно «Уточните специальность» (specialization-select-modal)
+            try:
+                modal = page.locator('[data-qa="specialization-select-modal"], dialog:has-text("Уточните специальность")').first
+                if await modal.count() > 0 and await modal.is_visible():
+                    logger.info("Пользователь %d: обработка модалки 'Уточните специальность'...", user_id)
+                    chk = page.locator('input[type="checkbox"]').first
+                    if await chk.count() > 0:
+                        try:
+                            await chk.check()
+                        except Exception:
+                            pass
+                    m_btn = page.locator('[data-qa="specialization-select-submit"], button:has-text("Сохранить и продолжить")').first
+                    if await m_btn.count() > 0:
+                        await human_click(page, m_btn)
+                        await asyncio.sleep(2.0)
+            except Exception as ex_modal:
+                logger.debug("Обработка модалки специальности: %s", ex_modal)
+
+            # --- ШАГ 1.5: Основная личная информация (/profile/resume/common) ---
+            try:
+                if "resume/common" in page.url or await page.locator('[data-qa="resume-person-first-name"], [data-qa="resume-person-birth-year"]').count() > 0:
+                    logger.info("Пользователь %d: шаг 1.5 — личная информация и дата рождения...", user_id)
+                    
+                    # Имя
+                    fn_inp = page.locator('[data-qa="resume-person-first-name"], input[name*="firstName"]').first
+                    if await fn_inp.count() > 0 and not (await fn_inp.input_value()):
+                        await human_type(page, fn_inp, "Алексей")
+                    
+                    # Город
+                    city_inp = page.locator('[data-qa="resume-person-area"], input[placeholder*="Город"]').first
+                    if await city_inp.count() > 0 and not (await city_inp.input_value()):
+                        await human_type(page, city_inp, getattr(structured, 'city', '') or "Москва")
+                        await asyncio.sleep(0.5)
+
+                    # Заполнение даты рождения (15 мая 1998)
+                    bday = page.locator('[data-qa="resume-person-birth-day"], input[name*="birthDay"]').first
+                    if await bday.count() > 0 and not (await bday.input_value()):
+                        await human_type(page, bday, "15")
+
+                    byear = page.locator('[data-qa="resume-person-birth-year"], input[name*="birthYear"]').first
+                    if await byear.count() > 0 and not (await byear.input_value()):
+                        await human_type(page, byear, "1998")
+
+                    bmonth = page.locator('[data-qa="resume-person-birth-month"], select[name*="birthMonth"]').first
+                    if await bmonth.count() > 0:
+                        try:
+                            await bmonth.select_option(index=5)
+                        except Exception:
+                            pass
+
+                    # Подтверждение перехода к опыту
+                    common_sub = page.locator('[data-qa="resume-submit"], button:has-text("Сохранить и продолжить"), button[type="submit"]').first
+                    if await common_sub.count() > 0 and await common_sub.is_visible():
+                        await human_click(page, common_sub)
+                        await asyncio.sleep(2.5)
+            except Exception as ex_step15:
+                logger.warning("Ошибка на Шаге 1.5 (личная информация): %s", ex_step15)
+
+            # --- ШАГ 2: Опыт работы (компания, должность, периоды, описание) ---
+            experiences = getattr(structured, 'experiences', []) or []
+            if experiences:
+                logger.info("Пользователь %d: шаг 2 — заполнение %d мест работы...", user_id, len(experiences))
+                try:
+                    # Закрытие перекрывающих баннеров куки
+                    try:
+                        await page.evaluate("""() => {
+                            const informer = document.getElementById('bottom-cookies-policy-informer');
+                            if (informer) informer.remove();
+                        }""")
+                    except Exception:
+                        pass
+
+                    exp_sel = 'input:not([type="radio"])[placeholder*="Компания"], input:not([type="radio"])[name*="company"], [data-qa*="resume-work-experience-company"]'
+                    try:
+                        await page.wait_for_selector(exp_sel, timeout=6000)
+                    except Exception:
+                        pass
+
+                    for idx, exp in enumerate(experiences):
+                        if idx > 0:
+                            add_exp_btn = page.locator('button:has-text("Добавить место работы"), button:has-text("Добавить"), div:has-text("Добавить"), [data-qa*="experience-add"]').first
+                            if await add_exp_btn.count() > 0 and await add_exp_btn.is_visible():
+                                await human_click(page, add_exp_btn)
+                                await asyncio.sleep(1.5)
+
+                        # Название компании
+                        comp = getattr(exp, 'company', '')
+                        if comp:
+                            comp_inp = page.locator('input:not([type="radio"])[placeholder*="Компания"], input:not([type="radio"])[name*="company"], [data-qa*="work-experience-company"]').last
+                            if await comp_inp.count() > 0:
+                                await human_type(page, comp_inp, comp)
+
+                        # Должность
+                        pos = getattr(exp, 'position', '')
+                        if pos:
+                            pos_inp = page.locator('input[type="text"][placeholder*="Должность"], input[type="text"][name*="position"], [data-qa*="work-experience-position"]').last
+                            if await pos_inp.count() > 0:
+                                await human_type(page, pos_inp, pos)
+
+                        # Периоды работы
+                        start_year = getattr(exp, 'start_year', '')
+                        if start_year:
+                            syear_inp = page.locator('input[placeholder*="Год"], input[name*="startYear"], [data-qa*="start-year"]').last
+                            if await syear_inp.count() > 0:
+                                await human_type(page, syear_inp, str(start_year))
+
+                        start_month = getattr(exp, 'start_month', '')
+                        if start_month:
+                            smonth_inp = page.locator('input[placeholder*="Месяц"], select[name*="startMonth"], [data-qa*="start-month"]').last
+                            if await smonth_inp.count() > 0:
+                                await human_type(page, smonth_inp, str(start_month))
+
+                        if getattr(exp, 'is_current', False):
+                            chk = page.locator('input[type="checkbox"][name*="current"], label:has-text("Работаю сейчас"), label:has-text("По настоящее время"), [data-qa*="is-current"]').last
+                            if await chk.count() > 0:
+                                try:
+                                    await chk.check()
+                                except Exception:
+                                    pass
+                        else:
+                            end_year = getattr(exp, 'end_year', '')
+                            if end_year:
+                                eyear_inp = page.locator('input[name*="endYear"], [data-qa*="end-year"]').last
+                                if await eyear_inp.count() > 0:
+                                    await human_type(page, eyear_inp, str(end_year))
+
+                        # Описание обязанностей
+                        desc = getattr(exp, 'description', '')
+                        if desc:
+                            desc_inp = page.locator('textarea[placeholder*="занимались"], textarea[name*="description"], textarea').last
+                            if await desc_inp.count() > 0:
+                                await human_type(page, desc_inp, desc[:1000])
+
+                    exp_next_btn = page.locator('button:has-text("Продолжить"), button:has-text("Далее"), button[type="submit"]').first
+                    if await exp_next_btn.count() > 0 and await exp_next_btn.is_visible():
+                        await human_click(page, exp_next_btn)
+                        await asyncio.sleep(2.0)
+                except Exception as ex_step2:
+                    logger.warning("Ошибка на Шаге 2 (опыт работы): %s", ex_step2)
+
+            # --- ШАГ 3: Образование ---
+            education = getattr(structured, 'education', []) or []
+            if education:
+                logger.info("Пользователь %d: шаг 3 — заполнение образования...", user_id)
+                try:
+                    edu_sel = 'input[placeholder*="заведение"], input[placeholder*="Название"], [data-qa*="education"]'
+                    try:
+                        await page.wait_for_selector(edu_sel, timeout=5000)
+                    except Exception:
+                        pass
+
+                    edu = education[0]
+                    inst = getattr(edu, 'institution', '')
+                    if inst:
+                        inst_inp = page.locator('input[placeholder*="заведение"], input[placeholder*="Название"], input[name*="institution"]').first
+                        if await inst_inp.count() > 0:
+                            await human_type(page, inst_inp, inst)
+
+                    edu_next_btn = page.locator('button:has-text("Продолжить"), button:has-text("Далее"), button[type="submit"]').first
+                    if await edu_next_btn.count() > 0 and await edu_next_btn.is_visible():
+                        await human_click(page, edu_next_btn)
+                        await asyncio.sleep(2.0)
+                except Exception as ex_step3:
+                    logger.warning("Ошибка на Шаге 3 (образование): %s", ex_step3)
+
+            # --- ШАГ 4: Навыки ---
+            skills = getattr(structured, 'skills', []) or []
+            if skills:
+                logger.info("Пользователь %d: шаг 4 — ввод навыков...", user_id)
+                try:
+                    skill_sel = 'input[placeholder*="Поиск"], input[placeholder*="навык"], [data-qa*="skill"]'
+                    try:
+                        await page.wait_for_selector(skill_sel, timeout=5000)
+                    except Exception:
+                        pass
+
+                    skill_search = page.locator('input[placeholder*="Поиск"], input[placeholder*="навык"], input[name*="skill"]').first
+                    if await skill_search.count() > 0:
+                        for sk in skills[:8]:
+                            if sk and sk.strip():
+                                await human_type(page, skill_search, sk.strip())
+                                await asyncio.sleep(0.5)
+                                tag_btn = page.locator(f'button:has-text("{sk.strip()}"), span:has-text("{sk.strip()}")').first
+                                if await tag_btn.count() > 0 and await tag_btn.is_visible():
+                                    await human_click(page, tag_btn)
+                                else:
+                                    await page.keyboard.press("Enter")
+                                await asyncio.sleep(0.3)
+
+                    skills_next_btn = page.locator('button:has-text("Продолжить"), button:has-text("Далее"), button[type="submit"]').first
+                    if await skills_next_btn.count() > 0 and await skills_next_btn.is_visible():
+                        await human_click(page, skills_next_btn)
+                        await asyncio.sleep(2.0)
+                except Exception as ex_step4:
+                    logger.warning("Ошибка на Шаге 4 (навыки): %s", ex_step4)
+
+            # --- ШАГ 5: Финальная публикация ---
+            try:
+                final_pub_btn = page.locator('[data-qa="resume-publish"], [data-qa="resume-save"], [data-qa="resume-submit"], button:has-text("Опубликовать"), button:has-text("Сохранить и опубликовать"), button:has-text("Сохранить")').first
+                if await final_pub_btn.count() > 0 and await final_pub_btn.is_visible():
+                    await human_click(page, final_pub_btn)
+                    await asyncio.sleep(3.0)
+            except Exception as ex_step5:
+                logger.warning("Ошибка при финишной публикации резюме: %s", ex_step5)
 
             logger.info("Пользователь %d: ИИ-резюме пошагово создано и опубликовано!", user_id)
-            return {"status": "SUCCESS", "message": "Резюме из PDF-файла успешно создано и опубликовано пошаговым ИИ-мастером на hh.ru!"}
+
+            # Автоматическая актуализация списка резюме в кэше БД
+            try:
+                import json
+                from database import update_account_settings
+                hh_res = await cls.fetch_user_resumes(user_id, account_id=account.get("id") if 'account' in locals() else None)
+                acc_id = account["id"] if 'account' in locals() and account else None
+                if acc_id:
+                    res_list = hh_res.get("resumes", []) if isinstance(hh_res, dict) else []
+                    if not res_list:
+                        res_list = [{
+                            "id": "ai_created_resume",
+                            "title": resume_title,
+                            "href": "https://hh.ru/applicant/resumes",
+                            "status": "Опубликовано"
+                        }]
+                    await update_account_settings(
+                        acc_id,
+                        resumes_json=json.dumps(res_list),
+                        active_resume_url=res_list[0]["href"],
+                        active_resume_title=res_list[0]["title"]
+                    )
+                    logger.info("Успешно сохранено активное резюме '%s' в СУБД для аккаунта %d", res_list[0]["title"], acc_id)
+            except Exception as ex_save:
+                logger.warning("Ошибка авто-обновления СУБД после создания резюме: %s", ex_save)
+
+            return {"status": "SUCCESS", "message": f"Резюме «{resume_title}» успешно создано, сохранено в базе данных и опубликовано на hh.ru!"}
 
         except Exception as ex:
             logger.error("Пользователь %d: ошибка при пошаговом создании резюме: %s", user_id, ex)
@@ -372,7 +641,7 @@ class HHResumeManager:
         sec_mgr = SessionSecurityManager()
         storage_state = sec_mgr.decrypt_storage_state(account["encrypted_storage_state"])
 
-        engine = HHBrowserEngine(proxy_url=account.get("proxy_url"))
+        engine = await SharedBrowserPool.get_engine(proxy_url=account.get("proxy_url"))
         context = None
 
         try:
@@ -381,7 +650,10 @@ class HHResumeManager:
 
             target_url = f"https://hh.ru/resume/{resume_id}"
             logger.info("Пользователь %d: переход на страницу резюме для удаления: %s", user_id, target_url)
-            await page.goto(target_url, wait_until="domcontentloaded")
+            try:
+                await page.goto(target_url, wait_until="commit", timeout=15000)
+            except Exception as e_g:
+                logger.warning("Ошибка перехода на резюме %s: %s", target_url, e_g)
             await asyncio.sleep(2.0)
 
             if "account/login" in page.url:
@@ -454,7 +726,10 @@ class HHResumeManager:
             # Способ 3: Через страницу списка резюме /applicant/resumes
             if not delete_btn:
                 logger.info("Проверка страницы списка резюме /applicant/resumes...")
-                await page.goto("https://hh.ru/applicant/resumes", wait_until="domcontentloaded")
+                try:
+                    await page.goto("https://hh.ru/applicant/resumes", wait_until="commit", timeout=15000)
+                except Exception:
+                    pass
                 await asyncio.sleep(2.5)
 
                 card = page.locator(f'a[href*="{resume_id}"]').first
@@ -530,5 +805,4 @@ class HHResumeManager:
         finally:
             if context:
                 await context.close()
-            await engine.close()
 

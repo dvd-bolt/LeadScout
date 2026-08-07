@@ -30,7 +30,7 @@ from database import (
 )
 from keyboards import get_questionnaire_confirmation_keyboard
 from utils.security import SessionSecurityManager
-from parsers.hh_browser import HHBrowserEngine
+from parsers.hh_browser import HHBrowserEngine, SharedBrowserPool
 from parsers.hh_applicant import apply_to_hh_vacancy, submit_approved_questionnaire
 from ai_handler import extract_search_keywords_from_resume
 
@@ -129,10 +129,9 @@ async def process_account_hh_applications(account_id: int) -> dict:
 
         active_browsers_count += 1
         browser_counted = True
-        engine = HHBrowserEngine(proxy_url=account.get("proxy_url"))
+        engine = await SharedBrowserPool.get_engine(proxy_url=account.get("proxy_url"))
         context = None
         try:
-            await engine.start()
             context = await engine.create_context(storage_state=storage_state)
             search_tab = await context.new_page()
 
@@ -348,7 +347,6 @@ async def process_account_hh_applications(account_id: int) -> dict:
                 active_browsers_count = max(0, active_browsers_count - 1)
             if context:
                 await context.close()
-            await engine.close()
 
 
 @broker.task
@@ -408,10 +406,9 @@ async def submit_approved_hh_questionnaire(user_id: int, apply_id: int) -> dict:
         except Exception:
             answers = []
 
-    engine = HHBrowserEngine(proxy_url=proxy_url)
+    engine = await SharedBrowserPool.get_engine(proxy_url=proxy_url)
     context = None
     try:
-        await engine.start()
         context = await engine.create_context(storage_state=storage_state)
         page = await context.new_page()
 
@@ -446,4 +443,3 @@ async def submit_approved_hh_questionnaire(user_id: int, apply_id: int) -> dict:
     finally:
         if context:
             await context.close()
-        await engine.close()

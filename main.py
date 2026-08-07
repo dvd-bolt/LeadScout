@@ -7,8 +7,16 @@ import asyncio
 import logging
 import sys
 
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass
+
 from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.storage.memory import MemoryStorage
+import aiohttp
 
 from config import BOT_TOKEN
 from database import init_db
@@ -28,6 +36,21 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class CustomSession(AiohttpSession):
+    async def create_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False),
+                json_serialize=self.json_dumps,
+            )
+        return self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        await super().close()
+
+
 async def main() -> None:
     """Запуск основного процесса Telegram-бота LeadScout AI."""
     if not BOT_TOKEN:
@@ -37,8 +60,11 @@ async def main() -> None:
     # Инициализация базы данных SQLite
     await init_db()
 
+    # Сессия с защитой от SSL-сбоев сети
+    session = CustomSession()
+
     # Инициализация aiogram 3
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(token=BOT_TOKEN, session=session)
     dp = Dispatcher(storage=MemoryStorage())
 
     # Регистрация роутера обработчиков

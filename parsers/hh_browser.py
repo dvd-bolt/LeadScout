@@ -94,3 +94,23 @@ class HHBrowserEngine:
             await self.playwright.stop()
             self.playwright = None
         logger.info("HHBrowserEngine остановлен.")
+
+
+class SharedBrowserPool:
+    """Глобальный синглтон браузерного пула для переиспользования единого инстанса Patchright/Chromium."""
+    _instance = None
+    _engine = None
+
+    @classmethod
+    async def get_engine(cls, proxy_url: str | None = None) -> HHBrowserEngine:
+        if cls._engine is None or not cls._engine.browser or not cls._engine.browser.is_connected():
+            cls._engine = HHBrowserEngine(proxy_url=proxy_url)
+            await cls._engine.start()
+        return cls._engine
+
+    @classmethod
+    async def shutdown(cls):
+        if cls._engine:
+            await cls._engine.close()
+            cls._engine = None
+

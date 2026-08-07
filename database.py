@@ -29,10 +29,12 @@ def get_db_connection():
 async def init_db() -> None:
     """Инициализация и миграция базы данных."""
     async with get_db_connection() as db:
-        # Режим WAL и настройки производительности для параллельных процессов
+        # Режим WAL и максимальные настройки производительности для параллельных процессов
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("PRAGMA synchronous=NORMAL;")
-        await db.execute("PRAGMA busy_timeout=10000;")
+        await db.execute("PRAGMA busy_timeout=15000;")
+        await db.execute("PRAGMA cache_size=-64000;")
+        await db.execute("PRAGMA temp_store=MEMORY;")
 
         # 1. Таблица пользователей Telegram (SaaS Core)
         await db.execute("""
@@ -199,6 +201,11 @@ async def init_db() -> None:
         except Exception:
             pass
 
+        try:
+            await db.execute("ALTER TABLE hh_accounts ADD COLUMN resumes_json TEXT DEFAULT '[]'")
+        except Exception:
+            pass
+
         # Создание индексов для высокой скорости поиска и проверки откликов
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hh_applies_acc_vac ON hh_applies(account_id, vacancy_hh_id);")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_hh_accounts_user ON hh_accounts(user_id);")
@@ -281,6 +288,18 @@ async def set_active_account(user_id: int, account_id: int | None) -> None:
         await db.commit()
 
 
+async def get_user_resumes_json(user_id: int) -> list[dict]:
+    """Возвращает список сохраненных резюме для активного аккаунта пользователя."""
+    acc = await get_active_account(user_id)
+    if not acc:
+        return []
+    resumes_raw = acc.get("resumes_json") or "[]"
+    try:
+        return json.loads(resumes_raw)
+    except Exception:
+        return []
+
+
 async def create_hh_account(user_id: int, phone_or_email: str, account_name: str = "") -> dict:
     """Создает новый аккаунт hh.ru и делает его активным."""
     if not account_name:
@@ -330,7 +349,8 @@ async def update_account_settings(account_id: int, **kwargs) -> None:
     allowed_fields = {
         "account_name", "phone_or_email", "resume_text", "session_status", "daily_limit",
         "applied_today", "min_salary", "only_remote", "stop_words", "keywords", "proxy_url",
-        "active_resume_url", "active_resume_title", "auto_apply_enabled", "send_cover_letter"
+        "active_resume_url", "active_resume_title", "auto_apply_enabled", "send_cover_letter",
+        "resumes_json"
     }
     updates = []
     params = []
