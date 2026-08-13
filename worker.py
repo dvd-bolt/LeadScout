@@ -1,445 +1,557 @@
-"""
-LeadScout AI — Асинхронный воркер Taskiq (Redis Broker / InMemory Broker Fallback).
-Выполняет фоновые задачи по браузерной автотизации hh.ru, автооткликам для мульти-аккаунтов
-и повторной отправке подтвержденных анкет из Telegram.
-"""
+"""Local in-process task coordinator for hh.ru automation."""
+
+from __future__ import annotations
 
 import asyncio
-import logging
 import json
+import logging
 import random
-import socket
-import urllib.parse
-import html
-from taskiq import InMemoryBroker
+from collections import defaultdict
+from urllib.parse import quote_plus
+
 from aiogram import Bot
 
-from config import REDIS_URL, BOT_TOKEN, MAX_CONCURRENT_BROWSERS
+from ai_handler import extract_search_keywords_from_resume
+from config import DEFAULT_MAX_DELAY_SEC, DEFAULT_MIN_DELAY_SEC, MAX_CONCURRENT_BROWSERS
 from database import (
-    get_or_create_user,
+    claim_pending_questionnaire,
+    finish_pending_questionnaire,
+    get_account_for_user,
     get_user_accounts,
-    get_account_by_id,
-    update_account_session,
-    update_account_settings,
-    save_account_hh_apply,
-    increment_account_applied_today,
     is_account_already_applied,
+    record_application_event,
+    record_successful_application,
     save_pending_questionnaire_account,
-    get_pending_questionnaire,
-    update_pending_questionnaire_status,
+    update_account_session,
+    update_account_settings_for_user,
 )
 from keyboards import get_questionnaire_confirmation_keyboard
-from utils.security import SessionSecurityManager
-from parsers.hh_browser import HHBrowserEngine, SharedBrowserPool
 from parsers.hh_applicant import apply_to_hh_vacancy, submit_approved_questionnaire
-from ai_handler import extract_search_keywords_from_resume
+from parsers.hh_browser import SharedBrowserPool
+from utils.security import SessionDecryptionError, SessionSecurityManager
+from utils.validation import escape_html, split_text, strip_telegram_html
 
 logger = logging.getLogger(__name__)
 
-# Семафор контроля параллельных браузеров (по умолчанию 2 на 1 IP)
-browser_semaphore = asyncio.Semaphore(MAX_CONCURRENT_BROWSERS)
 
-
-def _escape_md(text: str) -> str:
-    """Экранирует спецсимволы Markdown V1 для безопасной отправки в Telegram."""
-    for ch in ('_', '*', '`', '['):
-        text = text.replace(ch, f'\\{ch}')
-    return text
-
-
-def _is_redis_available(host: str = "127.0.0.1", port: int = 6379) -> bool:
-    """Проверяет доступность порта Redis."""
-    try:
-        s = socket.socket()
-        s.settimeout(1)
-        res = s.connect_ex((host, port))
-        s.close()
-        return res == 0
-    except Exception:
-        return False
-
-
-# Динамический выбор брокера: Redis если доступен, иначе InMemoryBroker
-if _is_redis_available():
-    try:
-        from taskiq_redis import ListQueueBroker, RedisAsyncResultBackend
-        result_backend = RedisAsyncResultBackend(redis_url=REDIS_URL)
-        broker = ListQueueBroker(url=REDIS_URL).with_result_backend(result_backend)
-        logger.info("Taskiq успешно подключен к Redis (%s)", REDIS_URL)
-    except Exception as e:
-        broker = InMemoryBroker()
-        logger.warning("Не удалось подключиться к Redis (%s). Используется InMemoryBroker.", e)
-else:
-    broker = InMemoryBroker()
-    logger.info("ℹ️ Redis не обнаружен на порту 6379. Автоматически активирован локальный InMemoryBroker.")
-
-security_mgr = SessionSecurityManager()
-
-
-active_browsers_count = 0
-
-
-@broker.task
-async def process_account_hh_applications(account_id: int) -> dict:
-    """
-    Фоновая задача: запуск цикла поиска вакансий и откликов для конкретного аккаунта hh.ru.
-    Работает под семафором (до 2 браузеров одновременно).
-    При 1 аккаунте запуск мгновенный (0 сек), при 2+ аккаунтах — рассинхронизация 5-15 сек.
-    """
-    global active_browsers_count
-    account = await get_account_by_id(account_id)
-    if not account:
-        logger.error("Аккаунт id=%d не найден в БД.", account_id)
-        return {"status": "NOT_FOUND"}
-
-    user_id = account["user_id"]
-    account_name = account.get("account_name") or account.get("phone_or_email") or f"ID {account_id}"
-
-    if account.get("session_status") != "ACTIVE":
-        logger.info("Аккаунт %s (user %d) не авторизован в hh.ru (статус: %s). Пропуск.", account_name, user_id, account.get("session_status"))
-        return {"status": "SKIPPED_NOT_AUTHORIZED"}
-
-    if not account.get("auto_apply_enabled"):
-        logger.info("Автоотклик остановлен для аккаунта %s (user %d). Пропуск выполнения.", account_name, user_id)
-        return {"status": "SKIPPED_STOPPED_BY_USER"}
-
-    if account.get("applied_today", 0) >= account.get("daily_limit", 50):
-        logger.info("Аккаунт %s (user %d) достиг суточного лимита откликов (%d/%d).", account_name, user_id, account["applied_today"], account["daily_limit"])
-        return {"status": "SKIPPED_LIMIT_REACHED"}
-
-    encrypted_state = account.get("encrypted_storage_state")
-    if not encrypted_state:
-        return {"status": "SKIPPED_NO_SESSION"}
-
-    try:
-        storage_state = security_mgr.decrypt_storage_state(encrypted_state)
-    except Exception as e:
-        logger.error("Не удалось расшифровать сессию для аккаунта %s: %s", account_name, e)
-        await update_account_session(account_id, b"", "EXPIRED")
-        return {"status": "EXPIRED_SESSION"}
-
-    # Захват семафора контроля количества параллельных браузеров (до 2)
-    async with browser_semaphore:
-        if active_browsers_count > 0:
-            stagger_delay = random.uniform(5.0, 15.0)
-            logger.info("Параллельный браузер #%d для '%s' (стартовая рассинхронизация: %.1f сек)...", active_browsers_count + 1, account_name, stagger_delay)
-            await asyncio.sleep(stagger_delay)
-        else:
-            logger.info("Единственный браузер для '%s' запущен мгновенно (без задержки)...", account_name)
-
-        active_browsers_count += 1
-        browser_counted = True
-        engine = await SharedBrowserPool.get_engine(proxy_url=account.get("proxy_url"))
-        context = None
-        try:
-            context = await engine.create_context(storage_state=storage_state)
-            search_tab = await context.new_page()
-
-            # Извлечение/формирование ключевых слов
-            keywords_str = account.get("keywords")
-            if not keywords_str or keywords_str.strip() in ["", "Python", "Python, Backend, FastAPI, Django"]:
-                resume_text = account.get("resume_text", "")
-                resume_title = account.get("active_resume_title", "")
-                ai_keywords = await extract_search_keywords_from_resume(resume_text, resume_title)
-                if ai_keywords:
-                    keywords_str = ", ".join(ai_keywords)
-                    await update_account_settings(account_id, keywords=keywords_str)
-                else:
-                    keywords_str = resume_title or "Python"
-
-            kw_list = [k.strip() for k in keywords_str.split(",") if k.strip()]
-            if not kw_list:
-                kw_list = [account.get("active_resume_title") or "Python"]
-
-            stop_words = [w.strip().lower() for w in account.get("stop_words", "").split(",") if w.strip()]
-
-            processed_count = 0
-            seen_urls_in_run = set()
-
-            for kw in kw_list:
-                urls_with_titles = []
-
-                # Проверка флага автооткликов перед каждым ключевым словом
-                curr_acc = await get_account_by_id(account_id)
-                if not curr_acc or not curr_acc.get("auto_apply_enabled"):
-                    logger.info("Автоотклик остановлен для %s во время выполнения. Прерывание.", account_name)
-                    break
-
-                if curr_acc["applied_today"] >= curr_acc["daily_limit"]:
-                    logger.info("Аккаунт %s достиг лимита (%d). Завершение.", account_name, curr_acc["daily_limit"])
-                    break
-
-                encoded_kw = urllib.parse.quote_plus(kw)
-
-                for page_num in range(3):
-                    curr_acc = await get_account_by_id(account_id)
-                    if not curr_acc or not curr_acc.get("auto_apply_enabled") or curr_acc["applied_today"] >= curr_acc["daily_limit"]:
-                        break
-
-                    search_url = f"https://hh.ru/search/vacancy?text={encoded_kw}&order_by=publication_time&search_period=3&page={page_num}"
-                    if curr_acc.get("min_salary"):
-                        search_url += f"&salary={curr_acc['min_salary']}&currency_code=RUR"
-                    if curr_acc.get("only_remote"):
-                        search_url += "&schedule=remote"
-
-                    logger.info("Поиск вакансий [%s] по ключу '%s' (Стр. %d)...", account_name, kw, page_num + 1)
-                    try:
-                        await search_tab.goto(search_url, wait_until="domcontentloaded", timeout=20000)
-                    except Exception as nav_err:
-                        logger.warning("Таймаут перехода [%s] на %s: %s", account_name, search_url, nav_err)
-                        try:
-                            await search_tab.goto(search_url, wait_until="commit", timeout=15000)
-                        except Exception:
-                            continue
-                    await search_tab.wait_for_timeout(1500)
-
-                    # Проверка инвалидации сессии
-                    if "account/login" in search_tab.url:
-                        logger.warning("Сессия аккаунта %s (%d) истекла.", account_name, user_id)
-                        await update_account_session(account_id, b"", "EXPIRED")
-                        if BOT_TOKEN:
-                            bot = Bot(token=BOT_TOKEN)
-                            safe_name = html.escape(account_name)
-                            await bot.send_message(
-                                chat_id=user_id,
-                                text=f"⚠️ <b>Сессия аккаунта <code>{safe_name}</code> истекла.</b> Пожалуйста, войдите повторно через <code>👤 Мои аккаунты</code>.",
-                                parse_mode="HTML"
-                            )
-                            await bot.session.close()
-                        return {"status": "SESSION_EXPIRED"}
-
-                    vacancy_cards = await search_tab.locator('[data-qa="serp-item__title"], [data-qa="vacancy-serp__vacancy-title"], a[data-qa*="vacancy-title"]').all()
-                    if not vacancy_cards:
-                        break
-
-                    for link in vacancy_cards:
-                        href = await link.get_attribute("href")
-                        title = await link.text_content() or ""
-                        if href and "/vacancy/" in href and "/response" not in href:
-                            clean_url = href.split("?")[0] if href.startswith("http") else f"https://hh.ru{href.split('?')[0]}"
-                            if clean_url not in seen_urls_in_run:
-                                seen_urls_in_run.add(clean_url)
-                                urls_with_titles.append((clean_url, title.strip().lower()))
-
-                for vacancy_url, vac_title_lower in urls_with_titles:
-                    curr_acc = await get_account_by_id(account_id)
-                    if not curr_acc or not curr_acc.get("auto_apply_enabled") or curr_acc["applied_today"] >= curr_acc["daily_limit"]:
-                        break
-
-                    # 1. Фильтрация по стоп-словам
-                    if stop_words and any(sw in vac_title_lower for sw in stop_words):
-                        continue
-
-                    already = await is_account_already_applied(account_id, vacancy_url)
-                    if already:
-                        continue
-
-                    vac_page = await context.new_page()
-                    try:
-                        status_code, cover_letter, extra = await apply_to_hh_vacancy(
-                            page=vac_page,
-                            resume_context=account.get("resume_text", "Разработчик с опытом."),
-                            vacancy_url=vacancy_url,
-                            target_resume_title=account.get("active_resume_title"),
-                            send_cover_letter=bool(account.get("send_cover_letter", 1)),
-                            stop_words=stop_words
-                        )
-                    finally:
-                        await vac_page.close()
-
-                    if status_code == "SKIPPED_STOP_WORD":
-                        logger.info("Аккаунт %s: вакансия %s пропущена из-за стоп-слова в описании.", account_name, vacancy_url)
-                        continue
-
-                    if status_code == "SKIPPED_IRRELEVANT":
-                        reason = extra.get("reason", "Не соответствует профилю") if isinstance(extra, dict) else "Не соответствует профилю"
-                        logger.info("Аккаунт %s: вакансия %s пропущена как нерелевантная (%s)", account_name, vacancy_url, reason)
-                        continue
-
-                    if status_code in ["APPLIED_DIRECT", "APPLIED_WITH_LETTER"]:
-                        await save_account_hh_apply(user_id, account_id, vacancy_url, cover_letter or "", status_code)
-                        current_applied = await increment_account_applied_today(account_id)
-                        processed_count += 1
-
-                        if BOT_TOKEN:
-                            company_name = extra.get("company", "Работодатель") if isinstance(extra, dict) else "Работодатель"
-                            vac_title = extra.get("title", "Вакансия") if isinstance(extra, dict) else "Вакансия"
-                            safe_acc_name = html.escape(account_name)
-                            safe_company = html.escape(company_name)
-                            safe_title = html.escape(vac_title)
-                            safe_letter = html.escape((cover_letter or "")[:300])
-
-                            bot = Bot(token=BOT_TOKEN)
-                            msg_text = (
-                                f"🎯 <b>Отклик отправлен с аккаунта <code>{safe_acc_name}</code>!</b>\n\n"
-                                f"🏢 <b>Компания:</b> {safe_company}\n"
-                                f"📌 <b>Вакансия:</b> <a href=\"{vacancy_url}\">{safe_title}</a>\n"
-                                f"📊 <b>Всего сегодня:</b> <code>{current_applied}/{account.get('daily_limit', 50)}</code>\n"
-                            )
-                            if cover_letter:
-                                msg_text += f"\n📝 <b>Сопроводительное письмо:</b>\n{safe_letter}"
-
-                            try:
-                                await bot.send_message(chat_id=user_id, text=msg_text, parse_mode="HTML")
-                            except Exception:
-                                plain = f"🎯 Отклик отправлен (Аккаунт: {account_name})!\n🏢 Компания: {company_name}\n📌 Вакансия: {vac_title}\n{vacancy_url}"
-                                await bot.send_message(chat_id=user_id, text=plain)
-                            await bot.session.close()
-
-                        await asyncio.sleep(account.get("min_delay_sec", 30))
-
-                    elif status_code == "QUESTIONNAIRE_REQUIRED" and extra:
-                        v_title = extra.get("vacancy", {}).get("title", "Вакансия с анкетой")
-                        questions = extra.get("questions", [])
-                        ai_payload = extra.get("ai_payload", {})
-
-                        apply_id = await save_pending_questionnaire_account(
-                            user_id=user_id,
-                            account_id=account_id,
-                            vacancy_url=vacancy_url,
-                            vacancy_title=v_title,
-                            cover_letter=cover_letter or "",
-                            questions=questions,
-                            ai_payload=ai_payload
-                        )
-
-                        if BOT_TOKEN:
-                            bot = Bot(token=BOT_TOKEN)
-                            q_text = "\n".join([f"• {html.escape(q)}" for q in questions[:3]])
-                            safe_v_title = html.escape(v_title)
-                            safe_acc_name = html.escape(account_name)
-                            safe_cl = html.escape((cover_letter or '')[:250])
-                            msg_text = (
-                                f"❓ <b>Требуется подтверждение отклика (<code>{safe_acc_name}</code>)</b>!\n\n"
-                                f"📌 <b>Вакансия:</b> <a href=\"{vacancy_url}\">{safe_v_title}</a>\n"
-                                f"❓ <b>Вопросы работодателя:</b>\n{q_text}\n\n"
-                                f"📝 <b>Предложенное письмо:</b>\n{safe_cl}"
-                            )
-                            try:
-                                await bot.send_message(
-                                    chat_id=user_id,
-                                    text=msg_text,
-                                    reply_markup=get_questionnaire_confirmation_keyboard(apply_id),
-                                    parse_mode="HTML"
-                                )
-                            except Exception:
-                                plain = f"❓ Требуется подтверждение отклика ({account_name})!\n📌 Вакансия: {v_title}\n{vacancy_url}"
-                                await bot.send_message(
-                                    chat_id=user_id,
-                                    text=plain,
-                                    reply_markup=get_questionnaire_confirmation_keyboard(apply_id)
-                                )
-                            await bot.session.close()
-
-            # Обновление сохраненных кук после работы
-            new_state = await context.storage_state()
-            encrypted_new_state = security_mgr.encrypt_storage_state(new_state)
-            await update_account_session(account_id, encrypted_new_state, "ACTIVE")
-
-            return {"status": "SUCCESS", "processed": processed_count}
-
-        except Exception as e:
-            logger.error("Ошибка при выполнении задачи для аккаунта %s (id=%d): %s", account_name, account_id, e)
-            return {"status": f"ERROR: {e}"}
-
-        finally:
-            if browser_counted:
-                active_browsers_count = max(0, active_browsers_count - 1)
-            if context:
-                await context.close()
-
-
-@broker.task
-async def process_user_hh_applications(user_id: int) -> dict:
-    """
-    Фоновая задача для пользователя: запускает поисковые задачи для всех его активных аккаунтов.
-    """
-    accounts = await get_user_accounts(user_id)
-    active_accs = [acc for acc in accounts if acc.get("session_status") == "ACTIVE" and acc.get("auto_apply_enabled")]
-
-    if not active_accs:
-        logger.info("Пользователь %d не имеет активных аккаунтов для автоотклика.", user_id)
-        return {"status": "NO_ACTIVE_ACCOUNTS"}
-
-    for acc in active_accs:
-        try:
-            await process_account_hh_applications.kiq(acc["id"])
-        except Exception:
-            asyncio.create_task(process_account_hh_applications(acc["id"]))
-
-    return {"status": "SUCCESS", "launched_accounts": len(active_accs)}
-
-
-@broker.task
-async def submit_approved_hh_questionnaire(user_id: int, apply_id: int) -> dict:
-    """
-    Фоновая задача: физическая отправка подтвержденного отклика с анкетой на hh.ru.
-    """
-    item = await get_pending_questionnaire(apply_id)
-    if not item:
-        return {"status": "NOT_FOUND"}
-
-    account_id = item.get("account_id")
-    account = await get_account_by_id(account_id) if account_id else None
-
-    if account:
-        encrypted_state = account.get("encrypted_storage_state")
-        proxy_url = account.get("proxy_url")
-    else:
-        user = await get_or_create_user(user_id)
-        encrypted_state = user.get("encrypted_storage_state")
-        proxy_url = user.get("proxy_url")
-
-    if not encrypted_state:
-        return {"status": "NO_SESSION"}
-
-    try:
-        storage_state = security_mgr.decrypt_storage_state(encrypted_state)
-    except Exception as e:
-        return {"status": "EXPIRED_SESSION"}
-
-    answers = []
-    if item.get("ai_payload_json"):
-        try:
-            payload = json.loads(item["ai_payload_json"])
-            answers = payload.get("answers", [])
-        except Exception:
-            answers = []
-
-    engine = await SharedBrowserPool.get_engine(proxy_url=proxy_url)
-    context = None
-    try:
-        context = await engine.create_context(storage_state=storage_state)
-        page = await context.new_page()
-
-        success, msg = await submit_approved_questionnaire(
-            page=page,
-            vacancy_url=item["vacancy_url"],
-            cover_letter=item.get("cover_letter", ""),
-            answers=answers
+class TaskCoordinator:
+    def __init__(self, max_browsers: int = MAX_CONCURRENT_BROWSERS):
+        self._account_tasks: dict[int, asyncio.Task] = {}
+        self._account_task_users: dict[int, int] = {}
+        self._questionnaire_tasks: dict[int, asyncio.Task] = {}
+        self._account_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._registry_lock = asyncio.Lock()
+        self._launch_lock = asyncio.Lock()
+        self._browser_semaphore = asyncio.Semaphore(max_browsers)
+        self._active_browsers = 0
+        self._bot: Bot | None = None
+        self._shutting_down = False
+
+    def configure_bot(self, bot: Bot) -> None:
+        self._bot = bot
+
+    def is_running(self, user_id: int, account_id: int) -> bool:
+        task = self._account_tasks.get(account_id)
+        return bool(
+            task
+            and not task.done()
+            and self._account_task_users.get(account_id) == user_id
         )
 
-        if success:
-            await save_account_hh_apply(user_id, account_id or 0, item["vacancy_url"], item.get("cover_letter", ""), "APPLIED_WITH_QUESTIONNAIRE")
-            if account_id:
-                await increment_account_applied_today(account_id)
-            await update_pending_questionnaire_status(apply_id, "SUBMITTED")
+    async def start_account(self, user_id: int, account_id: int) -> str:
+        if self._shutting_down:
+            return "SHUTTING_DOWN"
+        account = await get_account_for_user(user_id, account_id)
+        if not account:
+            return "NOT_FOUND"
+        async with self._registry_lock:
+            existing = self._account_tasks.get(account_id)
+            if existing and not existing.done():
+                return "ALREADY_RUNNING"
+            task = asyncio.create_task(
+                self._run_account_guarded(user_id, account_id),
+                name=f"hh-account-{account_id}",
+            )
+            self._account_tasks[account_id] = task
+            self._account_task_users[account_id] = user_id
+            task.add_done_callback(lambda completed, key=account_id: self._task_done("account", key, completed))
+        return "STARTED"
 
-            if BOT_TOKEN:
-                bot = Bot(token=BOT_TOKEN)
-                v_title = item.get("vacancy_title", "Вакансия")
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=f"🎯 **Отклик с анкетой успешно отправлен на hh.ru!**\n📌 [{v_title}]({item['vacancy_url']})",
-                    parse_mode="Markdown"
+    async def stop_account(self, user_id: int, account_id: int) -> bool:
+        if not await update_account_settings_for_user(
+            user_id, account_id, auto_apply_enabled=0
+        ):
+            return False
+        async with self._registry_lock:
+            task = (
+                self._account_tasks.get(account_id)
+                if self._account_task_users.get(account_id) == user_id
+                else None
+            )
+            if task and not task.done():
+                task.cancel()
+        if task and not task.done():
+            await asyncio.gather(task, return_exceptions=True)
+        return True
+
+    async def start_questionnaire(self, user_id: int, apply_id: int) -> str:
+        if self._shutting_down:
+            return "SHUTTING_DOWN"
+        async with self._registry_lock:
+            existing = self._questionnaire_tasks.get(apply_id)
+            if existing and not existing.done():
+                return "ALREADY_RUNNING"
+            item = await claim_pending_questionnaire(user_id, apply_id)
+            if not item:
+                return "NOT_AVAILABLE"
+            task = asyncio.create_task(
+                self._submit_questionnaire_guarded(user_id, item), name=f"hh-questionnaire-{apply_id}"
+            )
+            self._questionnaire_tasks[apply_id] = task
+            task.add_done_callback(
+                lambda completed, key=apply_id: self._task_done("questionnaire", key, completed)
+            )
+        return "STARTED"
+
+    def _task_done(self, kind: str, key: int, task: asyncio.Task) -> None:
+        registry = self._account_tasks if kind == "account" else self._questionnaire_tasks
+        if registry.get(key) is task:
+            registry.pop(key, None)
+            if kind == "account":
+                self._account_task_users.pop(key, None)
+        if not task.cancelled():
+            error = task.exception()
+            if error:
+                logger.error(
+                    "Background %s task %d failed",
+                    kind,
+                    key,
+                    exc_info=(type(error), error, error.__traceback__),
                 )
-                await bot.session.close()
 
-        return {"status": "SUCCESS" if success else "ERROR", "message": msg}
+    async def _browser_slot(self):
+        return _BrowserSlot(self)
 
-    except Exception as e:
-        logger.error("Ошибка при отправке одобренной анкеты %d: %s", apply_id, e)
-        return {"status": f"ERROR: {e}"}
-    finally:
-        if context:
-            await context.close()
+    async def _run_account_guarded(self, user_id: int, account_id: int) -> dict:
+        async with self._account_locks[account_id]:
+            async with await self._browser_slot():
+                return await self._run_account(user_id, account_id)
+
+    async def _run_account(self, user_id: int, account_id: int) -> dict:
+        account = await get_account_for_user(user_id, account_id)
+        if not account:
+            return {"status": "NOT_FOUND"}
+        name = account.get("account_name") or account.get("phone_or_email") or f"ID {account_id}"
+        if account.get("session_status") != "ACTIVE":
+            return {"status": "SKIPPED_NOT_AUTHORIZED"}
+        if not account.get("auto_apply_enabled"):
+            return {"status": "SKIPPED_STOPPED"}
+        if account.get("applied_today", 0) >= account.get("daily_limit", 50):
+            return {"status": "SKIPPED_LIMIT"}
+        if not account.get("resume_text", "").strip() or not account.get("active_resume_title", "").strip():
+            await update_account_settings_for_user(
+                user_id, account_id, auto_apply_enabled=0
+            )
+            await self._notify(
+                user_id,
+                "<b>Автоотклик остановлен.</b> Выберите активное резюме с доступным текстом.",
+            )
+            return {"status": "SKIPPED_NO_RESUME"}
+
+        encrypted_state = account.get("encrypted_storage_state")
+        if not encrypted_state:
+            return {"status": "SKIPPED_NO_SESSION"}
+        security = SessionSecurityManager()
+        try:
+            storage_state = security.decrypt_storage_state(encrypted_state)
+        except SessionDecryptionError:
+            await update_account_session(user_id, account_id, b"", "EXPIRED")
+            await self._notify(user_id, f"Сессия аккаунта <code>{escape_html(name)}</code> требует повторного входа.")
+            return {"status": "EXPIRED_SESSION"}
+
+        engine = await SharedBrowserPool.get_engine(account.get("proxy_url") or None)
+        context = None
+        processed = 0
+        try:
+            context = await engine.create_context(storage_state=storage_state)
+            search_page = await context.new_page()
+            keywords = await self._resolve_keywords(account)
+            stop_words = [word.strip().lower() for word in account.get("stop_words", "").split(",") if word.strip()]
+            seen: set[str] = set()
+
+            for keyword in keywords:
+                if not await self._account_may_continue(user_id, account_id):
+                    break
+                vacancies = await self._collect_vacancies(
+                    search_page, user_id, account_id, keyword, seen
+                )
+                for vacancy_url, vacancy_title in vacancies:
+                    current = await get_account_for_user(user_id, account_id)
+                    if not current or not await self._account_may_continue(user_id, account_id):
+                        break
+                    if stop_words and any(word in vacancy_title.lower() for word in stop_words):
+                        continue
+                    if await is_account_already_applied(user_id, account_id, vacancy_url):
+                        continue
+                    page = await context.new_page()
+                    try:
+                        status, cover_letter, extra = await apply_to_hh_vacancy(
+                            page=page,
+                            resume_context=current["resume_text"],
+                            vacancy_url=vacancy_url,
+                            target_resume_title=current["active_resume_title"],
+                            send_cover_letter=bool(current.get("send_cover_letter", 1)),
+                            stop_words=stop_words,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning("Vacancy %s failed for account %d: %s", vacancy_url, account_id, type(exc).__name__)
+                        status, cover_letter, extra = "ERROR_BROWSER", None, None
+                    finally:
+                        await page.close()
+
+                    details = extra if isinstance(extra, dict) else {}
+                    title = details.get("title") or details.get("vacancy", {}).get("title") or vacancy_title
+                    company = details.get("company") or details.get("vacancy", {}).get("company") or ""
+                    if status.startswith("APPLIED"):
+                        created, count = await record_successful_application(
+                            user_id,
+                            account_id,
+                            vacancy_url,
+                            cover_letter or "",
+                            status,
+                            title,
+                            company,
+                        )
+                        if created:
+                            processed += 1
+                            await self._notify_success(user_id, name, vacancy_url, title, company, count, current["daily_limit"])
+                            await asyncio.sleep(random.uniform(DEFAULT_MIN_DELAY_SEC, DEFAULT_MAX_DELAY_SEC))
+                    elif status == "QUESTIONNAIRE_REQUIRED" and details:
+                        apply_id = await save_pending_questionnaire_account(
+                            user_id,
+                            account_id,
+                            vacancy_url,
+                            title,
+                            cover_letter or "",
+                            details.get("questions", []),
+                            details.get("ai_payload", {}),
+                        )
+                        await self._notify_questionnaire(user_id, apply_id, name, vacancy_url, title, details)
+                    elif status != "ALREADY_APPLIED":
+                        await record_application_event(
+                            user_id, account_id, vacancy_url, status, title, company
+                        )
+
+            return {"status": "SUCCESS", "processed": processed}
+        except asyncio.CancelledError:
+            logger.info("Account task %d cancelled", account_id)
+            raise
+        except Exception as exc:
+            logger.error("Account task %d failed: %s", account_id, type(exc).__name__)
+            return {"status": "ERROR"}
+        finally:
+            if context:
+                try:
+                    new_state = await context.storage_state()
+                    await update_account_session(
+                        user_id,
+                        account_id,
+                        security.encrypt_storage_state(new_state),
+                        "ACTIVE",
+                    )
+                except Exception as exc:
+                    logger.warning("Could not persist session for account %d: %s", account_id, type(exc).__name__)
+                await context.close()
+
+    async def _resolve_keywords(self, account: dict) -> list[str]:
+        configured = [item.strip() for item in account.get("keywords", "").split(",") if item.strip()]
+        if configured:
+            return configured[:10]
+        generated = await extract_search_keywords_from_resume(
+            account.get("resume_text", ""), account.get("active_resume_title", "")
+        )
+        if generated:
+            await update_account_settings_for_user(
+                account["user_id"], account["id"], keywords=", ".join(generated)
+            )
+            return generated
+        return [account["active_resume_title"]]
+
+    async def _account_may_continue(self, user_id: int, account_id: int) -> bool:
+        account = await get_account_for_user(user_id, account_id)
+        return bool(
+            account
+            and account.get("auto_apply_enabled")
+            and account.get("session_status") == "ACTIVE"
+            and account.get("applied_today", 0) < account.get("daily_limit", 50)
+        )
+
+    async def _collect_vacancies(
+        self, page, user_id: int, account_id: int, keyword: str, seen: set[str]
+    ) -> list[tuple[str, str]]:
+        found: list[tuple[str, str]] = []
+        for page_number in range(3):
+            account = await get_account_for_user(user_id, account_id)
+            if not account or not await self._account_may_continue(user_id, account_id):
+                break
+            url = (
+                "https://hh.ru/search/vacancy?text="
+                f"{quote_plus(keyword)}&order_by=publication_time&search_period=3&page={page_number}"
+            )
+            if account.get("min_salary"):
+                url += f"&salary={account['min_salary']}&currency_code=RUR"
+            if account.get("only_remote"):
+                url += "&schedule=remote"
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+            except Exception:
+                logger.warning("Search navigation failed for account %d", account_id)
+                continue
+            if "account/login" in page.url:
+                await update_account_session(user_id, account_id, b"", "EXPIRED")
+                break
+            links = page.locator(
+                '[data-qa="serp-item__title"], [data-qa="vacancy-serp__vacancy-title"], '
+                'a[data-qa*="vacancy-title"]'
+            )
+            for index in range(await links.count()):
+                link = links.nth(index)
+                href = await link.get_attribute("href")
+                if not href or "/vacancy/" not in href or "/response" in href:
+                    continue
+                clean = href.split("?", 1)[0]
+                if not clean.startswith("https://"):
+                    clean = "https://hh.ru" + clean
+                if clean in seen:
+                    continue
+                seen.add(clean)
+                found.append((clean, ((await link.text_content()) or "Вакансия").strip()))
+        return found
+
+    async def _submit_questionnaire_guarded(self, user_id: int, item: dict) -> dict:
+        account_id = item["account_id"]
+        async with self._account_locks[account_id]:
+            async with await self._browser_slot():
+                return await self._submit_questionnaire(user_id, item)
+
+    async def _submit_questionnaire(self, user_id: int, item: dict) -> dict:
+        apply_id = item["id"]
+        account = await get_account_for_user(user_id, item["account_id"])
+        if not account or not account.get("encrypted_storage_state"):
+            await finish_pending_questionnaire(user_id, apply_id, "FAILED", "Сессия аккаунта не найдена")
+            return {"status": "NO_SESSION"}
+        security = SessionSecurityManager()
+        try:
+            state = security.decrypt_storage_state(account["encrypted_storage_state"])
+        except SessionDecryptionError:
+            await update_account_session(user_id, account["id"], b"", "EXPIRED")
+            await finish_pending_questionnaire(user_id, apply_id, "FAILED", "Сессия требует повторного входа")
+            return {"status": "EXPIRED_SESSION"}
+        try:
+            payload = json.loads(item.get("ai_payload_json") or "{}")
+            answers = payload.get("answers", [])
+        except (json.JSONDecodeError, AttributeError):
+            answers = []
+
+        engine = await SharedBrowserPool.get_engine(account.get("proxy_url") or None)
+        context = None
+        try:
+            context = await engine.create_context(storage_state=state)
+            page = await context.new_page()
+            success, message = await submit_approved_questionnaire(
+                page,
+                item["vacancy_url"],
+                item.get("cover_letter", ""),
+                answers,
+                account.get("active_resume_title") or None,
+            )
+            await page.close()
+            if not success:
+                await finish_pending_questionnaire(user_id, apply_id, "FAILED", message)
+                await self._notify(user_id, f"Не удалось отправить анкету: {escape_html(message)}")
+                return {"status": "ERROR"}
+            await record_successful_application(
+                user_id,
+                account["id"],
+                item["vacancy_url"],
+                item.get("cover_letter", ""),
+                "APPLIED_WITH_QUESTIONNAIRE",
+                item.get("vacancy_title", ""),
+            )
+            await finish_pending_questionnaire(user_id, apply_id, "SUBMITTED")
+            await self._notify(
+                user_id,
+                f'<b>Отклик с анкетой подтвержден на hh.ru.</b>\n<a href="{escape_html(item["vacancy_url"])}">'
+                f'{escape_html(item.get("vacancy_title") or "Вакансия")}</a>',
+            )
+            return {"status": "SUCCESS"}
+        except asyncio.CancelledError:
+            await finish_pending_questionnaire(user_id, apply_id, "FAILED", "Отправка отменена")
+            raise
+        except Exception as exc:
+            logger.error("Questionnaire %d failed: %s", apply_id, type(exc).__name__)
+            await finish_pending_questionnaire(user_id, apply_id, "FAILED", "Ошибка браузера")
+            return {"status": "ERROR"}
+        finally:
+            if context:
+                try:
+                    new_state = await context.storage_state()
+                    await update_account_session(
+                        user_id,
+                        account["id"],
+                        security.encrypt_storage_state(new_state),
+                        "ACTIVE",
+                    )
+                except Exception:
+                    logger.warning("Could not persist questionnaire session for account %d", account["id"])
+                await context.close()
+
+    async def _notify(self, user_id: int, text: str, **kwargs) -> None:
+        if not self._bot:
+            return
+        parse_mode = "HTML"
+        if len(text) > 4000:
+            text = strip_telegram_html(text)
+            parse_mode = None
+        chunks = split_text(text, 4000)
+        reply_markup = kwargs.pop("reply_markup", None)
+        for index, chunk in enumerate(chunks):
+            try:
+                await self._bot.send_message(
+                    user_id,
+                    chunk,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup if index == len(chunks) - 1 else None,
+                    **kwargs,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Telegram notification for user %d failed: %s",
+                    user_id,
+                    type(exc).__name__,
+                )
+                return
+
+    async def _notify_success(
+        self,
+        user_id: int,
+        account_name: str,
+        vacancy_url: str,
+        title: str,
+        company: str,
+        count: int,
+        limit: int,
+    ) -> None:
+        await self._notify(
+            user_id,
+            f"<b>Отклик отправлен.</b>\n"
+            f"Аккаунт: <code>{escape_html(account_name)}</code>\n"
+            f"Компания: {escape_html(company or 'Не указана')}\n"
+            f'<a href="{escape_html(vacancy_url)}">{escape_html(title or "Вакансия")}</a>\n'
+            f"Сегодня: <code>{count}/{limit}</code>",
+            disable_web_page_preview=True,
+        )
+
+    async def _notify_questionnaire(
+        self, user_id: int, apply_id: int, account_name: str, url: str, title: str, details: dict
+    ) -> None:
+        questions = details.get("questions", [])
+        payload = details.get("ai_payload", {})
+        answer_map = {
+            str(answer.get("field_id")): str(answer.get("value") or "")
+            for answer in payload.get("answers", [])
+            if isinstance(answer, dict)
+        }
+        lines = []
+        for question in questions[:5]:
+            if isinstance(question, dict):
+                label = question.get("label", "")
+                answer = answer_map.get(str(question.get("field_id")), "Не заполнено")
+            else:
+                label = str(question)
+                answer = "Не заполнено"
+            lines.append(
+                f"• {escape_html(label)}\n  <b>Ответ:</b> {escape_html(answer)}"
+            )
+        confidence = payload.get("confidence_score")
+        confidence_line = (
+            f"\nУверенность Gemini: <code>{float(confidence):.0%}</code>\n"
+            if isinstance(confidence, (int, float))
+            else "\n"
+        )
+        text = (
+            f"<b>Нужно подтвердить ответы работодателю.</b>\n"
+            f"Аккаунт: <code>{escape_html(account_name)}</code>\n"
+            f'<a href="{escape_html(url)}">{escape_html(title)}</a>\n'
+            f"{confidence_line}\n"
+            + "\n".join(lines)
+        )
+        await self._notify(
+            user_id,
+            text,
+            reply_markup=get_questionnaire_confirmation_keyboard(apply_id),
+            disable_web_page_preview=True,
+        )
+
+    async def shutdown(self) -> None:
+        self._shutting_down = True
+        async with self._registry_lock:
+            tasks = [*self._account_tasks.values(), *self._questionnaire_tasks.values()]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._account_tasks.clear()
+        self._account_task_users.clear()
+        self._questionnaire_tasks.clear()
+        await SharedBrowserPool.shutdown()
+
+
+class _BrowserSlot:
+    def __init__(self, coordinator: TaskCoordinator):
+        self.coordinator = coordinator
+
+    async def __aenter__(self):
+        await self.coordinator._browser_semaphore.acquire()
+        try:
+            async with self.coordinator._launch_lock:
+                should_stagger = self.coordinator._active_browsers > 0
+                self.coordinator._active_browsers += 1
+            if should_stagger:
+                await asyncio.sleep(random.uniform(5.0, 15.0))
+            return self
+        except BaseException:
+            async with self.coordinator._launch_lock:
+                self.coordinator._active_browsers = max(0, self.coordinator._active_browsers - 1)
+            self.coordinator._browser_semaphore.release()
+            raise
+
+    async def __aexit__(self, exc_type, exc, tb):
+        async with self.coordinator._launch_lock:
+            self.coordinator._active_browsers = max(0, self.coordinator._active_browsers - 1)
+        self.coordinator._browser_semaphore.release()
+
+
+task_coordinator = TaskCoordinator()
+
+
+async def process_account_hh_applications(user_id: int, account_id: int) -> dict:
+    """Compatibility entrypoint: schedule one local account task."""
+    return {"status": await task_coordinator.start_account(user_id, account_id)}
+
+
+async def process_user_hh_applications(user_id: int) -> dict:
+    accounts = await get_user_accounts(user_id)
+    launched = 0
+    for account in accounts:
+        if account.get("session_status") == "ACTIVE" and account.get("auto_apply_enabled"):
+            if await task_coordinator.start_account(user_id, account["id"]) == "STARTED":
+                launched += 1
+    return {"status": "SUCCESS", "launched_accounts": launched}
+
+
+async def submit_approved_hh_questionnaire(user_id: int, apply_id: int) -> dict:
+    return {"status": await task_coordinator.start_questionnaire(user_id, apply_id)}

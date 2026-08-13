@@ -1,116 +1,113 @@
-"""
-LeadScout AI — Модуль браузерного контекста hh.ru (Patchright Stealth Engine).
-Запускает анонимизированный браузер Google Chrome, перехватывает тяжелые ресурсы
-и управляет сессиями StorageState.
-"""
+"""Patchright browser lifecycle and proxy-isolated browser pool."""
 
+from __future__ import annotations
+
+import asyncio
 import logging
-from patchright.async_api import async_playwright, Browser, BrowserContext, Page, Route
-from config import DEFAULT_PROXY_URL
+from urllib.parse import unquote, urlsplit
+
+from patchright.async_api import Browser, BrowserContext, Route, async_playwright
+
+from config import BROWSER_HEADLESS, DEFAULT_PROXY_URL
+from utils.validation import normalize_proxy_url
 
 logger = logging.getLogger(__name__)
 
 
 async def intercept_network_traffic(route: Route) -> None:
-    """Отменяет загрузку медиа-ресурсов, шрифтов и сторонних трекеров для экономии памяти и ускорения."""
-    req = route.request
-    resource_type = req.resource_type
-    url = req.url.lower()
-
-    if resource_type in ["image", "media", "font"]:
-        if "captcha" in url or "picture" in url or "qr" in url:
+    request = route.request
+    url = request.url.lower()
+    if request.resource_type in {"image", "media", "font"}:
+        if any(marker in url for marker in ("captcha", "picture", "qr")):
             await route.continue_()
-            return
+        else:
+            await route.abort()
+        return
+    if any(host in url for host in ("google-analytics.com", "mc.yandex.ru", "facebook.net", "top-fwz1.mail.ru")):
         await route.abort()
         return
-
-    trackers = ["google-analytics.com", "mc.yandex.ru", "facebook.net", "top-fwz1.mail.ru"]
-    if any(tracker in url for tracker in trackers):
-        await route.abort()
-        return
-
     await route.continue_()
 
 
-class HHBrowserEngine:
-    """Управление Patchright движком браузера и контекстами."""
+def _proxy_config(proxy_url: str | None) -> dict | None:
+    if not proxy_url:
+        return None
+    normalized = normalize_proxy_url(proxy_url)
+    parsed = urlsplit(normalized)
+    config: dict[str, str] = {"server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username is not None:
+        config["username"] = unquote(parsed.username)
+    if parsed.password is not None:
+        config["password"] = unquote(parsed.password)
+    return config
 
+
+class HHBrowserEngine:
     def __init__(self, proxy_url: str | None = DEFAULT_PROXY_URL):
-        self.proxy_url = proxy_url
+        self.proxy_url = normalize_proxy_url(proxy_url) if proxy_url else None
         self.playwright = None
         self.browser: Browser | None = None
+        self._start_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        """Запуск Playwright / Patchright и бинарника Google Chrome."""
-        self.playwright = await async_playwright().start()
-        
-        launch_args = [
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-accelerated-2d-canvas",
-            "--no-first-run",
-            "--no-zygote",
-        ]
-
-        proxy_config = {"server": self.proxy_url} if self.proxy_url else None
-
-        self.browser = await self.playwright.chromium.launch(
-            channel="chrome",
-            headless=True,
-            args=launch_args,
-            proxy=proxy_config,
-        )
-        logger.info("HHBrowserEngine на базе Patchright успешно запущен.")
+        async with self._start_lock:
+            if self.browser and self.browser.is_connected():
+                return
+            self.playwright = await async_playwright().start()
+            try:
+                self.browser = await self.playwright.chromium.launch(
+                    headless=BROWSER_HEADLESS,
+                    proxy=_proxy_config(self.proxy_url),
+                )
+            except Exception:
+                await self.playwright.stop()
+                self.playwright = None
+                raise
+            logger.info("Patchright Chromium started%s", " with proxy" if self.proxy_url else "")
 
     async def create_context(self, storage_state: dict | None = None) -> BrowserContext:
-        """Создает новый изолированный BrowserContext с загруженным storage_state."""
-        if not self.browser:
-            await self.start()
-
-        context_options = {
-            "viewport": {"width": 1920, "height": 1080},
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        await self.start()
+        options: dict = {
+            "viewport": {"width": 1440, "height": 900},
             "locale": "ru-RU",
             "timezone_id": "Europe/Moscow",
         }
-
         if storage_state:
-            context_options["storage_state"] = storage_state
-
-        context = await self.browser.new_context(**context_options)
-        
-        # Подключение перехвата ресурсов на уровне контекста
+            options["storage_state"] = storage_state
+        context = await self.browser.new_context(**options)
         await context.route("**/*", intercept_network_traffic)
         return context
 
     async def close(self) -> None:
-        """Безопасное закрытие браузера."""
-        if self.browser:
-            await self.browser.close()
-            self.browser = None
-        if self.playwright:
-            await self.playwright.stop()
-            self.playwright = None
-        logger.info("HHBrowserEngine остановлен.")
+        async with self._start_lock:
+            if self.browser:
+                await self.browser.close()
+                self.browser = None
+            if self.playwright:
+                await self.playwright.stop()
+                self.playwright = None
 
 
 class SharedBrowserPool:
-    """Глобальный синглтон браузерного пула для переиспользования единого инстанса Patchright/Chromium."""
-    _instance = None
-    _engine = None
+    _engines: dict[str, HHBrowserEngine] = {}
+    _lock = asyncio.Lock()
 
     @classmethod
     async def get_engine(cls, proxy_url: str | None = None) -> HHBrowserEngine:
-        if cls._engine is None or not cls._engine.browser or not cls._engine.browser.is_connected():
-            cls._engine = HHBrowserEngine(proxy_url=proxy_url)
-            await cls._engine.start()
-        return cls._engine
+        key = normalize_proxy_url(proxy_url) if proxy_url else ""
+        async with cls._lock:
+            engine = cls._engines.get(key)
+            if engine is None or not engine.browser or not engine.browser.is_connected():
+                if engine is not None:
+                    await engine.close()
+                engine = HHBrowserEngine(proxy_url=key or None)
+                await engine.start()
+                cls._engines[key] = engine
+            return engine
 
     @classmethod
-    async def shutdown(cls):
-        if cls._engine:
-            await cls._engine.close()
-            cls._engine = None
-
+    async def shutdown(cls) -> None:
+        async with cls._lock:
+            engines = list(cls._engines.values())
+            cls._engines.clear()
+        await asyncio.gather(*(engine.close() for engine in engines), return_exceptions=True)

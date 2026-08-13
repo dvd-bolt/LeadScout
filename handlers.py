@@ -3,64 +3,91 @@ LeadScout AI — Обработчики команд и диалогов Telegra
 Использует FSM для ввода резюме, параметров фильтрации, OTP-авторизации hh.ru, мульти-аккаунтов и анкет.
 """
 
-import logging
 import asyncio
-import tempfile
-import os
 import json
-from aiogram import Router, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, BufferedInputFile, InputMediaPhoto, FSInputFile
+import logging
+import os
+import re
+import tempfile
+from datetime import date
+from pathlib import Path
+
+from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, InputMediaPhoto, Message
 
-from database import (
-    get_or_create_user,
-    get_user_accounts,
-    get_active_account,
-    set_active_account,
-    create_hh_account,
-    get_account_by_id,
-    update_account_settings,
-    update_account_session,
-    delete_hh_account,
-    update_user_settings,
-    get_pending_questionnaire,
-    update_pending_questionnaire_status,
-    update_pending_questionnaire_letter,
-    save_hh_apply,
-    increment_applied_today,
-    get_user_recent_applies,
-    save_resume_audit,
-    get_user_latest_audit,
-    get_resume_audit_by_id,
-)
-from keyboards import (
-    get_main_keyboard,
-    get_accounts_resume_hub_keyboard,
-    get_settings_analytics_hub_keyboard,
-    get_autoapply_launch_keyboard,
-    get_autoapply_manage_keyboard,
-    get_accounts_inline_keyboard,
-    get_settings_inline_keyboard,
-    get_delete_confirmation_keyboard,
-    get_questionnaire_confirmation_keyboard,
-    get_captcha_inline_keyboard,
-    get_resume_inline_keyboard,
-    get_resume_action_keyboard,
-    get_confirm_delete_resume_keyboard,
-    get_resume_audit_start_keyboard,
-    get_resume_audit_result_keyboard,
-    get_cancel_vacancy_matching_keyboard,
-)
-from parsers.hh_login import HHLoginManager
-from parsers.hh_resume import HHResumeManager, extract_text_from_pdf
 from ai_handler import (
-    extract_search_keywords_from_resume,
+    StructuredResume,
     analyze_resume_quality,
+    extract_search_keywords_from_resume,
     match_resume_to_vacancy,
 )
+from config import GEMINI_MODEL, PDF_MAX_BYTES
+from database import (
+    AccountLimitError,
+    DuplicateAccountError,
+    create_hh_account,
+    delete_hh_account_for_user,
+    get_account_for_user,
+    get_active_account,
+    get_application_stats,
+    get_or_create_user,
+    get_pending_questionnaire_for_user,
+    get_resume_audit_for_user,
+    get_resume_snapshot_for_user,
+    get_user_accounts,
+    get_user_latest_audit,
+    get_user_recent_applies,
+    list_resume_snapshots,
+    save_resume_audit,
+    set_active_account,
+    set_active_resume_snapshot,
+    update_account_settings_for_user,
+    update_pending_questionnaire_answers,
+    update_pending_questionnaire_letter,
+    update_pending_questionnaire_status,
+    update_user_settings,
+)
+from keyboards import (
+    AUTOAPPLY_OFF_TEXT,
+    AUTOAPPLY_ON_TEXT,
+    get_accounts_inline_keyboard,
+    get_accounts_resume_hub_keyboard,
+    get_autoapply_launch_keyboard,
+    get_autoapply_manage_keyboard,
+    get_cancel_vacancy_matching_keyboard,
+    get_captcha_inline_keyboard,
+    get_confirm_delete_resume_keyboard,
+    get_delete_confirmation_keyboard,
+    get_main_keyboard,
+    get_questionnaire_confirmation_keyboard,
+    get_resume_action_keyboard,
+    get_resume_audit_result_keyboard,
+    get_resume_audit_start_keyboard,
+    get_resume_inline_keyboard,
+    get_settings_analytics_hub_keyboard,
+    get_settings_inline_keyboard,
+)
+from parsers.hh_login import HHLoginManager
+from parsers.hh_resume import (
+    HHResumeManager,
+    PDFValidationError,
+    extract_text_from_pdf,
+)
 from utils.pdf_generator import generate_resume_audit_pdf
+from utils.validation import (
+    escape_html,
+    mask_proxy_url,
+    normalize_hh_vacancy_url,
+    normalize_proxy_url,
+    parse_callback_id,
+    split_text,
+    strip_telegram_html,
+)
+from worker import task_coordinator
 
 logger = logging.getLogger(__name__)
 
@@ -74,28 +101,76 @@ SETTINGS_BANNER = os.path.join(ASSETS_DIR, "settings_banner.jpg")
 STATS_BANNER = os.path.join(ASSETS_DIR, "stats_banner.jpg")
 
 
+async def send_chunked_message(
+    message: Message,
+    text: str,
+    *,
+    reply_markup=None,
+    parse_mode: str | None = None,
+    **send_kwargs,
+) -> Message:
+    """Send bounded Telegram messages and degrade malformed/long markup to plain text."""
+    rendered = text
+    effective_parse_mode = parse_mode
+    if parse_mode == "HTML" and len(text) > 4000:
+        rendered = strip_telegram_html(text)
+        effective_parse_mode = None
+    chunks = split_text(rendered, 4000)
+    sent = None
+    for index, chunk in enumerate(chunks):
+        markup = reply_markup if index == len(chunks) - 1 else None
+        try:
+            sent = await message.answer(
+                chunk,
+                reply_markup=markup,
+                parse_mode=effective_parse_mode,
+                **send_kwargs,
+            )
+        except TelegramBadRequest:
+            logger.warning("Telegram markup was rejected; sending the chunk as plain text")
+            plain = strip_telegram_html(chunk) if effective_parse_mode == "HTML" else chunk
+            sent = await message.answer(
+                plain,
+                reply_markup=markup,
+                parse_mode=None,
+                **send_kwargs,
+            )
+    return sent
+
+
 async def send_banner_message(
     target: Message | CallbackQuery,
     banner_path: str,
     text: str,
     reply_markup=None,
-    parse_mode: str = "Markdown"
+    parse_mode: str = "Markdown",
 ) -> Message:
-    """Отправляет графический баннер с подписью, если файл существует, иначе обычное сообщение."""
+    """Send a banner when the caption fits, otherwise send bounded text chunks."""
     msg = target.message if isinstance(target, CallbackQuery) else target
+    if banner_path and os.path.exists(banner_path) and len(text) <= 1024:
+        try:
+            return await msg.answer_photo(
+                photo=FSInputFile(banner_path),
+                caption=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+        except TelegramBadRequest:
+            logger.warning("Telegram caption markup was rejected; using a plain caption")
+            plain = strip_telegram_html(text) if parse_mode == "HTML" else text
+            return await msg.answer_photo(
+                photo=FSInputFile(banner_path),
+                caption=plain,
+                reply_markup=reply_markup,
+            )
     if banner_path and os.path.exists(banner_path):
-        return await msg.answer_photo(
-            photo=FSInputFile(banner_path),
-            caption=text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode
-        )
-    else:
-        return await msg.answer(
-            text,
-            reply_markup=reply_markup,
-            parse_mode=parse_mode
-        )
+        await msg.answer_photo(photo=FSInputFile(banner_path))
+    return await send_chunked_message(
+        msg,
+        text,
+        reply_markup=reply_markup,
+        parse_mode=parse_mode,
+    )
 
 
 class UserState(StatesGroup):
@@ -112,6 +187,8 @@ class UserState(StatesGroup):
     waiting_for_vacancy_for_matching = State()
     waiting_for_audit_pdf = State()
     waiting_for_audit_text = State()
+    waiting_for_resume_field = State()
+    waiting_for_edited_answer = State()
 
 
 
@@ -119,7 +196,7 @@ class UserState(StatesGroup):
 async def cmd_start(message: Message, state: FSMContext):
     """Приветственное сообщение и инициализация пользователя."""
     await state.clear()
-    user = await get_or_create_user(message.from_user.id)
+    await get_or_create_user(message.from_user.id)
     accounts = await get_user_accounts(message.from_user.id)
     active_acc = await get_active_account(message.from_user.id)
 
@@ -131,7 +208,7 @@ async def cmd_start(message: Message, state: FSMContext):
     welcome_text = (
         f"👋 Привет, {message.from_user.first_name}! Welcome to LeadScout AI!\n\n"
         f"🤖 Автономный ассистент поиска работы на hh.ru...\n"
-        f"⚙️ Модель ИИ: gemini-3.5-flash-lite\n\n"
+        f"⚙️ Модель ИИ: {GEMINI_MODEL}\n\n"
         f"⭐ Активный аккаунт: {phone}\n"
         f"👥 Всего аккаунтов: {total_accs} шт.\n"
         f"⚡️ Статус автоотклика: {status_str}\n\n"
@@ -145,9 +222,7 @@ async def cmd_start(message: Message, state: FSMContext):
 async def cmd_restart(message: Message, state: FSMContext):
     """Сброс состояний FSM и очистка сессий входа."""
     await state.clear()
-    session = HHLoginManager._sessions.pop(message.from_user.id, None)
-    if session:
-        asyncio.create_task(session.cleanup())
+    await HHLoginManager.cancel(message.from_user.id)
 
     accounts = await get_user_accounts(message.from_user.id)
     active_acc = await get_active_account(message.from_user.id)
@@ -160,7 +235,7 @@ async def cmd_restart(message: Message, state: FSMContext):
     restart_text = (
         f"👋 Привет, {message.from_user.first_name}! Welcome to LeadScout AI!\n\n"
         f"🤖 Автономный ассистент поиска работы на hh.ru...\n"
-        f"⚙️ Модель ИИ: gemini-3.5-flash-lite\n\n"
+        f"⚙️ Модель ИИ: {GEMINI_MODEL}\n\n"
         f"⭐ Активный аккаунт: {phone}\n"
         f"👥 Всего аккаунтов: {total_accs} шт.\n"
         f"⚡️ Статус автоотклика: {status_str}\n\n"
@@ -191,7 +266,7 @@ async def cmd_accounts_and_resume_hub(message: Message, state: FSMContext):
     await state.update_data(nav_hub="accounts")
     acc = await get_active_account(message.from_user.id)
     phone = (acc.get("phone_or_email") or acc.get("account_name")) if acc else "Не авторизован"
-    active_resume_title = acc.get("active_resume_title") or ("Не выбрано" if acc else "Не авторизован")
+    active_resume_title = (acc.get("active_resume_title") or "Не выбрано") if acc else "Не авторизован"
     last_sync_time = "Сегодня" if acc else "Нет данных"
 
     text = (
@@ -209,24 +284,27 @@ async def cmd_settings_and_analytics_hub(message: Message, state: FSMContext):
     """Хаб с вложенными кнопками настроек, статистики и справки."""
     await state.update_data(nav_hub="settings")
     acc = await get_active_account(message.from_user.id)
-    search_query = acc.get("active_resume_title") or ("Не выбрана" if acc else "Не авторизован")
+    search_query = (acc.get("active_resume_title") or "Не выбрана") if acc else "Не авторизован"
     min_sal_val = acc.get("min_salary") if acc else 0
-    min_salary = f"от {min_sal_val:,} ₽".replace(",", " ") if min_sal_val else "Не задан"
-    keywords = acc.get("keywords") or "Не заданы"
-    has_proxy = bool(acc and acc.get("proxy_url"))
-    proxy_str = "Stealth IP 🟢" if has_proxy else "Не задан ⚪️"
-    threads = 2 if (acc and acc.get("auto_apply_enabled")) else 1
+    min_salary = f"{min_sal_val:,} ₽".replace(",", " ") if min_sal_val else "Не задан"
+    keywords = (acc.get("keywords") or "Не заданы") if acc else "Не заданы"
+    proxy_str = mask_proxy_url(acc.get("proxy_url") if acc else None)
+    runtime_status = (
+        "Запущен"
+        if (acc and task_coordinator.is_running(message.from_user.id, acc["id"]))
+        else "Остановлен"
+    )
 
     text = (
         f"⚙️ Настройки автопоиска и фильтров\n\n"
         f"🎯 Должность: {search_query}\n"
-        f"💰 Зарплатный фильтр: от {min_salary} ₽\n"
+        f"💰 Зарплатный фильтр: {min_salary}\n"
         f"🔑 Ключевые слова: {keywords}\n"
-        f"🛡 Прокси: {proxy_status} 🟢\n"
-        f"🚀 Режим работы: {threads} параллельных потока\n\n"
+        f"🛡 Прокси: {proxy_str}\n"
+        f"🚀 Автоотклик: {runtime_status}\n\n"
         f"Нажмите на кнопку, чтобы изменить..."
     )
-    await send_banner_message(message, SETTINGS_BANNER, text, reply_markup=get_settings_analytics_hub_keyboard(), parse_mode="Markdown")
+    await send_banner_message(message, SETTINGS_BANNER, text, reply_markup=get_settings_analytics_hub_keyboard(acc), parse_mode="Markdown")
 
 
 @router.callback_query(F.data == "start_hh_auth_hub")
@@ -313,7 +391,7 @@ async def cb_return_main_menu(callback: CallbackQuery, state: FSMContext):
     text = (
         f"👋 Привет, {callback.from_user.first_name}! Welcome to LeadScout AI!\n\n"
         f"🤖 Автономный ассистент поиска работы на hh.ru...\n"
-        f"⚙️ Модель ИИ: gemini-3.5-flash-lite\n\n"
+        f"⚙️ Модель ИИ: {GEMINI_MODEL}\n\n"
         f"⭐ Активный аккаунт: {phone}\n"
         f"👥 Всего аккаунтов: {total_accs} шт.\n"
         f"⚡️ Статус автоотклика: {status_str}\n\n"
@@ -338,7 +416,7 @@ async def cb_nav_back(callback: CallbackQuery, state: FSMContext):
     if nav_hub == "accounts":
         acc = await get_active_account(callback.from_user.id)
         phone = (acc.get("phone_or_email") or acc.get("account_name")) if acc else "Не авторизован"
-        active_resume_title = acc.get("active_resume_title") or ("Не выбрано" if acc else "Не авторизован")
+        active_resume_title = (acc.get("active_resume_title") or "Не выбрано") if acc else "Не авторизован"
         last_sync_time = "Сегодня" if acc else "Нет данных"
         text = (
             f"👤 Центр управления аккаунтами и резюме\n\n"
@@ -350,13 +428,17 @@ async def cb_nav_back(callback: CallbackQuery, state: FSMContext):
         await send_banner_message(callback, ACCOUNTS_BANNER, text, reply_markup=get_accounts_resume_hub_keyboard(), parse_mode="Markdown")
     elif nav_hub == "settings":
         acc = await get_active_account(callback.from_user.id)
-        search_query = acc.get("active_resume_title") or ("Не выбрана" if acc else "Не авторизован")
+        search_query = (acc.get("active_resume_title") or "Не выбрана") if acc else "Не авторизован"
         min_sal_val = acc.get("min_salary") if acc else 0
         min_salary = f"от {min_sal_val:,} ₽".replace(",", " ") if min_sal_val else "Не задан"
-        keywords = acc.get("keywords") or "Не заданы"
+        keywords = (acc.get("keywords") or "Не заданы") if acc else "Не заданы"
         has_proxy = bool(acc and acc.get("proxy_url"))
         proxy_str = "Stealth IP 🟢" if has_proxy else "Не задан ⚪️"
-        threads = 2 if (acc and acc.get("auto_apply_enabled")) else 1
+        runtime_status = (
+            "Запущен"
+            if (acc and task_coordinator.is_running(callback.from_user.id, acc["id"]))
+            else "Остановлен"
+        )
 
         text = (
             f"⚙️ Настройки автопоиска и фильтров\n\n"
@@ -364,10 +446,10 @@ async def cb_nav_back(callback: CallbackQuery, state: FSMContext):
             f"💰 Зарплатный фильтр: {min_salary}\n"
             f"🔑 Ключевые слова: {keywords}\n"
             f"🛡 Прокси: {proxy_str}\n"
-            f"🚀 Режим работы: {threads} параллельных потока\n\n"
+            f"🚀 Автоотклик: {runtime_status}\n\n"
             f"Нажмите на кнопку, чтобы изменить..."
         )
-        await send_banner_message(callback, SETTINGS_BANNER, text, reply_markup=get_settings_analytics_hub_keyboard(), parse_mode="Markdown")
+        await send_banner_message(callback, SETTINGS_BANNER, text, reply_markup=get_settings_analytics_hub_keyboard(acc), parse_mode="Markdown")
     elif nav_hub == "audit":
         await cmd_check_resume(callback.message, state=state)
     else:
@@ -405,26 +487,26 @@ async def cmd_accounts(message: Message, state: FSMContext):
 async def cb_select_account(callback: CallbackQuery):
     """Безопасное переключение активного аккаунта без сброса куков!"""
     try:
-        acc_id = int(callback.data.replace("select_acc_", ""))
-        acc = await get_account_by_id(acc_id)
-        if not acc or acc.get("user_id") != callback.from_user.id:
+        acc_id = parse_callback_id(callback.data, "select_acc_")
+        acc = await get_account_for_user(callback.from_user.id, acc_id) if acc_id else None
+        if not acc:
             await callback.answer("Аккаунт не найден.", show_alert=True)
             return
 
         await set_active_account(callback.from_user.id, acc_id)
-        accounts = await get_user_accounts(callback.from_user.id)
-
         acc_name = acc.get("account_name") or acc.get("phone_or_email")
         await callback.answer(f"✅ Активный аккаунт изменен на «{acc_name}»!", show_alert=True)
 
         await callback.message.edit_text(
-            f"⚙️ **Настройки выбранного аккаунта `{acc_name}`:**\n"
-            f"🔑 **Статус:** `{acc.get('session_status')}` | 🎯 **Откликов сегодня:** `{acc.get('applied_today', 0)}/{acc.get('daily_limit', 50)}`",
+            f"⚙️ <b>Настройки выбранного аккаунта</b> <code>{escape_html(acc_name)}</code>:\n"
+            f"🔑 <b>Статус:</b> <code>{escape_html(acc.get('session_status'))}</code> | "
+            f"🎯 <b>Откликов сегодня:</b> "
+            f"<code>{acc.get('applied_today', 0)}/{acc.get('daily_limit', 50)}</code>",
             reply_markup=get_settings_inline_keyboard(acc),
-            parse_mode="Markdown"
+            parse_mode="HTML",
         )
     except Exception as e:
-        logger.error("Ошибка при выборе аккаунта: %s", e)
+        logger.error("Ошибка при выборе аккаунта: %s", type(e).__name__)
         await callback.answer("Ошибка переключения аккаунта.", show_alert=True)
 
 
@@ -464,16 +546,23 @@ async def cb_start_all_accounts(callback: CallbackQuery):
         await callback.answer("У вас нет привязанных аккаунтов!", show_alert=True)
         return
 
-    from worker import process_account_hh_applications
     launched = 0
     for acc in accounts:
-        if acc.get("session_status") == "ACTIVE":
-            await update_account_settings(acc["id"], auto_apply_enabled=1)
-            try:
-                await process_account_hh_applications.kiq(acc["id"])
-            except Exception:
-                asyncio.create_task(process_account_hh_applications(acc["id"]))
-            launched += 1
+        if (
+            acc.get("session_status") == "ACTIVE"
+            and acc.get("active_resume_title")
+            and (acc.get("resume_text") or "").strip()
+        ):
+            await update_account_settings_for_user(callback.from_user.id, acc["id"], auto_apply_enabled=1)
+            if await task_coordinator.start_account(callback.from_user.id, acc["id"]) in {
+                "STARTED",
+                "ALREADY_RUNNING",
+            }:
+                launched += 1
+
+    if launched == 0:
+        await callback.answer("Нет готовых аккаунтов: проверьте вход и активное резюме.", show_alert=True)
+        return
 
     if launched == 1:
         msg = "🚀 **Запущен автоотклик для 1 аккаунта!**\nБот использует 1 браузер Patchright Stealth (мгновенный запуск)."
@@ -495,7 +584,7 @@ async def cb_stop_all_accounts(callback: CallbackQuery):
     """Остановка автооткликов для всех аккаунтов."""
     accounts = await get_user_accounts(callback.from_user.id)
     for acc in accounts:
-        await update_account_settings(acc["id"], auto_apply_enabled=0)
+        await task_coordinator.stop_account(callback.from_user.id, acc["id"])
 
     await callback.message.answer(
         "⛔️ **Автоотклик остановлен для ВСЕХ аккаунтов.**",
@@ -508,15 +597,19 @@ async def cb_stop_all_accounts(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("confirm_delete_acc_"))
 async def cb_confirm_delete_acc(callback: CallbackQuery):
     """Подтверждение удаления аккаунта."""
-    acc_id = int(callback.data.replace("confirm_delete_acc_", ""))
-    acc = await get_account_by_id(acc_id)
-    acc_name = acc.get("account_name") if acc else f"ID {acc_id}"
+    acc_id = parse_callback_id(callback.data, "confirm_delete_acc_")
+    acc = await get_account_for_user(callback.from_user.id, acc_id) if acc_id else None
+    if not acc:
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    acc_name = acc.get("account_name") or f"ID {acc_id}"
 
     await callback.message.edit_text(
-        f"⚠️ **Вы действительно хотите удалить аккаунт `{acc_name}` из бота?**\n\n"
-        f"Сохраненные куки сессии и индивидуальные настройки этого аккаунта будут стираться безвозвратно.",
+        f"⚠️ <b>Вы действительно хотите удалить аккаунт "
+        f"<code>{escape_html(acc_name)}</code> из бота?</b>\n\n"
+        "Сохраненные куки сессии и индивидуальные настройки этого аккаунта будут удалены безвозвратно.",
         reply_markup=get_delete_confirmation_keyboard(acc_id),
-        parse_mode="Markdown"
+        parse_mode="HTML",
     )
     await callback.answer()
 
@@ -524,8 +617,14 @@ async def cb_confirm_delete_acc(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("delete_acc_"))
 async def cb_delete_acc(callback: CallbackQuery):
     """Физическое удаление аккаунта из БД."""
-    acc_id = int(callback.data.replace("delete_acc_", ""))
-    await delete_hh_account(acc_id)
+    acc_id = parse_callback_id(callback.data, "delete_acc_")
+    if not acc_id or not await get_account_for_user(callback.from_user.id, acc_id):
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    await task_coordinator.stop_account(callback.from_user.id, acc_id)
+    if not await delete_hh_account_for_user(callback.from_user.id, acc_id):
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
 
     accounts = await get_user_accounts(callback.from_user.id)
     active_acc = await get_active_account(callback.from_user.id)
@@ -556,12 +655,23 @@ async def cmd_auth_hh(message: Message, state: FSMContext):
 async def process_phone_input(message: Message, state: FSMContext):
     """Прием логина и запуск СМС-входа для нового аккаунта."""
     login_text = message.text.strip() if message.text else ""
-    if not login_text or len(login_text) < 5:
+    is_email = bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", login_text))
+    digits = re.sub(r"\D", "", login_text)
+    if len(login_text) > 254 or (not is_email and len(digits) not in {10, 11}):
         await message.answer("❌ Пожалуйста, введите корректный номер телефона или email.", parse_mode="Markdown")
         return
 
     # Создаем запись нового аккаунта в hh_accounts
-    new_acc = await create_hh_account(message.from_user.id, login_text)
+    try:
+        new_acc = await create_hh_account(message.from_user.id, login_text)
+    except AccountLimitError:
+        await message.answer("❌ Достигнут лимит аккаунтов для одного пользователя.")
+        await state.clear()
+        return
+    except DuplicateAccountError:
+        await message.answer("❌ Этот аккаунт hh.ru уже добавлен.")
+        await state.clear()
+        return
     acc_id = new_acc["id"]
 
     await state.update_data(current_account_id=acc_id)
@@ -591,7 +701,7 @@ async def process_phone_input(message: Message, state: FSMContext):
 async def process_captcha_input(message: Message, state: FSMContext):
     """Прием и ввод символов с капчи."""
     captcha_text = message.text.strip() if message.text else ""
-    if not captcha_text or len(captcha_text) < 2:
+    if not 2 <= len(captcha_text) <= 32:
         await message.answer("❌ Введите корректный текст с картинки.", parse_mode="Markdown")
         return
 
@@ -649,9 +759,7 @@ async def cb_captcha_lang(callback: CallbackQuery):
 async def cb_captcha_cancel(callback: CallbackQuery, state: FSMContext):
     """Отмена входа."""
     await state.clear()
-    session = HHLoginManager._sessions.pop(callback.from_user.id, None)
-    if session:
-        asyncio.create_task(session.cleanup())
+    await HHLoginManager.cancel(callback.from_user.id)
     await callback.message.delete()
     await callback.message.answer("❌ **Авторизация отменена пользователем.**", reply_markup=get_main_keyboard(), parse_mode="Markdown")
     await callback.answer()
@@ -661,8 +769,8 @@ async def cb_captcha_cancel(callback: CallbackQuery, state: FSMContext):
 async def process_otp_input(message: Message, state: FSMContext):
     """Прием СМС-кода и завершение авторизации."""
     code = message.text.strip() if message.text else ""
-    if not code or not code.isdigit() or len(code) < 4:
-        await message.answer("❌ Код должен состоять из цифр. Попробуйте еще раз:", parse_mode="Markdown")
+    if not code.isdigit() or not 4 <= len(code) <= 8:
+        await message.answer("❌ Код должен содержать от 4 до 8 цифр. Попробуйте еще раз:")
         return
 
     status_msg = await message.answer("🔄 **Проверка СМС-кода и сохранение сессии...**", parse_mode="Markdown")
@@ -674,9 +782,9 @@ async def process_otp_input(message: Message, state: FSMContext):
         active_acc = await get_active_account(message.from_user.id)
         acc_name = active_acc.get("account_name") if active_acc else "hh.ru"
         await status_msg.edit_text(
-            f"✅ **Авторизация аккаунта `{acc_name}` успешно выполнена!**\n"
-            f"Сессия защищена шифрованием Fernet AES-256.\nТеперь вы можете запустить отклики кнопкой `🚀 Запустить автоотклик`.",
-            parse_mode="Markdown"
+            f"✅ <b>Авторизация аккаунта <code>{escape_html(acc_name)}</code> успешно выполнена!</b>\n"
+            "Сессия защищена шифрованием Fernet.\nТеперь можно запустить автоотклик из главного меню.",
+            parse_mode="HTML",
         )
     else:
         await status_msg.edit_text(f"❌ **Ошибка авторизации:** {res.get('message', 'Неверный код')}", parse_mode="Markdown")
@@ -686,40 +794,27 @@ async def process_otp_input(message: Message, state: FSMContext):
 
 @router.message(F.text == "📄 Мое резюме")
 async def cmd_resume(message: Message, state: FSMContext):
-    """Управление резюме текущего активного аккаунта (Мгновенный отклик из кэша БД)."""
+    """Show stable, database-backed resume snapshots for the active account."""
     await state.update_data(nav_hub="accounts")
     acc = await get_active_account(message.from_user.id)
     if not acc:
         await message.answer("⚠️ У вас нет активных аккаунтов. Нажмите `🔑 Авторизация hh.ru`.", parse_mode="Markdown")
         return
-
-    resume_text = acc.get("resume_text", "")
-    resumes_raw = acc.get("resumes_json") or "[]"
-    try:
-        resumes_list = json.loads(resumes_raw)
-    except Exception:
-        resumes_list = []
-
-    # Если кэш пуст — первый асинхронный импорт с hh.ru
+    resumes_list = await list_resume_snapshots(message.from_user.id, acc["id"])
     if not resumes_list:
-        status_msg = await message.answer(f"🔄 **Первичная загрузка списка резюме с hh.ru...**", parse_mode="Markdown")
+        status_msg = await message.answer("🔄 Загружаем список резюме с hh.ru...")
         hh_res = await HHResumeManager.fetch_user_resumes(message.from_user.id, account_id=acc["id"])
         resumes_list = hh_res.get("resumes", []) if hh_res.get("status") == "SUCCESS" else []
-        if resumes_list:
-            await update_account_settings(acc["id"], resumes_json=json.dumps(resumes_list))
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-
+        await status_msg.delete()
+    acc = await get_account_for_user(message.from_user.id, acc["id"]) or acc
+    resume_text = acc.get("resume_text", "")
     active_title = acc.get("active_resume_title") or (resumes_list[0]["title"] if resumes_list else "Не выбрано")
-
     text = (
-        f"📄 **Управление резюме для аккаунта `{acc.get('account_name')}`:**\n\n"
-        f"🎯 **Выбранное резюме:** `{active_title}`\n"
-        f"📊 **Текст для ИИ:** `{len(resume_text)} символов`\n"
-        f"📌 **Резюме на hh.ru:** `{len(resumes_list)} шт.`\n\n"
-        f"Выберите резюме для настройки или загрузите новое:"
+        f"📄 Управление резюме для аккаунта {acc.get('account_name')}\n\n"
+        f"🎯 Выбранное резюме: {active_title}\n"
+        f"📊 Текст для ИИ: {len(resume_text)} символов\n"
+        f"📌 Резюме на hh.ru: {len(resumes_list)} шт.\n\n"
+        "Выберите резюме для настройки или загрузите новое:"
     )
     await send_banner_message(
         message,
@@ -729,55 +824,144 @@ async def cmd_resume(message: Message, state: FSMContext):
             resumes_list,
             selected_href=acc.get("active_resume_url")
         ),
-        parse_mode="Markdown"
+        parse_mode=None,
     )
 
 
 @router.message(UserState.waiting_for_resume, F.document)
 async def process_pdf_document(message: Message, state: FSMContext):
-    """Обработка загруженного PDF-файла резюме для активного аккаунта (выгрузка на hh.ru)."""
-    await state.clear()
+    """Parse a bounded PDF in a unique temporary directory and upload it."""
     document = message.document
-    if not document.file_name or not document.file_name.lower().endswith(".pdf"):
+    if (
+        not document.file_name
+        or not document.file_name.lower().endswith(".pdf")
+        or document.mime_type not in {None, "application/pdf"}
+    ):
         await message.answer("❌ Пожалуйста, отправьте файл в формате **.PDF**.", parse_mode="Markdown")
         return
-
-    acc = await get_active_account(message.from_user.id)
+    if document.file_size and document.file_size > PDF_MAX_BYTES:
+        await message.answer(f"❌ Размер PDF не должен превышать {PDF_MAX_BYTES // (1024 * 1024)} МБ.")
+        return
+    state_data = await state.get_data()
+    account_id = state_data.get("resume_upload_account_id")
+    acc = await get_account_for_user(message.from_user.id, account_id) if account_id else None
     if not acc:
+        await state.clear()
         await message.answer("⚠️ Сначала выберите или авторизуйте аккаунт hh.ru.", parse_mode="Markdown")
         return
-
-    status_msg = await message.answer("📥 **Скачивание PDF-файла и извлечение текста для Gemini 3.5 Flash Lite...**", parse_mode="Markdown")
-    temp_dir = tempfile.gettempdir()
-    pdf_path = os.path.join(temp_dir, f"resume_{acc['id']}.pdf")
-
-    await message.bot.download(document, destination=pdf_path)
-    extracted_text = extract_text_from_pdf(pdf_path)
-
-    if not extracted_text or len(extracted_text) < 50:
-        await status_msg.edit_text("❌ Не удалось извлечь текст из PDF.", parse_mode="Markdown")
+    status_msg = await message.answer("📥 Проверяем PDF и запускаем публикацию на hh.ru...")
+    try:
+        with tempfile.TemporaryDirectory(prefix="leadscout_resume_") as temp_dir:
+            pdf_path = str(Path(temp_dir) / "resume.pdf")
+            await message.bot.download(document, destination=pdf_path)
+            await asyncio.to_thread(extract_text_from_pdf, pdf_path)
+            upload_res = await HHResumeManager.upload_pdf_resume_to_hh(
+                message.from_user.id, pdf_path, account_id=acc["id"]
+            )
+    except PDFValidationError as exc:
+        await state.clear()
+        await status_msg.edit_text(f"❌ {exc}")
         return
-
-    await update_account_settings(acc["id"], resume_text=extracted_text)
-    await status_msg.edit_text(
-        f"✅ **Текст резюме сохранен для аккаунта `{acc.get('account_name')}` ({len(extracted_text)} символов)!**\n\n"
-        f"🔄 **Публикация PDF на hh.ru (Patchright Stealth)...**",
-        parse_mode="Markdown"
-    )
-
-    upload_res = await HHResumeManager.upload_pdf_resume_to_hh(message.from_user.id, pdf_path, account_id=acc["id"])
     if upload_res.get("status") == "SUCCESS":
-        # Синхронизация резюме в базе
-        hh_res = await HHResumeManager.fetch_user_resumes(message.from_user.id, account_id=acc["id"])
-        if hh_res.get("resumes"):
-            await update_account_settings(acc["id"], resumes_json=json.dumps(hh_res["resumes"]))
-        await message.answer("🎉 **Резюме из PDF-файла успешно загружено и опубликовано на hh.ru!**", reply_markup=get_main_keyboard(), parse_mode="Markdown")
+        await state.clear()
+        await status_msg.edit_text("🎉 Резюме создано и подтверждено в списке hh.ru.")
+        await message.answer("Готово.", reply_markup=get_main_keyboard())
+    elif upload_res.get("status") == "NEEDS_FIELDS":
+        missing = upload_res.get("missing_fields", [])
+        await state.update_data(
+            resume_file_id=document.file_id,
+            resume_structured=upload_res.get("structured", {}),
+            resume_missing_fields=missing,
+            resume_field_index=0,
+            resume_upload_account_id=acc["id"],
+        )
+        await state.set_state(UserState.waiting_for_resume_field)
+        await status_msg.edit_text("Для мастера hh.ru нужны дополнительные обязательные данные.")
+        await _prompt_next_resume_field(message, state)
     else:
-        await message.answer(f"⚠️ {upload_res.get('message')}", reply_markup=get_main_keyboard(), parse_mode="Markdown")
+        await state.clear()
+        await status_msg.edit_text(f"⚠️ {upload_res.get('message', 'Не удалось создать резюме.')}")
+
+
+RESUME_FIELD_LABELS = {
+    "first_name": "Имя",
+    "birth_date": "Дата рождения в формате ГГГГ-ММ-ДД",
+    "city": "Город проживания",
+    "title": "Желаемая должность",
+}
+
+
+async def _prompt_next_resume_field(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    fields = data.get("resume_missing_fields", [])
+    index = data.get("resume_field_index", 0)
+    if index < len(fields):
+        await message.answer(f"Введите: <b>{escape_html(RESUME_FIELD_LABELS[fields[index]])}</b>", parse_mode="HTML")
+
+
+@router.message(UserState.waiting_for_resume_field)
+async def process_resume_field(message: Message, state: FSMContext):
+    value = (message.text or "").strip()
+    data = await state.get_data()
+    fields = data.get("resume_missing_fields", [])
+    index = data.get("resume_field_index", 0)
+    if index >= len(fields):
+        await state.clear()
+        return
+    field = fields[index]
+    if field == "birth_date":
+        try:
+            parsed = date.fromisoformat(value)
+            age = (date.today() - parsed).days // 365
+            if not 14 <= age <= 100:
+                raise ValueError
+        except ValueError:
+            await message.answer("❌ Введите реальную дату в формате ГГГГ-ММ-ДД.")
+            return
+    elif not 1 <= len(value) <= (100 if field == "first_name" else 300):
+        await message.answer("❌ Значение пустое или слишком длинное.")
+        return
+    structured = data.get("resume_structured", {})
+    structured[field] = value
+    index += 1
+    await state.update_data(resume_structured=structured, resume_field_index=index)
+    if index < len(fields):
+        await _prompt_next_resume_field(message, state)
+        return
+    account_id = data.get("resume_upload_account_id")
+    account = await get_account_for_user(message.from_user.id, account_id) if account_id else None
+    if not account:
+        await state.clear()
+        await message.answer("❌ Аккаунт больше не доступен.")
+        return
+    status_msg = await message.answer("🔄 Повторно запускаем мастер hh.ru с указанными данными...")
+    try:
+        with tempfile.TemporaryDirectory(prefix="leadscout_resume_") as temp_dir:
+            pdf_path = str(Path(temp_dir) / "resume.pdf")
+            await message.bot.download(data["resume_file_id"], destination=pdf_path)
+            result = await HHResumeManager.upload_pdf_resume_to_hh(
+                message.from_user.id,
+                pdf_path,
+                account_id=account_id,
+                structured_override=StructuredResume.model_validate(structured),
+            )
+    except (PDFValidationError, ValueError) as exc:
+        result = {"status": "ERROR", "message": str(exc)}
+    await state.clear()
+    await status_msg.edit_text(
+        "✅ Резюме создано и подтверждено в hh.ru."
+        if result.get("status") == "SUCCESS"
+        else f"❌ {result.get('message', 'Не удалось завершить мастер hh.ru.')}"
+    )
 
 
 @router.callback_query(F.data == "upload_pdf_resume")
 async def cb_upload_pdf_resume(callback: CallbackQuery, state: FSMContext):
+    acc = await get_active_account(callback.from_user.id)
+    if not acc:
+        await callback.answer("Сначала выберите аккаунт.", show_alert=True)
+        return
+    await state.update_data(resume_upload_account_id=acc["id"])
     await callback.message.answer("📎 **Прикрепите и отправьте ваш PDF-файл резюме для сохранения и выгрузки на hh.ru.**", parse_mode="Markdown")
     await state.set_state(UserState.waiting_for_resume)
     await callback.answer()
@@ -807,9 +991,7 @@ async def cb_sync_hh_resumes(callback: CallbackQuery, state: FSMContext):
 
     hh_res = await HHResumeManager.fetch_user_resumes(callback.from_user.id, account_id=acc["id"])
     resumes_list = hh_res.get("resumes", []) if hh_res.get("status") == "SUCCESS" else []
-    if resumes_list:
-        await update_account_settings(acc["id"], resumes_json=json.dumps(resumes_list))
-
+    acc = await get_account_for_user(callback.from_user.id, acc["id"]) or acc
     active_title = acc.get("active_resume_title") or (resumes_list[0]["title"] if resumes_list else "Не выбрано")
     resume_len = len(acc.get("resume_text") or "")
     text = (
@@ -847,11 +1029,11 @@ async def cb_preview_resume(callback: CallbackQuery):
 
     snippet = resume_text[:1200] + ("..." if len(resume_text) > 1200 else "")
     preview_msg = (
-        f"📄 **Обзор текста резюме (`{acc.get('account_name')}`):**\n"
-        f"📊 **Всего символов:** `{len(resume_text)}`\n\n"
-        f"```text\n{snippet}\n```"
+        f"📄 <b>Текст активного резюме</b>\n"
+        f"📊 Всего символов: <code>{len(resume_text)}</code>\n\n"
+        f"<pre>{escape_html(snippet)}</pre>"
     )
-    await callback.message.answer(preview_msg, parse_mode="Markdown")
+    await callback.message.answer(preview_msg, parse_mode="HTML")
     await callback.answer()
 
 
@@ -864,32 +1046,29 @@ async def cb_manage_resume(callback: CallbackQuery):
         pass
 
     try:
-        idx = int(callback.data.replace("manage_res_", ""))
+        snapshot_id = parse_callback_id(callback.data, "manage_res_")
         acc = await get_active_account(callback.from_user.id)
         if not acc:
             await callback.message.edit_text("⚠️ Аккаунт не найден. Пройдите авторизацию заново.", parse_mode="Markdown")
             return
 
-        hh_res = await HHResumeManager.fetch_user_resumes(callback.from_user.id, account_id=acc["id"])
-        resumes_list = hh_res.get("resumes", []) if hh_res.get("status") == "SUCCESS" else []
-
-        if 0 <= idx < len(resumes_list):
-            selected = resumes_list[idx]
-            is_active = (selected["href"] == acc.get("active_resume_url")) or (idx == 0 and not acc.get("active_resume_url"))
+        selected = await get_resume_snapshot_for_user(callback.from_user.id, snapshot_id) if snapshot_id else None
+        if selected and selected["account_id"] == acc["id"]:
+            is_active = selected["href"] == acc.get("active_resume_url")
             status_prefix = "🟢 [АКТИВНО] " if is_active else "📄 "
 
             text = (
                 f"📄 **Управление резюме (`{acc.get('account_name')}`):**\n\n"
                 f"📌 **Название:** `{selected['title']}`\n"
                 f"📊 **Статус:** `{status_prefix}{selected.get('status', 'Опубликовано')}`\n"
-                f"🔗 **ID на hh.ru:** `{selected['id']}`\n\n"
+                f"🔗 **ID на hh.ru:** `{selected['hh_resume_id']}`\n\n"
                 f"Выберите действие:"
             )
-            await callback.message.edit_text(text, reply_markup=get_resume_action_keyboard(idx, is_active=is_active), parse_mode="Markdown")
+            await callback.message.edit_text(text, reply_markup=get_resume_action_keyboard(snapshot_id, is_active=is_active), parse_mode="Markdown")
         else:
             await callback.message.edit_text("❌ Резюме не найдено. Нажмите `📄 Мое резюме` для обновления.", parse_mode="Markdown")
     except Exception as e:
-        logger.error("Ошибка при открытии меню резюме: %s", e)
+        logger.error("Ошибка при открытии меню резюме: %s", type(e).__name__)
         try:
             await callback.message.answer("❌ Ошибка открытия меню резюме.", parse_mode="Markdown")
         except Exception:
@@ -905,27 +1084,24 @@ async def cb_request_delete_resume(callback: CallbackQuery):
         pass
 
     try:
-        idx = int(callback.data.replace("req_del_res_", ""))
+        snapshot_id = parse_callback_id(callback.data, "req_del_res_")
         acc = await get_active_account(callback.from_user.id)
         if not acc:
             await callback.message.edit_text("⚠️ Аккаунт не найден.", parse_mode="Markdown")
             return
 
-        hh_res = await HHResumeManager.fetch_user_resumes(callback.from_user.id, account_id=acc["id"])
-        resumes_list = hh_res.get("resumes", []) if hh_res.get("status") == "SUCCESS" else []
-
-        if 0 <= idx < len(resumes_list):
-            selected = resumes_list[idx]
+        selected = await get_resume_snapshot_for_user(callback.from_user.id, snapshot_id) if snapshot_id else None
+        if selected and selected["account_id"] == acc["id"]:
             text = (
                 f"⚠️ **Удаление резюме**\n\n"
                 f"Вы действительно хотите безвозвратно **удалить резюме «{selected['title']}»** с сайта hh.ru и из бота?\n\n"
                 f"🛑 *Это действие нельзя отменить! Резюме будет удалено с hh.ru и очищено из аккаунта бота.*"
             )
-            await callback.message.edit_text(text, reply_markup=get_confirm_delete_resume_keyboard(idx), parse_mode="Markdown")
+            await callback.message.edit_text(text, reply_markup=get_confirm_delete_resume_keyboard(snapshot_id), parse_mode="Markdown")
         else:
             await callback.message.edit_text("❌ Резюме не найдено в списке.", parse_mode="Markdown")
     except Exception as e:
-        logger.error("Ошибка запроса удаления резюме: %s", e)
+        logger.error("Ошибка запроса удаления резюме: %s", type(e).__name__)
         try:
             await callback.message.answer("❌ Ошибка при запросе удаления.", parse_mode="Markdown")
         except Exception:
@@ -941,28 +1117,33 @@ async def cb_do_delete_resume(callback: CallbackQuery):
         pass
 
     try:
-        idx = int(callback.data.replace("do_del_res_", ""))
+        snapshot_id = parse_callback_id(callback.data, "do_del_res_")
         acc = await get_active_account(callback.from_user.id)
         if not acc:
             await callback.message.edit_text("⚠️ Аккаунт не найден. Пройдите авторизацию заново.", parse_mode="Markdown")
             return
 
-        hh_res = await HHResumeManager.fetch_user_resumes(callback.from_user.id, account_id=acc["id"])
-        resumes_list = hh_res.get("resumes", []) if hh_res.get("status") == "SUCCESS" else []
-
-        if 0 <= idx < len(resumes_list):
-            selected = resumes_list[idx]
+        selected = await get_resume_snapshot_for_user(callback.from_user.id, snapshot_id) if snapshot_id else None
+        if selected and selected["account_id"] == acc["id"]:
             await callback.message.edit_text(
                 f"🔄 **Удаление резюме «{selected['title']}» с hh.ru и бота...**\n"
                 f"Пожалуйста, подождите 10-15 секунд.",
                 parse_mode="Markdown"
             )
 
-            del_res = await HHResumeManager.delete_resume_on_hh(callback.from_user.id, selected["id"], account_id=acc["id"])
+            del_res = await HHResumeManager.delete_resume_on_hh(
+                callback.from_user.id, selected["hh_resume_id"], account_id=acc["id"]
+            )
 
             if del_res.get("status") == "SUCCESS":
-                if acc.get("active_resume_url") and (selected["id"] in acc["active_resume_url"] or selected["href"] == acc["active_resume_url"]):
-                    await update_account_settings(acc["id"], active_resume_url="", active_resume_title="", resume_text="")
+                if selected["href"] == acc.get("active_resume_url"):
+                    await update_account_settings_for_user(
+                        callback.from_user.id,
+                        acc["id"],
+                        active_resume_url="",
+                        active_resume_title="",
+                        resume_text="",
+                    )
 
                 updated_acc = await get_active_account(callback.from_user.id)
                 new_hh = await HHResumeManager.fetch_user_resumes(callback.from_user.id, account_id=acc["id"])
@@ -992,7 +1173,7 @@ async def cb_do_delete_resume(callback: CallbackQuery):
         else:
             await callback.message.edit_text("❌ Резюме не найдено в списке. Нажмите `📄 Мое резюме` для обновления.", parse_mode="Markdown")
     except Exception as e:
-        logger.error("Ошибка при выполнении удаления резюме: %s", e)
+        logger.error("Ошибка при выполнении удаления резюме: %s", type(e).__name__)
         try:
             await callback.message.answer("❌ Произошла ошибка при удалении резюме.", parse_mode="Markdown")
         except Exception:
@@ -1004,27 +1185,20 @@ async def cb_do_delete_resume(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("select_res_"))
 async def cb_select_resume(callback: CallbackQuery):
     try:
-        idx = int(callback.data.replace("select_res_", ""))
+        snapshot_id = parse_callback_id(callback.data, "select_res_")
         acc = await get_active_account(callback.from_user.id)
         if not acc:
             await callback.answer("Аккаунт не найден.", show_alert=True)
             return
 
-        hh_res = await HHResumeManager.fetch_user_resumes(callback.from_user.id, account_id=acc["id"])
-        resumes_list = hh_res.get("resumes", []) if hh_res.get("status") == "SUCCESS" else []
-
-        if 0 <= idx < len(resumes_list):
-            selected = resumes_list[idx]
-            ai_kw = await extract_search_keywords_from_resume(acc.get("resume_text", ""), selected["title"])
+        selected = await set_active_resume_snapshot(
+            callback.from_user.id, acc["id"], snapshot_id
+        ) if snapshot_id else None
+        if selected:
+            ai_kw = await extract_search_keywords_from_resume(selected.get("extracted_text", ""), selected["title"])
             kw_setting = ", ".join(ai_kw) if ai_kw else acc.get("keywords", "")
-
-            await update_account_settings(
-                acc["id"],
-                active_resume_url=selected["href"],
-                active_resume_title=selected["title"],
-                keywords=kw_setting
-            )
-
+            await update_account_settings_for_user(callback.from_user.id, acc["id"], keywords=kw_setting)
+            resumes_list = await list_resume_snapshots(callback.from_user.id, acc["id"])
             await callback.message.edit_reply_markup(
                 reply_markup=get_resume_inline_keyboard(
                     resumes_list,
@@ -1035,24 +1209,26 @@ async def cb_select_resume(callback: CallbackQuery):
             msg = f"✅ Резюме «{selected['title']}» выбрано основным!"
             if ai_kw:
                 msg += f"\n🤖 Ключевые слова ИИ: {kw_setting}"
+            elif not selected.get("extracted_text"):
+                msg += "\n⚠️ Текст этого резюме недоступен; автоотклик не запустится до загрузки текста."
             await callback.answer(msg, show_alert=True)
         else:
             await callback.answer("Резюме не найдено.", show_alert=True)
     except Exception as e:
-        logger.error("Ошибка выбора резюме: %s", e)
+        logger.error("Ошибка выбора резюме: %s", type(e).__name__)
         await callback.answer("Ошибка выбора резюме.", show_alert=True)
 
 
 
 @router.message(UserState.waiting_for_resume)
 async def process_resume_input(message: Message, state: FSMContext):
-    if not message.text or len(message.text.strip()) < 50:
-        await message.answer("❌ Текст резюме должен быть от 50 символов.", parse_mode="Markdown")
+    if not message.text or not 50 <= len(message.text.strip()) <= 50_000:
+        await message.answer("❌ Текст резюме должен содержать от 50 до 50 000 символов.", parse_mode="Markdown")
         return
 
     acc = await get_active_account(message.from_user.id)
     if acc:
-        await update_account_settings(acc["id"], resume_text=message.text.strip())
+        await update_account_settings_for_user(message.from_user.id, acc["id"], resume_text=message.text.strip())
     else:
         await update_user_settings(message.from_user.id, resume_text=message.text.strip())
 
@@ -1099,13 +1275,13 @@ async def _process_and_send_resume_audit(event: CallbackQuery | Message, resume_
     # 2. Валидация на IT-профессию
     if not audit_res.is_it_profession:
         reject_text = (
-            "⚠️ **Проверка доступна только для IT-резюме!**\n\n"
-            f"Ваше резюме распознано как: **{audit_res.profession_name}**.\n"
-            f"**Причина:** {audit_res.rejection_reason}\n\n"
+            "⚠️ <b>Проверка доступна только для IT-резюме.</b>\n\n"
+            f"Распознано как: <b>{escape_html(audit_res.profession_name)}</b>.\n"
+            f"<b>Причина:</b> {escape_html(audit_res.rejection_reason)}\n\n"
             "Модуль автоскоринга LeadScout AI настроен на аналитику IT-профессий (Software Engineering, Data, DevOps, QA, Product & Project Management).\n\n"
-            "*Попробуйте загрузку или ввод другого IT-резюме.*"
+            "Попробуйте загрузить другое IT-резюме."
         )
-        await status_msg.edit_text(reject_text, parse_mode="Markdown")
+        await status_msg.edit_text(reject_text, parse_mode="HTML")
         return
 
     # 3. Сохранение результатов в БД
@@ -1126,65 +1302,75 @@ async def _process_and_send_resume_audit(event: CallbackQuery | Message, resume_
 
     # 4. Генерация PDF-отчета ReportLab
     try:
-        temp_dir = tempfile.gettempdir()
-        pdf_path = os.path.join(temp_dir, f"LeadScout_Resume_Audit_{audit_id}.pdf")
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix=f"leadscout_audit_{audit_id}_", suffix=".pdf", delete=False
+        )
+        pdf_path = temp_file.name
+        temp_file.close()
         generate_resume_audit_pdf(audit_dict, pdf_path)
     except Exception as e:
-        logger.error("Ошибка при генерации PDF-отчета: %s", e)
+        logger.error("Ошибка при генерации PDF-отчета: %s", type(e).__name__)
         pdf_path = None
 
     # 5. Вывод отчета в Telegram
     cats = audit_res.category_scores
     bar = _make_progress_bar(audit_res.overall_score)
     
-    penalties_str = "\n• ".join(audit_res.penalties) if audit_res.penalties else "Барьеров не обнаружено"
-    recs_str = "\n".join([f"{idx}. {rec}" for idx, rec in enumerate(audit_res.top_recommendations, 1)]) if audit_res.top_recommendations else "Все основные аспекты в порядке"
+    penalties_str = "\n• ".join(escape_html(item) for item in audit_res.penalties) if audit_res.penalties else "Барьеров не обнаружено"
+    recs_str = "\n".join([f"{idx}. {escape_html(rec)}" for idx, rec in enumerate(audit_res.top_recommendations, 1)]) if audit_res.top_recommendations else "Все основные аспекты в порядке"
 
-    custom_tag = "\nℹ️ *Проверено стороннее резюме (без загрузки на hh.ru).*" if is_custom else ""
+    custom_tag = "\nℹ️ Проверено стороннее резюме (без загрузки на hh.ru)." if is_custom else ""
 
     report_text = (
-        f"🏆 **Результат проверки IT-резюме**{custom_tag}\n"
-        f"📌 **Роль:** `{audit_res.profession_name}`\n"
-        f"📊 **Итоговый балл:** `{audit_res.overall_score} / 100` {bar}\n\n"
-        f"--- \n"
-        f"🟢 **Hard Skills & Стек:** `{cats.hard_skills}/100`\n"
-        f"🟢 **Impact & Метрики (XYZ):** `{cats.impact_metrics}/100`\n"
-        f"🟢 **Читаемость ATS & Формат:** `{cats.parseability}/100`\n"
-        f"🟡 **Карьерный трек & Стаж:** `{cats.timeline}/100`\n"
-        f"🟢 **Стиль & Оформление:** `{cats.style}/100`\n\n"
-        f"--- \n"
-        f"⚠️ **Выявленные риски:**\n• {penalties_str}\n\n"
-        f"💡 **Топ-3 рекомендации:**\n{recs_str}\n\n"
-        f"📎 *Подробный графический PDF-отчет прикреплен ниже!*"
+        f"🏆 <b>Результат проверки IT-резюме</b>{custom_tag}\n"
+        f"📌 <b>Роль:</b> <code>{escape_html(audit_res.profession_name)}</code>\n"
+        f"📊 <b>Итоговый балл:</b> <code>{audit_res.overall_score} / 100</code> {bar}\n\n"
+        f"🟢 <b>Hard Skills и стек:</b> <code>{cats.hard_skills}/100</code>\n"
+        f"🟢 <b>Impact и метрики:</b> <code>{cats.impact_metrics}/100</code>\n"
+        f"🟢 <b>Читаемость ATS:</b> <code>{cats.parseability}/100</code>\n"
+        f"🟡 <b>Карьерный трек:</b> <code>{cats.timeline}/100</code>\n"
+        f"🟢 <b>Стиль:</b> <code>{cats.style}/100</code>\n\n"
+        f"⚠️ <b>Выявленные риски:</b>\n• {penalties_str}\n\n"
+        f"💡 <b>Топ-рекомендации:</b>\n{recs_str}\n\n"
+        f"📎 Подробный PDF-отчет прикреплен ниже."
     )
 
     await status_msg.edit_text("✅ **Анализ завершен! Высылаем итоговый отчет...**", parse_mode="Markdown")
 
-    if pdf_path and os.path.exists(pdf_path):
-        if len(report_text) <= 1000:
-            await message.answer_document(
-                document=FSInputFile(pdf_path, filename=f"LeadScout_Resume_Audit_{audit_id}.pdf"),
-                caption=report_text,
-                reply_markup=get_resume_audit_result_keyboard(audit_id),
-                parse_mode="Markdown"
-            )
+    try:
+        if pdf_path and os.path.exists(pdf_path):
+            if len(report_text) <= 1000:
+                await message.answer_document(
+                    document=FSInputFile(pdf_path, filename=f"LeadScout_Resume_Audit_{audit_id}.pdf"),
+                    caption=report_text,
+                    reply_markup=get_resume_audit_result_keyboard(audit_id),
+                    parse_mode="HTML"
+                )
+            else:
+                await send_chunked_message(
+                    message,
+                    report_text,
+                    reply_markup=get_resume_audit_result_keyboard(audit_id),
+                    parse_mode="HTML",
+                )
+                await message.answer_document(
+                    document=FSInputFile(pdf_path, filename=f"LeadScout_Resume_Audit_{audit_id}.pdf"),
+                    caption=f"📎 <b>Полный PDF-отчет аудита #{audit_id}</b>",
+                    parse_mode="HTML"
+                )
         else:
-            await message.answer(
+            await send_chunked_message(
+                message,
                 report_text,
                 reply_markup=get_resume_audit_result_keyboard(audit_id),
-                parse_mode="Markdown"
+                parse_mode="HTML",
             )
-            await message.answer_document(
-                document=FSInputFile(pdf_path, filename=f"LeadScout_Resume_Audit_{audit_id}.pdf"),
-                caption=f"📎 **Полный графический PDF-отчет аудита #{audit_id}**",
-                parse_mode="Markdown"
-            )
-    else:
-        await message.answer(
-            report_text,
-            reply_markup=get_resume_audit_result_keyboard(audit_id),
-            parse_mode="Markdown"
-        )
+    finally:
+        if pdf_path:
+            try:
+                os.remove(pdf_path)
+            except FileNotFoundError:
+                pass
 
 
 
@@ -1195,9 +1381,12 @@ async def cmd_check_resume(message: Message, state: FSMContext = None):
     if state:
         await state.update_data(nav_hub="audit")
     acc = await get_active_account(message.from_user.id)
-    applied_count = acc.get("applied_today", 0) if acc else 0
-    processed_count = applied_count
-    error_count = 0
+    stats = await get_application_stats(
+        message.from_user.id, account_id=acc.get("id") if acc else None
+    )
+    applied_count = stats["applied"]
+    processed_count = stats["processed"]
+    error_count = stats["errors"]
 
     latest_audit = await get_user_latest_audit(message.from_user.id)
     if latest_audit and latest_audit.get("overall_score"):
@@ -1234,7 +1423,14 @@ async def cmd_check_resume(message: Message, state: FSMContext = None):
         f"📜 Живой лог последних действий:\n"
         f"{log_clean}"
     )
-    await send_banner_message(message, AUDIT_BANNER, text, reply_markup=get_resume_audit_start_keyboard(has_active_resume=True), parse_mode=None)
+    has_active_resume = bool(acc and acc.get("active_resume_title") and (acc.get("resume_text") or "").strip())
+    await send_banner_message(
+        message,
+        AUDIT_BANNER,
+        text,
+        reply_markup=get_resume_audit_start_keyboard(has_active_resume=has_active_resume),
+        parse_mode=None,
+    )
 
 
 @router.callback_query(F.data == "start_resume_audit")
@@ -1289,27 +1485,27 @@ async def process_audit_pdf_document(message: Message, state: FSMContext):
     """Обработка загруженного PDF-файла исключительно для аудита (без HH)."""
     from parsers.hh_resume import extract_text_from_pdf
 
-    if not message.document.file_name.lower().endswith(".pdf"):
+    if (
+        not message.document.file_name
+        or not message.document.file_name.lower().endswith(".pdf")
+        or message.document.mime_type not in {None, "application/pdf"}
+    ):
         await message.answer("❌ Пожалуйста, отправьте файл в формате **PDF**.", parse_mode="Markdown")
+        return
+    if message.document.file_size and message.document.file_size > PDF_MAX_BYTES:
+        await message.answer(f"❌ Размер PDF не должен превышать {PDF_MAX_BYTES // (1024 * 1024)} МБ.")
         return
 
     await state.clear()
     status_msg = await message.answer("📥 **Скачивание и извлечение текста из PDF...**", parse_mode="Markdown")
 
-    file_info = await message.bot.get_file(message.document.file_id)
-    temp_dir = tempfile.gettempdir()
-    pdf_path = os.path.join(temp_dir, f"audit_upload_{message.from_user.id}.pdf")
-    await message.bot.download_file(file_info.file_path, pdf_path)
-
-    extracted_text = extract_text_from_pdf(pdf_path)
-    if os.path.exists(pdf_path):
-        try:
-            os.remove(pdf_path)
-        except Exception:
-            pass
-
-    if not extracted_text or len(extracted_text.strip()) < 50:
-        await status_msg.edit_text("❌ Не удалось извлечь читаемый текст из PDF. Убедитесь, что это текстовый PDF, а не сканированное изображение.", parse_mode="Markdown")
+    try:
+        with tempfile.TemporaryDirectory(prefix="leadscout_audit_") as temp_dir:
+            pdf_path = str(Path(temp_dir) / "audit.pdf")
+            await message.bot.download(message.document, destination=pdf_path)
+            extracted_text = await asyncio.to_thread(extract_text_from_pdf, pdf_path)
+    except PDFValidationError as exc:
+        await status_msg.edit_text(f"❌ {exc}")
         return
 
     await status_msg.delete()
@@ -1332,8 +1528,8 @@ async def process_audit_text_message(message: Message, state: FSMContext):
 async def cb_show_audit_insights(callback: CallbackQuery):
     """Вывод подробного списка пошаговых рекомендаций (Actionable Insights)."""
     try:
-        audit_id = int(callback.data.replace("show_audit_insights_", ""))
-        audit = await get_resume_audit_by_id(audit_id)
+        audit_id = parse_callback_id(callback.data, "show_audit_insights_")
+        audit = await get_resume_audit_for_user(callback.from_user.id, audit_id) if audit_id else None
         if not audit:
             await callback.answer("Данные аудита не найдены.", show_alert=True)
             return
@@ -1343,31 +1539,31 @@ async def cb_show_audit_insights(callback: CallbackQuery):
             await callback.answer("Подробные рекомендации отсутствуют.", show_alert=True)
             return
 
-        text = f"💡 **Пошаговые рекомендации по улучшению резюме (#{audit_id}):**\n\n"
+        text = f"💡 <b>Пошаговые рекомендации по улучшению резюме (#{audit_id})</b>\n\n"
         
         tier_1 = [i for i in insights if i.get("tier") == 1 or i.get("tier") == "1"]
         tier_2 = [i for i in insights if i.get("tier") == 2 or i.get("tier") == "2"]
         tier_3 = [i for i in insights if i.get("tier") == 3 or i.get("tier") == "3"]
 
         if tier_1:
-            text += "🔴 **Tier 1: Критические блокеры (Срочные исправления):**\n"
+            text += "🔴 <b>Tier 1: Критические блокеры</b>\n"
             for item in tier_1:
-                text += f"• **{item.get('title')}** ({item.get('score_impact')}):\n  _{item.get('description')}_\n\n"
+                text += f"• <b>{escape_html(item.get('title'))}</b> ({escape_html(item.get('score_impact'))}):\n{escape_html(item.get('description'))}\n\n"
 
         if tier_2:
-            text += "🟡 **Tier 2: Оптимизация контента и метрики XYZ:**\n"
+            text += "🟡 <b>Tier 2: Оптимизация контента и метрики XYZ</b>\n"
             for item in tier_2:
-                text += f"• **{item.get('title')}** ({item.get('score_impact')}):\n  _{item.get('description')}_\n\n"
+                text += f"• <b>{escape_html(item.get('title'))}</b> ({escape_html(item.get('score_impact'))}):\n{escape_html(item.get('description'))}\n\n"
 
         if tier_3:
-            text += "🟢 **Tier 3: Стилистическая полировка:**\n"
+            text += "🟢 <b>Tier 3: Стилистическая полировка</b>\n"
             for item in tier_3:
-                text += f"• **{item.get('title')}** ({item.get('score_impact')}):\n  _{item.get('description')}_\n\n"
+                text += f"• <b>{escape_html(item.get('title'))}</b> ({escape_html(item.get('score_impact'))}):\n{escape_html(item.get('description'))}\n\n"
 
-        await callback.message.answer(text, parse_mode="Markdown")
+        await send_chunked_message(callback.message, text, parse_mode="HTML")
         await callback.answer()
     except Exception as e:
-        logger.error("Ошибка вывода рекомендаций аудита: %s", e)
+        logger.error("Ошибка вывода рекомендаций аудита: %s", type(e).__name__)
         await callback.answer("Ошибка получения рекомендаций.", show_alert=True)
 
 
@@ -1375,7 +1571,11 @@ async def cb_show_audit_insights(callback: CallbackQuery):
 async def cb_match_with_vacancy_prompt(callback: CallbackQuery, state: FSMContext):
     """Запрос вакансии для 2-го этапа ИИ-матчинга."""
     try:
-        audit_id = int(callback.data.replace("match_with_vacancy_", ""))
+        audit_id = parse_callback_id(callback.data, "match_with_vacancy_")
+        audit = await get_resume_audit_for_user(callback.from_user.id, audit_id) if audit_id else None
+        if not audit:
+            await callback.answer("Данные аудита не найдены.", show_alert=True)
+            return
         await state.update_data(audit_id=audit_id)
         await state.set_state(UserState.waiting_for_vacancy_for_matching)
 
@@ -1387,7 +1587,7 @@ async def cb_match_with_vacancy_prompt(callback: CallbackQuery, state: FSMContex
         await callback.message.answer(text, reply_markup=get_cancel_vacancy_matching_keyboard(), parse_mode="Markdown")
         await callback.answer()
     except Exception as e:
-        logger.error("Ошибка запуска матчинга вакансии: %s", e)
+        logger.error("Ошибка запуска матчинга вакансии: %s", type(e).__name__)
         await callback.answer("Ошибка запуска сравнения с вакансией.", show_alert=True)
 
 
@@ -1413,28 +1613,50 @@ async def process_vacancy_input_for_matching(message: Message, state: FSMContext
         user = await get_or_create_user(message.from_user.id)
         resume_text = user.get("resume_text", "")
 
+    if not resume_text:
+        await message.answer("❌ У активного резюме нет текста для сравнения.")
+        return
     status_msg = await message.answer("🎯 **ИИ сравнивает резюме с требованиями вакансии...**\n*Пожалуйста, подождите...*", parse_mode="Markdown")
+    vacancy_text = vacancy_input
+    if vacancy_input.lower().startswith(("http://", "https://")):
+        normalized = normalize_hh_vacancy_url(vacancy_input)
+        if not normalized or not acc:
+            await status_msg.edit_text("❌ Допустима только HTTPS-ссылка вида https://hh.ru/vacancy/123456.")
+            return
+        vacancy_result = await HHResumeManager.fetch_vacancy_text(
+            message.from_user.id, normalized, acc["id"]
+        )
+        if vacancy_result.get("status") != "SUCCESS":
+            await status_msg.edit_text(f"❌ {vacancy_result.get('message', 'Не удалось загрузить вакансию.')}")
+            return
+        vacancy_text = vacancy_result["description"]
+    elif len(vacancy_text) > 50_000:
+        await status_msg.edit_text("❌ Описание вакансии должно быть не длиннее 50 000 символов.")
+        return
 
-    match_res = await match_resume_to_vacancy(resume_text, vacancy_input)
+    match_res = await match_resume_to_vacancy(resume_text, vacancy_text)
 
     bar = _make_progress_bar(match_res.match_score)
     status_str = "Высокое соответствие 🚀" if match_res.is_suitable else "Требуется адаптация отклика ⚠️"
     
-    matching_str = ", ".join(match_res.matching_skills) if match_res.matching_skills else "Явных совпадений стека не выделено"
-    missing_str = "\n• ".join(match_res.missing_skills) if match_res.missing_skills else "Критических пробелов не вычислено"
+    matching_str = ", ".join(escape_html(item) for item in match_res.matching_skills) if match_res.matching_skills else "Явных совпадений стека не выделено"
+    missing_str = "\n• ".join(escape_html(item) for item in match_res.missing_skills) if match_res.missing_skills else "Критических пробелов не вычислено"
 
     report_text = (
-        f"🎯 **Результат соответствия вакансии**\n"
-        f"📊 **Match Score:** `{match_res.match_score}%` {bar}\n"
-        f"✅ **Статус:** `{status_str}`\n\n"
-        f"--- \n"
-        f"✅ **Совпавший стек (Hard Skills):**\n`{matching_str}`\n\n"
-        f"⚠️ **Нехватающие ключевые навыки:**\n• {missing_str}\n\n"
-        f"💡 **Совет по отклику:**\n_{match_res.advice_for_apply}_"
+        f"🎯 <b>Результат соответствия вакансии</b>\n"
+        f"📊 <b>Match Score:</b> <code>{match_res.match_score}%</code> {bar}\n"
+        f"✅ <b>Статус:</b> {escape_html(status_str)}\n\n"
+        f"✅ <b>Совпавший стек:</b>\n{matching_str}\n\n"
+        f"⚠️ <b>Недостающие ключевые навыки:</b>\n• {missing_str}\n\n"
+        f"💡 <b>Совет по отклику:</b>\n{escape_html(match_res.advice_for_apply)}"
     )
 
     await state.clear()
-    await status_msg.edit_text(report_text, parse_mode="Markdown")
+    if len(report_text) <= 4000:
+        await status_msg.edit_text(report_text, parse_mode="HTML")
+    else:
+        await status_msg.edit_text("✅ Сравнение завершено. Отправляю подробный результат ниже.")
+        await send_chunked_message(message, report_text, parse_mode="HTML")
 
 
 
@@ -1465,9 +1687,19 @@ async def cb_toggle_account_auto_apply(callback: CallbackQuery):
         return
 
     new_val = 0 if acc.get("auto_apply_enabled") else 1
-    await update_account_settings(acc["id"], auto_apply_enabled=new_val)
+    if new_val:
+        if acc.get("session_status") != "ACTIVE":
+            await callback.answer("Сначала войдите в hh.ru.", show_alert=True)
+            return
+        if not acc.get("active_resume_title") or not (acc.get("resume_text") or "").strip():
+            await callback.answer("Выберите резюме с доступным текстом.", show_alert=True)
+            return
+        await update_account_settings_for_user(callback.from_user.id, acc["id"], auto_apply_enabled=1)
+        await task_coordinator.start_account(callback.from_user.id, acc["id"])
+    else:
+        await task_coordinator.stop_account(callback.from_user.id, acc["id"])
 
-    updated_acc = await get_account_by_id(acc["id"])
+    updated_acc = await get_account_for_user(callback.from_user.id, acc["id"])
     await callback.message.edit_reply_markup(reply_markup=get_settings_inline_keyboard(updated_acc))
     await callback.answer(f"Автоотклик {'ВКЛЮЧЕН 🚀' if new_val else 'ОСТАНОВЛЕН ⛔️'}")
 
@@ -1477,8 +1709,8 @@ async def cb_toggle_remote(callback: CallbackQuery):
     acc = await get_active_account(callback.from_user.id)
     if acc:
         new_remote = 0 if acc.get("only_remote") else 1
-        await update_account_settings(acc["id"], only_remote=new_remote)
-        updated_acc = await get_account_by_id(acc["id"])
+        await update_account_settings_for_user(callback.from_user.id, acc["id"], only_remote=new_remote)
+        updated_acc = await get_account_for_user(callback.from_user.id, acc["id"])
         await callback.message.edit_reply_markup(reply_markup=get_settings_inline_keyboard(updated_acc))
     await callback.answer("Режим удаленки обновлен!")
 
@@ -1488,14 +1720,19 @@ async def cb_toggle_cover_letter(callback: CallbackQuery):
     acc = await get_active_account(callback.from_user.id)
     if acc:
         new_cover = 0 if acc.get("send_cover_letter", 1) else 1
-        await update_account_settings(acc["id"], send_cover_letter=new_cover)
-        updated_acc = await get_account_by_id(acc["id"])
+        await update_account_settings_for_user(callback.from_user.id, acc["id"], send_cover_letter=new_cover)
+        updated_acc = await get_account_for_user(callback.from_user.id, acc["id"])
         await callback.message.edit_reply_markup(reply_markup=get_settings_inline_keyboard(updated_acc))
     await callback.answer("Сопроводительное письмо обновлено!")
 
 
 @router.callback_query(F.data == "set_limit")
 async def cb_set_limit(callback: CallbackQuery, state: FSMContext):
+    acc = await get_active_account(callback.from_user.id)
+    if not acc:
+        await callback.answer("Аккаунт не выбран.", show_alert=True)
+        return
+    await state.update_data(settings_account_id=acc["id"])
     await callback.message.answer("🎯 **Введите суточный лимит откликов** (например, `30`):", parse_mode="Markdown")
     await state.set_state(UserState.waiting_for_limit)
     await callback.answer()
@@ -1508,9 +1745,13 @@ async def process_limit_input(message: Message, state: FSMContext):
         return
 
     limit = int(message.text.strip())
-    acc = await get_active_account(message.from_user.id)
+    if not 1 <= limit <= 200:
+        await message.answer("❌ Введите число от 1 до 200.")
+        return
+    data = await state.get_data()
+    acc = await get_account_for_user(message.from_user.id, data.get("settings_account_id")) if data.get("settings_account_id") else None
     if acc:
-        await update_account_settings(acc["id"], daily_limit=limit)
+        await update_account_settings_for_user(message.from_user.id, acc["id"], daily_limit=limit)
 
     await state.clear()
     await message.answer(f"✅ **Суточный лимит установлен:** `{limit}` откликов/день.", parse_mode="Markdown")
@@ -1518,6 +1759,11 @@ async def process_limit_input(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "set_salary")
 async def cb_set_salary(callback: CallbackQuery, state: FSMContext):
+    acc = await get_active_account(callback.from_user.id)
+    if not acc:
+        await callback.answer("Аккаунт не выбран.", show_alert=True)
+        return
+    await state.update_data(settings_account_id=acc["id"])
     await callback.message.answer("💰 **Введите желаемую минимальную ЗП в рублях** (например, `150000`):", parse_mode="Markdown")
     await state.set_state(UserState.waiting_for_salary)
     await callback.answer()
@@ -1530,9 +1776,13 @@ async def process_salary_input(message: Message, state: FSMContext):
         return
 
     salary = int(message.text.strip())
-    acc = await get_active_account(message.from_user.id)
+    if not 0 <= salary <= 100_000_000:
+        await message.answer("❌ Зарплата должна быть от 0 до 100 000 000 ₽.")
+        return
+    data = await state.get_data()
+    acc = await get_account_for_user(message.from_user.id, data.get("settings_account_id")) if data.get("settings_account_id") else None
     if acc:
-        await update_account_settings(acc["id"], min_salary=salary)
+        await update_account_settings_for_user(message.from_user.id, acc["id"], min_salary=salary)
 
     await state.clear()
     await message.answer(f"✅ **Минимальная ЗП установлена:** `{salary} ₽`.", parse_mode="Markdown")
@@ -1540,6 +1790,11 @@ async def process_salary_input(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "set_keywords")
 async def cb_set_keywords(callback: CallbackQuery, state: FSMContext):
+    acc = await get_active_account(callback.from_user.id)
+    if not acc:
+        await callback.answer("Аккаунт не выбран.", show_alert=True)
+        return
+    await state.update_data(settings_account_id=acc["id"])
     await callback.message.answer("🔑 **Введите ключевые слова через запятую** (например: `Python, FastAPI, Backend`):", parse_mode="Markdown")
     await state.set_state(UserState.waiting_for_keywords)
     await callback.answer()
@@ -1551,17 +1806,30 @@ async def process_keywords_input(message: Message, state: FSMContext):
         await message.answer("❌ Введите ключевое слово.", parse_mode="Markdown")
         return
 
-    kw = message.text.strip()
-    acc = await get_active_account(message.from_user.id)
+    values = [item.strip() for item in message.text.split(",") if item.strip()]
+    if not values or len(values) > 10 or any(len(item) > 100 for item in values):
+        await message.answer("❌ Укажите до 10 ключевых слов, каждое не длиннее 100 символов.")
+        return
+    kw = ", ".join(dict.fromkeys(values))
+    data = await state.get_data()
+    acc = await get_account_for_user(message.from_user.id, data.get("settings_account_id")) if data.get("settings_account_id") else None
     if acc:
-        await update_account_settings(acc["id"], keywords=kw)
+        await update_account_settings_for_user(message.from_user.id, acc["id"], keywords=kw)
 
     await state.clear()
-    await message.answer(f"✅ **Ключевые слова обновлены:** `{kw}`.", parse_mode="Markdown")
+    await message.answer(
+        f"✅ <b>Ключевые слова обновлены:</b> <code>{escape_html(kw)}</code>.",
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "set_stop_words")
 async def cb_set_stop_words(callback: CallbackQuery, state: FSMContext):
+    acc = await get_active_account(callback.from_user.id)
+    if not acc:
+        await callback.answer("Аккаунт не выбран.", show_alert=True)
+        return
+    await state.update_data(settings_account_id=acc["id"])
     await callback.message.answer("🚫 **Введите стоп-слова через запятую** (например: `Senior, Lead, Стажер`):", parse_mode="Markdown")
     await state.set_state(UserState.waiting_for_stop_words)
     await callback.answer()
@@ -1569,17 +1837,31 @@ async def cb_set_stop_words(callback: CallbackQuery, state: FSMContext):
 
 @router.message(UserState.waiting_for_stop_words)
 async def process_stop_words_input(message: Message, state: FSMContext):
-    sw = message.text.strip() if message.text else ""
-    acc = await get_active_account(message.from_user.id)
+    values = [item.strip() for item in (message.text or "").split(",") if item.strip()]
+    if len(values) > 30 or any(len(item) > 100 for item in values):
+        await message.answer("❌ Укажите до 30 стоп-слов, каждое не длиннее 100 символов.")
+        return
+    sw = ", ".join(dict.fromkeys(values))
+    data = await state.get_data()
+    acc = await get_account_for_user(message.from_user.id, data.get("settings_account_id")) if data.get("settings_account_id") else None
     if acc:
-        await update_account_settings(acc["id"], stop_words=sw)
+        await update_account_settings_for_user(message.from_user.id, acc["id"], stop_words=sw)
 
     await state.clear()
-    await message.answer(f"✅ **Стоп-слова обновлены:** `{sw if sw else 'очищены'}`.", parse_mode="Markdown")
+    await message.answer(
+        f"✅ <b>Стоп-слова обновлены:</b> "
+        f"<code>{escape_html(sw if sw else 'очищены')}</code>.",
+        parse_mode="HTML",
+    )
 
 
 @router.callback_query(F.data == "set_proxy")
 async def cb_set_proxy(callback: CallbackQuery, state: FSMContext):
+    acc = await get_active_account(callback.from_user.id)
+    if not acc:
+        await callback.answer("Аккаунт не выбран.", show_alert=True)
+        return
+    await state.update_data(settings_account_id=acc["id"])
     await callback.message.answer("🌐 **Введите URL прокси** (`http://user:pass@ip:port` или `0` для сброса):", parse_mode="Markdown")
     await state.set_state(UserState.waiting_for_proxy)
     await callback.answer()
@@ -1588,14 +1870,25 @@ async def cb_set_proxy(callback: CallbackQuery, state: FSMContext):
 @router.message(UserState.waiting_for_proxy)
 async def process_proxy_input(message: Message, state: FSMContext):
     raw_proxy = message.text.strip() if message.text else ""
-    proxy_val = "" if raw_proxy.lower() in ["0", "off", "none", "очистить"] else raw_proxy
+    if raw_proxy.lower() in ["0", "off", "none", "очистить"]:
+        proxy_val = ""
+    else:
+        try:
+            proxy_val = normalize_proxy_url(raw_proxy)
+        except ValueError as exc:
+            await message.answer(f"❌ {escape_html(exc)}", parse_mode="HTML")
+            return
 
-    acc = await get_active_account(message.from_user.id)
+    data = await state.get_data()
+    acc = await get_account_for_user(message.from_user.id, data.get("settings_account_id")) if data.get("settings_account_id") else None
     if acc:
-        await update_account_settings(acc["id"], proxy_url=proxy_val)
+        await update_account_settings_for_user(message.from_user.id, acc["id"], proxy_url=proxy_val)
 
     await state.clear()
-    await message.answer(f"✅ **Прокси обновлен:** `{proxy_val if proxy_val else 'Сброшен'}`", parse_mode="Markdown")
+    await message.answer(
+        f"✅ <b>Прокси обновлен:</b> <code>{escape_html(mask_proxy_url(proxy_val))}</code>",
+        parse_mode="HTML",
+    )
 
 
 # ── 📊 Статистика и История ───────────────────────────────────────────
@@ -1605,6 +1898,7 @@ async def cmd_stats(message: Message, user_id: int | None = None):
     target_user_id = user_id or message.from_user.id
     acc = await get_active_account(target_user_id)
     accounts = await get_user_accounts(target_user_id)
+    stats = await get_application_stats(target_user_id, account_id=acc.get("id") if acc else None)
 
     if not acc:
         await message.answer("📊 У вас нет привязанных аккаунтов. Перейдите в `👤 Аккаунты и Резюме` -> `🔑 Авторизоваться в hh.ru`.", parse_mode="Markdown")
@@ -1619,6 +1913,7 @@ async def cmd_stats(message: Message, user_id: int | None = None):
         f"💰 **Мин. ЗП:** `{acc.get('min_salary', 0)} ₽`\n"
         f"🔑 **Ключевые слова:** `{acc.get('keywords')}`\n"
         f"👥 **Всего аккаунтов в боте:** `{len(accounts)} шт.`"
+        f"\n📋 **Обработано сегодня:** `{stats['processed']}` | Ошибок: `{stats['errors']}` | Пропусков: `{stats['skipped']}`"
     )
     await send_banner_message(message, STATS_BANNER, stats_text, parse_mode="Markdown")
 
@@ -1634,21 +1929,43 @@ async def cmd_applies_history(message: Message, user_id: int | None = None):
         await message.answer("📜 **История откликов пока пуста.**\nЗапустите автоотклик кнопкой `🚀 Запустить автоотклик`!", parse_mode="Markdown")
         return
 
-    import html
     text = f"📜 <b>Последние отклики ({len(applies)} шт.):</b>\n\n"
     for idx, app in enumerate(applies, 1):
-        raw_url = app.get("vacancy_hh_id", "#")
-        safe_url = html.escape(raw_url)
-        status = html.escape(app.get("status", "APPLIED"))
-        date_str = html.escape(str(app.get("applied_at", ""))[:16])
-        text += f"{idx}. 🔗 <a href=\"{safe_url}\">{safe_url}</a>\n   📌 Статус: <code>{status}</code> | 🕒 <code>{date_str}</code>\n\n"
+        vacancy_id = str(app.get("vacancy_hh_id") or "")
+        raw_url = (
+            f"https://hh.ru/vacancy/{vacancy_id}"
+            if vacancy_id.isdigit()
+            else normalize_hh_vacancy_url(vacancy_id)
+        )
+        status = escape_html(app.get("status", "APPLIED"))
+        date_str = escape_html(str(app.get("applied_at", ""))[:16])
+        title = escape_html(app.get("vacancy_title") or "Вакансия")
+        company = escape_html(app.get("company") or "")
+        company_line = f" — {company}" if company else ""
+        vacancy_label = (
+            f'<a href="{escape_html(raw_url)}">{title}</a>' if raw_url else title
+        )
+        text += (
+            f"{idx}. 🔗 {vacancy_label}{company_line}\n"
+            f"   📌 Статус: <code>{status}</code> | 🕒 <code>{date_str}</code>\n\n"
+        )
 
-    await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
+    await send_chunked_message(
+        message,
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 # ── 🚀 Запуск и остановка автооткликов ─────────────────────────────────
 
-@router.message(F.text.in_({"🚀 Запустить автоотклик", "⛔️ Остановить автоотклик"}))
+@router.message(F.text.in_({
+    "🚀 Запустить автоотклик",
+    "⛔️ Остановить автоотклик",
+    AUTOAPPLY_ON_TEXT,
+    AUTOAPPLY_OFF_TEXT,
+}))
 async def cmd_autoapply_menu(message: Message):
     """Показ информационного меню выбора режима или управления автооткликом."""
     accounts = await get_user_accounts(message.from_user.id)
@@ -1700,38 +2017,43 @@ async def cmd_autoapply_menu(message: Message):
 @router.callback_query(F.data.startswith("start_single_acc_"))
 async def cb_start_single_account(callback: CallbackQuery):
     """Запуск автоотклика только для одного выбранного аккаунта."""
-    acc_id = int(callback.data.replace("start_single_acc_", ""))
-    acc = await get_account_by_id(acc_id)
-    if not acc or acc.get("user_id") != callback.from_user.id:
+    acc_id = parse_callback_id(callback.data, "start_single_acc_")
+    acc = await get_account_for_user(callback.from_user.id, acc_id) if acc_id else None
+    if not acc:
         await callback.answer("Аккаунт не найден.", show_alert=True)
         return
+    if acc.get("session_status") != "ACTIVE":
+        await callback.answer("Сессия hh.ru не активна.", show_alert=True)
+        return
+    if not acc.get("active_resume_title") or not (acc.get("resume_text") or "").strip():
+        await callback.answer("Выберите резюме с доступным текстом.", show_alert=True)
+        return
+    if acc.get("applied_today", 0) >= acc.get("daily_limit", 50):
+        await callback.answer("Суточный лимит уже достигнут.", show_alert=True)
+        return
 
-    await update_account_settings(acc_id, auto_apply_enabled=1)
+    await update_account_settings_for_user(callback.from_user.id, acc_id, auto_apply_enabled=1)
     await set_active_account(callback.from_user.id, acc_id)
-
-    from worker import process_account_hh_applications
-    try:
-        await process_account_hh_applications.kiq(acc_id)
-    except Exception:
-        asyncio.create_task(process_account_hh_applications(acc_id))
+    start_status = await task_coordinator.start_account(callback.from_user.id, acc_id)
 
     acc_name = acc.get("account_name") or acc.get("phone_or_email")
     try:
         await callback.message.edit_text(
-            f"🚀 **Автоотклик запущен для аккаунта `{acc_name}`!**\n\n"
-            f"🌐 Бот открывает **1 скрытый браузер Patchright Stealth** (мгновенный запуск).",
-            parse_mode="Markdown"
+            f"🚀 <b>Автоотклик запущен для аккаунта "
+            f"<code>{escape_html(acc_name)}</code>!</b>\n\n"
+            "🌐 Бот открывает один скрытый браузер Patchright Chromium.",
+            parse_mode="HTML",
         )
     except Exception:
         pass
 
     # Отправляем сообщение для обновления нижней Reply Keyboard
     await callback.message.answer(
-        f"⚡️ **Панель обновлена:** Кнопка установлена в положение `⛔️ Остановить автоотклик`.",
+        "⚡️ **Панель обновлена:** Кнопка установлена в положение `⛔️ Остановить автоотклик`.",
         reply_markup=get_main_keyboard(is_auto_apply_running=True),
         parse_mode="Markdown"
     )
-    await callback.answer("Автоотклик запущен!")
+    await callback.answer("Автоотклик уже работает." if start_status == "ALREADY_RUNNING" else "Автоотклик запущен!")
 
 
 @router.callback_query(F.data == "start_all_accounts_hub")
@@ -1744,15 +2066,21 @@ async def cb_start_all_accounts_hub(callback: CallbackQuery):
         await callback.answer("У вас нет авторизованных аккаунтов!", show_alert=True)
         return
 
-    from worker import process_account_hh_applications
+    launched = 0
     for acc in active_accs:
-        await update_account_settings(acc["id"], auto_apply_enabled=1)
-        try:
-            await process_account_hh_applications.kiq(acc["id"])
-        except Exception:
-            asyncio.create_task(process_account_hh_applications(acc["id"]))
+        if not acc.get("active_resume_title") or not (acc.get("resume_text") or "").strip():
+            continue
+        await update_account_settings_for_user(callback.from_user.id, acc["id"], auto_apply_enabled=1)
+        if await task_coordinator.start_account(callback.from_user.id, acc["id"]) in {
+            "STARTED",
+            "ALREADY_RUNNING",
+        }:
+            launched += 1
 
-    count = len(active_accs)
+    count = launched
+    if count == 0:
+        await callback.answer("Нет аккаунтов с выбранным резюме и доступным текстом.", show_alert=True)
+        return
     if count == 1:
         details = "Бот поднимет 1 скрытый браузер Chrome."
     elif count == 2:
@@ -1769,7 +2097,7 @@ async def cb_start_all_accounts_hub(callback: CallbackQuery):
         pass
 
     await callback.message.answer(
-        f"⚡️ **Панель обновлена:** Кнопка установлена в положение `⛔️ Остановить автоотклик`.",
+        "⚡️ **Панель обновлена:** Кнопка установлена в положение `⛔️ Остановить автоотклик`.",
         reply_markup=get_main_keyboard(is_auto_apply_running=True),
         parse_mode="Markdown"
     )
@@ -1779,8 +2107,11 @@ async def cb_start_all_accounts_hub(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("stop_single_acc_"))
 async def cb_stop_single_account(callback: CallbackQuery):
     """Остановка автоотклика для одного конкретного аккаунта."""
-    acc_id = int(callback.data.replace("stop_single_acc_", ""))
-    await update_account_settings(acc_id, auto_apply_enabled=0)
+    acc_id = parse_callback_id(callback.data, "stop_single_acc_")
+    if not acc_id or not await get_account_for_user(callback.from_user.id, acc_id):
+        await callback.answer("Аккаунт не найден.", show_alert=True)
+        return
+    await task_coordinator.stop_account(callback.from_user.id, acc_id)
 
     accounts = await get_user_accounts(callback.from_user.id)
     is_any_running = any(a.get("auto_apply_enabled") for a in accounts)
@@ -1806,7 +2137,7 @@ async def cb_stop_all_accounts_hub(callback: CallbackQuery):
     """Остановка автооткликов для ВСЕХ аккаунтов."""
     accounts = await get_user_accounts(callback.from_user.id)
     for acc in accounts:
-        await update_account_settings(acc["id"], auto_apply_enabled=0)
+        await task_coordinator.stop_account(callback.from_user.id, acc["id"])
 
     try:
         await callback.message.edit_text(
@@ -1838,29 +2169,31 @@ async def cb_cancel_launch_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("confirm_apply_"))
 async def cb_confirm_apply(callback: CallbackQuery):
-    apply_id = int(callback.data.split("_")[-1])
-    item = await get_pending_questionnaire(apply_id)
+    apply_id = parse_callback_id(callback.data, "confirm_apply_")
+    item = await get_pending_questionnaire_for_user(callback.from_user.id, apply_id) if apply_id else None
     if not item:
         await callback.answer("Анкета не найдена.", show_alert=True)
         return
-
-    await update_pending_questionnaire_status(apply_id, "APPROVED")
+    start_status = await task_coordinator.start_questionnaire(callback.from_user.id, apply_id)
+    if start_status != "STARTED":
+        await callback.answer("Эта анкета уже отправляется или обработана.", show_alert=True)
+        return
     await callback.message.edit_text(
-        f"⏳ **Отклик подтвержден!** Запускаем отправку формы...\n🔗 [{item.get('vacancy_title', 'Вакансия')}]({item['vacancy_url']})",
-        parse_mode="Markdown"
+        f"⏳ <b>Отклик подтвержден. Запускаем отправку формы...</b>\n"
+        f'<a href="{escape_html(item["vacancy_url"])}">{escape_html(item.get("vacancy_title") or "Вакансия")}</a>',
+        parse_mode="HTML",
+        disable_web_page_preview=True,
     )
     await callback.answer("Отклик отправляется...")
-
-    from worker import submit_approved_hh_questionnaire
-    try:
-        await submit_approved_hh_questionnaire.kiq(callback.from_user.id, apply_id)
-    except Exception as e:
-        asyncio.create_task(submit_approved_hh_questionnaire(callback.from_user.id, apply_id))
 
 
 @router.callback_query(F.data.startswith("edit_letter_"))
 async def cb_edit_letter(callback: CallbackQuery, state: FSMContext):
-    apply_id = int(callback.data.split("_")[-1])
+    apply_id = parse_callback_id(callback.data, "edit_letter_")
+    item = await get_pending_questionnaire_for_user(callback.from_user.id, apply_id) if apply_id else None
+    if not item or item.get("status") not in {"PENDING", "FAILED"}:
+        await callback.answer("Анкета недоступна для редактирования.", show_alert=True)
+        return
     await state.update_data(editing_apply_id=apply_id)
     await state.set_state(UserState.waiting_for_edited_letter)
 
@@ -1877,19 +2210,118 @@ async def process_edited_letter_input(message: Message, state: FSMContext):
         return
 
     new_letter = message.text.strip()
-    await update_pending_questionnaire_letter(apply_id, new_letter)
+    if not await update_pending_questionnaire_letter(
+        message.from_user.id, apply_id, new_letter
+    ):
+        await state.clear()
+        await message.answer("❌ Анкета уже отправляется или недоступна.")
+        return
     await state.clear()
 
     await message.answer(
-        f"✅ **Письмо обновлено!**\n\n📝 **Текст:**\n`{new_letter}`",
+        f"✅ <b>Письмо обновлено.</b>\n\n{escape_html(new_letter)}",
         reply_markup=get_questionnaire_confirmation_keyboard(apply_id),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
+
+
+@router.callback_query(F.data.startswith("edit_answers_"))
+async def cb_edit_answers(callback: CallbackQuery, state: FSMContext):
+    apply_id = parse_callback_id(callback.data, "edit_answers_")
+    item = await get_pending_questionnaire_for_user(callback.from_user.id, apply_id) if apply_id else None
+    if not item or item.get("status") not in {"PENDING", "FAILED"}:
+        await callback.answer("Анкета недоступна для редактирования.", show_alert=True)
+        return
+    try:
+        questions = json.loads(item.get("questions_json") or "[]")
+        payload = json.loads(item.get("ai_payload_json") or "{}")
+    except json.JSONDecodeError:
+        await callback.answer("Данные анкеты повреждены.", show_alert=True)
+        return
+    if not questions:
+        await callback.answer("Вопросы в анкете не найдены.", show_alert=True)
+        return
+    await state.update_data(
+        editing_apply_id=apply_id,
+        editing_questions=questions,
+        editing_payload=payload,
+        editing_answer_index=0,
+        editing_user_id=callback.from_user.id,
+    )
+    await state.set_state(UserState.waiting_for_edited_answer)
+    await _prompt_next_question_answer(callback.message, state)
+    await callback.answer()
+
+
+async def _prompt_next_question_answer(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    questions = data.get("editing_questions", [])
+    index = data.get("editing_answer_index", 0)
+    if index >= len(questions):
+        apply_id = data.get("editing_apply_id")
+        payload = data.get("editing_payload", {})
+        await update_pending_questionnaire_answers(data.get("editing_user_id"), apply_id, payload)
+        await state.clear()
+        await message.answer(
+            "✅ <b>Ответы анкеты обновлены.</b>",
+            reply_markup=get_questionnaire_confirmation_keyboard(apply_id),
+            parse_mode="HTML",
+        )
+        return
+    question = questions[index]
+    label = question.get("label") or question.get("field_id") or f"Вопрос {index + 1}"
+    options = question.get("options") or []
+    option_text = "\n" + "\n".join(f"• {escape_html(value)}" for value in options) if options else ""
+    await message.answer(
+        f"🧾 <b>Вопрос {index + 1} из {len(questions)}</b>\n{escape_html(label)}{option_text}\n\n"
+        "Отправьте новый ответ одним сообщением.",
+        parse_mode="HTML",
+    )
+
+
+@router.message(UserState.waiting_for_edited_answer)
+async def process_edited_answer_input(message: Message, state: FSMContext):
+    value = (message.text or "").strip()
+    if not value or len(value) > 2000:
+        await message.answer("❌ Ответ должен содержать от 1 до 2000 символов.")
+        return
+    data = await state.get_data()
+    questions = data.get("editing_questions", [])
+    index = data.get("editing_answer_index", 0)
+    if index >= len(questions):
+        await _prompt_next_question_answer(message, state)
+        return
+    question = questions[index]
+    options = question.get("options") or []
+    if options and value not in options:
+        await message.answer("❌ Ответ должен точно совпадать с одним из вариантов выше.")
+        return
+    payload = data.get("editing_payload", {})
+    answers = payload.setdefault("answers", [])
+    field_id = question.get("field_id") or f"q{index}"
+    answer = next((item for item in answers if item.get("field_id") == field_id), None)
+    if answer is None:
+        answers.append(
+            {
+                "field_id": field_id,
+                "answer_type": question.get("answer_type") or "text",
+                "value": value,
+            }
+        )
+    else:
+        answer["value"] = value
+        answer["answer_type"] = question.get("answer_type") or answer.get("answer_type") or "text"
+    await state.update_data(editing_payload=payload, editing_answer_index=index + 1)
+    await _prompt_next_question_answer(message, state)
 
 
 @router.callback_query(F.data.startswith("skip_apply_"))
 async def cb_skip_apply(callback: CallbackQuery):
-    apply_id = int(callback.data.split("_")[-1])
-    await update_pending_questionnaire_status(apply_id, "SKIPPED")
+    apply_id = parse_callback_id(callback.data, "skip_apply_")
+    item = await get_pending_questionnaire_for_user(callback.from_user.id, apply_id) if apply_id else None
+    if not item or item.get("status") not in {"PENDING", "FAILED"}:
+        await callback.answer("Анкета уже обработана.", show_alert=True)
+        return
+    await update_pending_questionnaire_status(callback.from_user.id, apply_id, "SKIPPED")
     await callback.message.edit_text("❌ **Отклик пропущен пользователем.**", parse_mode="Markdown")
     await callback.answer("Пропущено.")

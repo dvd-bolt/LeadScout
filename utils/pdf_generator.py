@@ -3,20 +3,23 @@ LeadScout AI — Модуль генерации PDF-отчетов аудита
 Создает стилизованные PDF-документы с оценками, визуальными баллами, матрицей рекомендаций и анализом ATS.
 """
 
-import os
 import logging
+import os
 from datetime import datetime
-from reportlab.lib.pagesizes import letter, A4
+from xml.sax.saxutils import escape
+
 from reportlab.lib import colors
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, KeepTogether
-)
-from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import HRFlowable, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 logger = logging.getLogger(__name__)
+
+
+def _safe(value: object) -> str:
+    return escape(str(value or ""))
 
 # Регистрация кириллических шрифтов (Windows Arial / Linux DejaVu / Liberation)
 FONT_REGULAR = "Helvetica"
@@ -46,7 +49,10 @@ if found_reg and found_bold:
         FONT_BOLD = "ArialCyr-Bold"
         logger.info("Успешно зарегистрированы шрифты %s / %s для ReportLab PDF.", found_reg, found_bold)
     except Exception as e:
-        logger.warning("Не удалось зарегистрировать кириллические шрифты (%s). Используются стандартные.", e)
+        logger.warning(
+            "Не удалось зарегистрировать кириллические шрифты (%s). Используются стандартные.",
+            type(e).__name__,
+        )
 
 
 
@@ -128,7 +134,7 @@ def generate_resume_audit_pdf(audit_data: dict, output_path: str) -> str:
     # 1. Шапка документа
     story.append(Paragraph("<b>LeadScout AI</b> — Отчет аудита IT-резюме", title_style))
     date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    profession = audit_data.get("profession_name", "IT-Специалист")
+    profession = _safe(audit_data.get("profession_name", "IT-Специалист"))
     story.append(Paragraph(f"Профессия: <b>{profession}</b> | Дата проверки: {date_str}", subtitle_style))
     story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#CBD5E1"), spaceAfter=15))
 
@@ -150,7 +156,7 @@ def generate_resume_audit_pdf(audit_data: dict, output_path: str) -> str:
     score_card_data = [
         [
             Paragraph(f"<font size=28 fontName='{FONT_BOLD}'><b>{score} / 100</b></font><br/><font color='{badge_text_color.hexval()}'><b>{status_label}</b></font>", body_style),
-            Paragraph(f"<b>ИИ-Резюме вывода:</b><br/>{audit_data.get('summary_text', 'Анализ завершен успешно.')}", body_style)
+            Paragraph(f"<b>Вывод:</b><br/>{_safe(audit_data.get('summary_text', 'Анализ завершен успешно.'))}", body_style)
         ]
     ]
 
@@ -168,7 +174,7 @@ def generate_resume_audit_pdf(audit_data: dict, output_path: str) -> str:
     story.append(Spacer(1, 15))
 
     # 3. Детализация по 5 категориям
-    story.append(Paragraph("📊 Детализация оценок по 5 ключевым категориям", heading_style))
+    story.append(Paragraph("Детализация оценок по 5 ключевым категориям", heading_style))
     
     cats = audit_data.get("category_scores", {})
     cat_rows = [
@@ -211,23 +217,23 @@ def generate_resume_audit_pdf(audit_data: dict, output_path: str) -> str:
     # 4. Штрафы и выявленные риски ATS
     penalties = audit_data.get("penalties", [])
     if penalties:
-        story.append(Paragraph("⚠️ Выявленные барьеры ATS и риски", heading_style))
+        story.append(Paragraph("Выявленные барьеры ATS и риски", heading_style))
         for pen in penalties:
-            story.append(Paragraph(f"• {pen}", bullet_style))
+            story.append(Paragraph(f"- {_safe(pen)}", bullet_style))
         story.append(Spacer(1, 10))
 
     # 5. Топ-3 Главные рекомендации
     top_recs = audit_data.get("top_recommendations", [])
     if top_recs:
-        story.append(Paragraph("💡 Топ-3 приоритетных шагов к улучшению", heading_style))
+        story.append(Paragraph("Топ-3 приоритетных шага к улучшению", heading_style))
         for idx, rec in enumerate(top_recs, 1):
-            story.append(Paragraph(f"<b>{idx}.</b> {rec}", bullet_style))
+            story.append(Paragraph(f"<b>{idx}.</b> {_safe(rec)}", bullet_style))
         story.append(Spacer(1, 10))
 
     # 6. Матрица пошаговых рекомендаций Actionable Insights
     insights = audit_data.get("insights", [])
     if insights:
-        story.append(Paragraph("🚀 Полная матрица оптимизации резюме (Actionable Insights)", heading_style))
+        story.append(Paragraph("Полная матрица оптимизации резюме", heading_style))
         
         # Группировка по Tier
         tier_1 = [ins for ins in insights if ins.get("tier") == 1 or ins.get("tier") == "1"]
@@ -235,30 +241,30 @@ def generate_resume_audit_pdf(audit_data: dict, output_path: str) -> str:
         tier_3 = [ins for ins in insights if ins.get("tier") == 3 or ins.get("tier") == "3"]
 
         if tier_1:
-            story.append(Paragraph("<b>🔴 Tier 1: Критические блокеры (Исправить незамедлительно)</b>", body_style))
+            story.append(Paragraph("<b>Tier 1: Критические блокеры</b>", body_style))
             for item in tier_1:
                 title = item.get("title", "")
                 desc = item.get("description", "")
                 impact = item.get("score_impact", "")
-                story.append(Paragraph(f"• <b>{title}</b> ({impact}): {desc}", bullet_style))
+                story.append(Paragraph(f"- <b>{_safe(title)}</b> ({_safe(impact)}): {_safe(desc)}", bullet_style))
             story.append(Spacer(1, 6))
 
         if tier_2:
-            story.append(Paragraph("<b>🟡 Tier 2: Оптимизация контента & Метрики XYZ</b>", body_style))
+            story.append(Paragraph("<b>Tier 2: Оптимизация контента и метрики XYZ</b>", body_style))
             for item in tier_2:
                 title = item.get("title", "")
                 desc = item.get("description", "")
                 impact = item.get("score_impact", "")
-                story.append(Paragraph(f"• <b>{title}</b> ({impact}): {desc}", bullet_style))
+                story.append(Paragraph(f"- <b>{_safe(title)}</b> ({_safe(impact)}): {_safe(desc)}", bullet_style))
             story.append(Spacer(1, 6))
 
         if tier_3:
-            story.append(Paragraph("<b>🟢 Tier 3: Стилистическая полировка</b>", body_style))
+            story.append(Paragraph("<b>Tier 3: Стилистическая полировка</b>", body_style))
             for item in tier_3:
                 title = item.get("title", "")
                 desc = item.get("description", "")
                 impact = item.get("score_impact", "")
-                story.append(Paragraph(f"• <b>{title}</b> ({impact}): {desc}", bullet_style))
+                story.append(Paragraph(f"- <b>{_safe(title)}</b> ({_safe(impact)}): {_safe(desc)}", bullet_style))
 
     # Подвал
     story.append(Spacer(1, 20))
@@ -267,7 +273,7 @@ def generate_resume_audit_pdf(audit_data: dict, output_path: str) -> str:
 
     # Сборка PDF
     doc.build(story)
-    logger.info("PDF-отчет аудита успешно сформирован по адресу: %s", output_path)
+    logger.info("PDF-отчет аудита успешно сформирован")
     return output_path
 
 

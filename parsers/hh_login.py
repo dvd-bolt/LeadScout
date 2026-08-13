@@ -4,15 +4,21 @@ LeadScout AI — Модуль интерактивной OTP-авторизац�
 """
 
 import asyncio
-import time
 import logging
-from typing import Dict, Any
-from patchright.async_api import Page, BrowserContext
+import time
+from typing import Any
 
+from patchright.async_api import BrowserContext, Page
+
+from database import (
+    delete_hh_account_for_user,
+    get_account_for_user,
+    update_account_session,
+    update_user_session,
+)
 from parsers.hh_browser import HHBrowserEngine
-from utils.humanization import human_type, human_click, human_type_digits
+from utils.humanization import human_click, human_type, human_type_digits
 from utils.security import SessionSecurityManager
-from database import update_user_session
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +42,12 @@ class HHLoginSession:
 
     async def start_login_flow(self) -> dict[str, Any]:
         """Первая фаза: запуск браузера и ввод номера телефона / email."""
-        self.engine = HHBrowserEngine()
-        await self.engine.start()
-        self.context = await self.engine.create_context()
-        self.page = await self.context.new_page()
-
         try:
+            account = await get_account_for_user(self.user_id, self.account_id) if self.account_id else None
+            self.engine = HHBrowserEngine(proxy_url=(account or {}).get("proxy_url") or None)
+            await self.engine.start()
+            self.context = await self.engine.create_context()
+            self.page = await self.context.new_page()
             logger.info("Пользователь %d: переход на страницу логина hh.ru...", self.user_id)
             await self.page.goto("https://hh.ru/account/login", wait_until="domcontentloaded")
             await asyncio.sleep(2.0)
@@ -95,7 +101,7 @@ class HHLoginSession:
 
             if await login_input.count() == 0:
                 logger.error("Пользователь %d: не найдено поле ввода логина на hh.ru", self.user_id)
-                await self.cleanup()
+                await self.abort()
                 return {"status": "ERROR", "message": "Не найдено поле ввода логина. Проверьте адрес входа hh.ru."}
 
             await human_type(self.page, login_input, text_to_type)
@@ -131,9 +137,9 @@ class HHLoginSession:
             return {"status": "WAITING_FOR_OTP"}
 
         except Exception as e:
-            logger.error("Пользователь %d: ошибка 1 фазы логина: %s", self.user_id, e)
-            await self.cleanup()
-            return {"status": "ERROR", "message": str(e)}
+            logger.error("Пользователь %d: ошибка 1 фазы логина: %s", self.user_id, type(e).__name__)
+            await self.abort()
+            return {"status": "ERROR", "message": "Не удалось открыть форму входа hh.ru."}
 
     async def _get_fresh_captcha_bytes(self, old_src: str | None = None) -> bytes:
         """Ожидает загрузки нового URL картинки капчи и снимает точный скриншот."""
@@ -167,7 +173,7 @@ class HHLoginSession:
             return {"status": "ERROR", "message": "Сессия логина не найдена или истекла."}
 
         try:
-            logger.info("Пользователь %d: ввод капчи '%s'...", self.user_id, captcha_text)
+            logger.info("Пользователь %d: отправка ответа капчи...", self.user_id)
             captcha_img = self.page.locator('[data-qa="account-captcha-picture"], img[src*="/captcha/picture"], img[data-qa="captcha-image"]').first
             old_src = await captcha_img.get_attribute("src") if await captcha_img.count() > 0 else None
 
@@ -191,9 +197,9 @@ class HHLoginSession:
             return {"status": "WAITING_FOR_OTP"}
 
         except Exception as e:
-            logger.error("Пользователь %d: ошибка при вводе капчи: %s", self.user_id, e)
-            await self.cleanup()
-            return {"status": "ERROR", "message": str(e)}
+            logger.error("Пользователь %d: ошибка при вводе капчи: %s", self.user_id, type(e).__name__)
+            await self.abort()
+            return {"status": "ERROR", "message": "Не удалось проверить капчу."}
 
     async def reload_captcha_flow(self) -> dict[str, Any]:
         """Клик по кнопке Перегенерировать капчу и получение нового скриншота."""
@@ -213,8 +219,8 @@ class HHLoginSession:
             return {"status": "WAITING_FOR_CAPTCHA", "captcha_bytes": captcha_bytes}
 
         except Exception as e:
-            logger.error("Пользователь %d: ошибка при обновлении капчи: %s", self.user_id, e)
-            return {"status": "ERROR", "message": str(e)}
+            logger.error("Пользователь %d: ошибка при обновлении капчи: %s", self.user_id, type(e).__name__)
+            return {"status": "ERROR", "message": "Не удалось обновить картинку капчи."}
 
     async def toggle_captcha_lang_flow(self) -> dict[str, Any]:
         """Клик по кнопке Переключения языка капчи (English / Русский) и получение нового скриншота."""
@@ -234,8 +240,8 @@ class HHLoginSession:
             return {"status": "WAITING_FOR_CAPTCHA", "captcha_bytes": captcha_bytes}
 
         except Exception as e:
-            logger.error("Пользователь %d: ошибка при смене языка капчи: %s", self.user_id, e)
-            return {"status": "ERROR", "message": str(e)}
+            logger.error("Пользователь %d: ошибка при смене языка капчи: %s", self.user_id, type(e).__name__)
+            return {"status": "ERROR", "message": "Не удалось переключить язык капчи."}
 
     async def complete_login_flow(self, code: str) -> dict[str, Any]:
         """Вторая фаза: человеческий ввод полученного СМС-кода и сохранение сессии."""
@@ -244,7 +250,7 @@ class HHLoginSession:
 
         try:
             self.otp_code = code.strip()
-            logger.info("Пользователь %d: посимвольный ввод СМС-кода '%s'...", self.user_id, self.otp_code)
+            logger.info("Пользователь %d: ввод полученного СМС-кода...", self.user_id)
 
             # Поиск поля ввода OTP кода
             otp_input = self.page.locator('[data-qa="otp-code-input"], input[name="code"], input[autocomplete="one-time-code"]').first
@@ -267,30 +273,55 @@ class HHLoginSession:
 
             await asyncio.sleep(3.0)
 
-            # Проверка успеха авторизации
-            if "account/login" not in self.page.url:
+            # URL сам по себе недостаточен: ждем элемент авторизованного профиля.
+            authenticated = self.page.locator(
+                '[data-qa="mainmenu_myResumes"], [data-qa="mainmenu_vacancyResponses"], '
+                'a[href*="/applicant/resumes"]'
+            ).first
+            try:
+                await authenticated.wait_for(state="visible", timeout=5000)
+                is_authenticated = "account/login" not in self.page.url
+            except Exception:
+                is_authenticated = False
+
+            if is_authenticated:
                 logger.info("Пользователь %d: успешная авторизация на hh.ru!", self.user_id)
                 storage_state = await self.context.storage_state()
                 
                 sec_mgr = SessionSecurityManager()
                 encrypted_state = sec_mgr.encrypt_storage_state(storage_state)
                 
-                from database import update_account_session
                 if self.account_id:
-                    await update_account_session(self.account_id, encrypted_state, status="ACTIVE")
+                    updated = await update_account_session(
+                        self.user_id,
+                        self.account_id,
+                        encrypted_state,
+                        status="ACTIVE",
+                    )
+                    if not updated:
+                        await self.cleanup()
+                        return {"status": "ERROR", "message": "Аккаунт для сохранения сессии не найден."}
                 else:
                     await update_user_session(self.user_id, encrypted_state, status="ACTIVE")
                 await self.cleanup()
                 return {"status": "SUCCESS"}
             else:
                 logger.warning("Пользователь %d: неверный СМС-код или ошибка подтверждения.", self.user_id)
-                await self.cleanup()
+                await self.abort()
                 return {"status": "INVALID_CODE", "message": "Неверный СМС-код. Попробуйте еще раз через меню авторизации."}
 
         except Exception as e:
-            logger.error("Пользователь %d: ошибка при вводе СМС-кода: %s", self.user_id, e)
-            await self.cleanup()
-            return {"status": "ERROR", "message": str(e)}
+            logger.error("Пользователь %d: ошибка при вводе СМС-кода: %s", self.user_id, type(e).__name__)
+            await self.abort()
+            return {"status": "ERROR", "message": "Не удалось подтвердить код hh.ru."}
+
+    async def abort(self) -> None:
+        """Close browser resources and remove an unfinished account row."""
+        await self.cleanup()
+        if self.account_id:
+            account = await get_account_for_user(self.user_id, self.account_id)
+            if account and account.get("session_status") == "AUTH_PENDING":
+                await delete_hh_account_for_user(self.user_id, self.account_id)
 
     async def cleanup(self):
         """Очистка ресурсов браузера."""
@@ -301,36 +332,56 @@ class HHLoginSession:
             if self.engine:
                 await self.engine.close()
         except Exception as e:
-            logger.debug("Ошибка при закрытии логин-сессии: %s", e)
+            logger.debug("Ошибка при закрытии логин-сессии: %s", type(e).__name__)
 
 
 class HHLoginManager:
     """Глобальный менеджер активных сессий входа."""
 
     _sessions: dict[int, HHLoginSession] = {}
+    _cleanup_tasks: dict[int, asyncio.Task] = {}
 
     @classmethod
-    async def _auto_cleanup_session(cls, user_id: int, timeout: float = 600.0) -> None:
+    async def _auto_cleanup_session(
+        cls, user_id: int, session: HHLoginSession, timeout: float = 600.0
+    ) -> None:
         """Автоматическое закрытие брошенной сессии авторизации по таймауту (10 мин)."""
         await asyncio.sleep(timeout)
-        session = cls._sessions.get(user_id)
-        if session and not session.is_done:
+        current = cls._sessions.get(user_id)
+        if current is session and not session.is_done:
             logger.info("Сессия входа пользователя %d не активна %d сек. Автоматическое освобождение ресурсов Chrome...", user_id, int(timeout))
-            await session.cleanup()
+            await session.abort()
             cls._sessions.pop(user_id, None)
+        if cls._cleanup_tasks.get(user_id) is asyncio.current_task():
+            cls._cleanup_tasks.pop(user_id, None)
 
     @classmethod
     async def start_login(cls, user_id: int, phone_or_email: str, account_id: int | None = None) -> dict[str, Any]:
+        old_timer = cls._cleanup_tasks.pop(user_id, None)
+        if old_timer:
+            old_timer.cancel()
+            await asyncio.gather(old_timer, return_exceptions=True)
         if user_id in cls._sessions:
-            await cls._sessions[user_id].cleanup()
+            await cls._sessions[user_id].abort()
         
         session = HHLoginSession(user_id, phone_or_email, account_id=account_id)
         cls._sessions[user_id] = session
 
         # Запуск таски автоочистки через 10 минут
-        asyncio.create_task(cls._auto_cleanup_session(user_id, timeout=600.0))
+        cls._cleanup_tasks[user_id] = asyncio.create_task(
+            cls._auto_cleanup_session(user_id, session, timeout=600.0)
+        )
 
-        return await session.start_login_flow()
+        result = await session.start_login_flow()
+        if result.get("status") == "ERROR" and cls._sessions.get(user_id) is session:
+            cls._sessions.pop(user_id, None)
+            timer = cls._cleanup_tasks.pop(user_id, None)
+            if timer:
+                timer.cancel()
+                await asyncio.gather(timer, return_exceptions=True)
+            if not session.is_done:
+                await session.abort()
+        return result
 
     @classmethod
     async def reload_captcha(cls, user_id: int) -> dict[str, Any]:
@@ -362,4 +413,30 @@ class HHLoginManager:
         
         res = await session.complete_login_flow(code)
         cls._sessions.pop(user_id, None)
+        timer = cls._cleanup_tasks.pop(user_id, None)
+        if timer:
+            timer.cancel()
+            await asyncio.gather(timer, return_exceptions=True)
         return res
+
+    @classmethod
+    async def cancel(cls, user_id: int) -> None:
+        timer = cls._cleanup_tasks.pop(user_id, None)
+        if timer:
+            timer.cancel()
+            await asyncio.gather(timer, return_exceptions=True)
+        session = cls._sessions.pop(user_id, None)
+        if session:
+            await session.abort()
+
+    @classmethod
+    async def shutdown(cls) -> None:
+        timers = list(cls._cleanup_tasks.values())
+        cls._cleanup_tasks.clear()
+        for timer in timers:
+            timer.cancel()
+        if timers:
+            await asyncio.gather(*timers, return_exceptions=True)
+        sessions = list(cls._sessions.values())
+        cls._sessions.clear()
+        await asyncio.gather(*(session.abort() for session in sessions), return_exceptions=True)

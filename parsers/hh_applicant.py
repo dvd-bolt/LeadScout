@@ -1,126 +1,232 @@
-"""
-LeadScout AI — Модуль автоматизации откликов на hh.ru (DOM data-qa selectors).
-Обрабатывает 4 типа откликов: прямой, с письмом, с анкетой и внешние редиректы.
-Поддерживает заполнение анкет в DOM и повторную отправку отложенных анкет из Telegram.
-"""
+"""Browser automation for hh.ru vacancy responses and questionnaires."""
 
-import logging
+from __future__ import annotations
+
 import asyncio
-from patchright.async_api import Page
-from utils.humanization import human_type, human_scroll, human_click
-from ai_handler import generate_hh_job_application, JobApplicationPayload, FormAnswer
+import logging
+from urllib.parse import urlsplit
+
+from patchright.async_api import Locator, Page
+
+from ai_handler import FormAnswer, JobApplicationPayload, QuestionField, generate_hh_job_application
+from utils.humanization import human_click, human_scroll, human_type
+from utils.validation import normalize_hh_vacancy_url
 
 logger = logging.getLogger(__name__)
 
-# Спецификация data-qa атрибутов hh.ru
 DATA_QA = {
-    "title": '[data-qa="vacancy-serp__vacancy-title"]',
-    "response_top": '[data-qa="vacancy-response-link-top"], [data-qa="vacancy-response-link-bottom"], a:has-text("Откликнуться"), button:has-text("Откликнуться")',
-    "modal_popup": 'div:has-text("Отклик на вакансию"), [data-qa*="response-popup"], [class*="modal"], [class*="popup"], [data-qa*="vacancy-response"]',
-    "letter_toggle": 'button:has-text("Добавить сопроводительное"), [data-qa="response-letter-toggle"], [data-qa*="letter-toggle"]',
-    "letter_input": 'textarea, [data-qa="vacancy-response-popup-form-letter-input"], textarea[name="message"]',
-    "submit_popup": 'button:has-text("Откликнуться"), [data-qa="vacancy-response-submit-popup"], button[type="submit"]',
-    "form_element": '[data-qa="general-form-element"]',
-    "resume_selector": '[data-qa="resume-selector"], [data-qa="vacancy-response-resume"], [class*="resume-select"]',
+    "response": (
+        '[data-qa="vacancy-response-link-top"], [data-qa="vacancy-response-link-bottom"], '
+        'a:has-text("Откликнуться"), button:has-text("Откликнуться")'
+    ),
+    "modal": '[data-qa*="response-popup"], [role="dialog"], [data-qa*="vacancy-response"]',
+    "letter_toggle": (
+        'button:has-text("Добавить сопроводительное"), [data-qa="response-letter-toggle"], '
+        '[data-qa*="letter-toggle"]'
+    ),
+    "letter_input": (
+        '[data-qa="vacancy-response-popup-form-letter-input"], textarea[name="message"], textarea'
+    ),
+    "submit": (
+        '[data-qa="vacancy-response-submit-popup"], [data-qa="response-submit-popup"], '
+        '[data-qa*="response-submit"], button[type="submit"]'
+    ),
+    "question": '[data-qa="general-form-element"]',
+    "resume_selector": '[data-qa="resume-selector"], [data-qa="vacancy-response-resume"]',
+}
+
+MANUAL_QUESTION_MARKERS = {
+    "согласие",
+    "персональн",
+    "гражданств",
+    "судим",
+    "разрешение на работу",
+    "зарплат",
+    "переезд",
+    "командиров",
+    "конфликт интересов",
 }
 
 
 async def extract_vacancy_details(page: Page) -> dict:
-    """Извлекает заголовок, компанию, описание и список вопросов со страницы вакансии hh.ru."""
-    title_elem = page.locator('h1[data-qa="vacancy-title"], [data-qa="vacancy-title"]').first
-    title = await title_elem.text_content() if await title_elem.count() > 0 else "Без названия"
-
-    company_elem = page.locator('[data-qa="vacancy-company-name"]').first
-    company = await company_elem.text_content() if await company_elem.count() > 0 else "Не указана"
-
-    description_elem = page.locator('[data-qa="vacancy-description"]').first
-    description = await description_elem.text_content() if await description_elem.count() > 0 else ""
+    async def first_text(selector: str, fallback: str = "") -> str:
+        locator = page.locator(selector).first
+        if await locator.count() == 0:
+            return fallback
+        return ((await locator.text_content()) or fallback).strip()
 
     return {
-        "title": title.strip(),
-        "company": company.strip(),
-        "description": description.strip(),
+        "title": await first_text('h1[data-qa="vacancy-title"], [data-qa="vacancy-title"]', "Без названия"),
+        "company": await first_text('[data-qa="vacancy-company-name"]', "Не указана"),
+        "description": await first_text('[data-qa="vacancy-description"]'),
         "url": page.url,
     }
 
 
+async def _is_visible(locator: Locator) -> bool:
+    return await locator.count() > 0 and await locator.is_visible()
+
+
 async def handle_resume_selection_if_needed(page: Page, target_resume_title: str | None = None) -> None:
-    """Проверяет и выбирает активное резюме, если на hh.ru выведен селектор нескольких резюме."""
-    resume_selector = page.locator(DATA_QA["resume_selector"]).first
-    if await resume_selector.count() > 0 and await resume_selector.is_visible():
-        logger.info("Обнаружен селектор резюме на странице отклика hh.ru...")
-        if target_resume_title:
-            matching_option = resume_selector.locator(f'label:has-text("{target_resume_title}"), option:has-text("{target_resume_title}")').first
-            if await matching_option.count() > 0 and await matching_option.is_visible():
-                await human_click(page, matching_option)
-                await asyncio.sleep(0.5)
-                return
-
-        first_option = resume_selector.locator('input[type="radio"], label, option').first
-        if await first_option.count() > 0:
-            await human_click(page, first_option)
-            await asyncio.sleep(0.5)
-
-
-async def fill_questionnaire_form(page: Page, answers: list[dict | FormAnswer]) -> None:
-    """
-    Автоматически заполняет поля анкеты (текст, radio, checkbox) на странице модального окна отклика hh.ru.
-    """
-    if not answers:
+    selector = page.locator(DATA_QA["resume_selector"]).first
+    if not await _is_visible(selector):
         return
+    if target_resume_title:
+        exact = selector.get_by_text(target_resume_title, exact=True).first
+        if await _is_visible(exact):
+            await human_click(page, exact)
+            await asyncio.sleep(0.4)
+            return
+    first = selector.locator('input[type="radio"], label, option').first
+    if await first.count() > 0:
+        await human_click(page, first)
+        await asyncio.sleep(0.4)
 
-    popup = page.locator(DATA_QA["modal_popup"]).first
-    for ans in answers:
-        if isinstance(ans, dict):
-            field_id = ans.get("field_id", "")
-            ans_type = ans.get("answer_type", "text")
-            val = ans.get("value", "")
-        else:
-            field_id = ans.field_id
-            ans_type = ans.answer_type
-            val = ans.value
 
-        if not val:
+async def extract_questionnaire_fields(page: Page) -> list[QuestionField]:
+    containers = page.locator(DATA_QA["question"])
+    fields: list[QuestionField] = []
+    for index in range(min(await containers.count(), 50)):
+        container = containers.nth(index)
+        label = ((await container.text_content()) or "").strip()
+        if not label:
             continue
+        inputs = container.locator("input, textarea, select")
+        answer_type: str = "text"
+        required = "*" in label
+        options: list[str] = []
+        if await inputs.count() > 0:
+            first = inputs.first
+            input_type = ((await first.get_attribute("type")) or "text").lower()
+            tag_name = await first.evaluate("el => el.tagName.toLowerCase()")
+            if input_type in {"radio", "checkbox"}:
+                answer_type = input_type
+                labels = container.locator("label")
+                for option_index in range(min(await labels.count(), 30)):
+                    text = ((await labels.nth(option_index).text_content()) or "").strip()
+                    if text and text not in options:
+                        options.append(text)
+            elif tag_name == "textarea":
+                answer_type = "textarea"
+            required = required or (await first.get_attribute("required") is not None)
+            required = required or (await first.get_attribute("aria-required") == "true")
+        fields.append(
+            QuestionField(
+                field_id=f"q{index}",
+                label=label[:1000],
+                answer_type=answer_type,
+                required=required,
+                options=options,
+            )
+        )
+    return fields
 
+
+def _question_index(field_id: str) -> int | None:
+    return int(field_id[1:]) if field_id.startswith("q") and field_id[1:].isdigit() else None
+
+
+async def fill_questionnaire_form(page: Page, answers: list[dict | FormAnswer]) -> bool:
+    containers = page.locator(DATA_QA["question"])
+    all_filled = True
+    for raw_answer in answers:
         try:
-            if ans_type in ["text", "textarea"]:
-                container = popup.locator(f'[data-qa="general-form-element"]:has-text("{field_id}"), label:has-text("{field_id}"), div:has-text("{field_id}")').first
-                if await container.count() > 0:
-                    inp = container.locator('input[type="text"], textarea').first
-                    if await inp.count() > 0:
-                        await human_type(page, inp, str(val))
-            elif ans_type == "radio":
-                radio_opt = popup.locator(f'label:has-text("{val}"), input[type="radio"][value="{val}"]').first
-                if await radio_opt.count() > 0:
-                    await human_click(page, radio_opt)
-            elif ans_type == "checkbox":
-                cb_opt = popup.locator(f'label:has-text("{val}"), input[type="checkbox"]').first
-                if await cb_opt.count() > 0:
-                    await human_click(page, cb_opt)
-        except Exception as err:
-            logger.warning("Ошибка при заполнении поля анкеты '%s': %s", field_id, err)
+            answer = raw_answer if isinstance(raw_answer, FormAnswer) else FormAnswer.model_validate(raw_answer)
+        except Exception:
+            all_filled = False
+            continue
+        index = _question_index(answer.field_id)
+        if index is None or index >= await containers.count():
+            all_filled = False
+            continue
+        container = containers.nth(index)
+        try:
+            if answer.answer_type in {"text", "textarea"}:
+                input_locator = container.locator('input:not([type="radio"]):not([type="checkbox"]), textarea').first
+                if not await _is_visible(input_locator):
+                    all_filled = False
+                    continue
+                await human_type(page, input_locator, answer.value)
+            else:
+                option = container.get_by_text(answer.value, exact=True).first
+                if not await _is_visible(option):
+                    all_filled = False
+                    continue
+                await human_click(page, option)
+        except Exception as exc:
+            logger.warning("Question field %s could not be filled: %s", answer.field_id, type(exc).__name__)
+            all_filled = False
+    return all_filled
+
+
+def questionnaire_requires_confirmation(
+    questions: list[QuestionField], payload: JobApplicationPayload
+) -> bool:
+    answer_map = {answer.field_id: answer for answer in payload.answers}
+    if not payload.can_auto_submit or payload.confidence_score < 0.85:
+        return True
+    for question in questions:
+        lowered = question.label.lower()
+        if any(marker in lowered for marker in MANUAL_QUESTION_MARKERS):
+            return True
+        answer = answer_map.get(question.field_id)
+        if question.required and (answer is None or not answer.value.strip()):
+            return True
+        if answer and question.options and answer.value not in question.options:
+            return True
+        if answer and answer.answer_type != question.answer_type:
+            return True
+    return False
+
+
+def effective_cover_letter(generated: str, send_cover_letter: bool) -> str:
+    """hh.ru requires a non-empty letter field; disabled mode intentionally sends a dot."""
+    return generated if send_cover_letter else "."
 
 
 async def verify_hh_application_success(page: Page) -> bool:
-    """Проверяет, подтвержден ли отклик на самой странице hh.ru."""
-    await page.wait_for_timeout(1500)
-
-    # 1. Проверка состояния кнопки "Вы откликнулись" / "Посмотреть отклик"
-    applied = page.locator('[data-qa="vacancy-response-link-view-topic"], a:has-text("Вы откликнулись"), a:has-text("Посмотреть отклик")').first
-    if await applied.count() > 0 and await applied.is_visible():
+    await page.wait_for_timeout(1200)
+    locator = page.locator(
+        '[data-qa="vacancy-response-link-view-topic"], '
+        '[data-qa="vacancy-response-status-success"], '
+        'a:has-text("Вы откликнулись"), a:has-text("Посмотреть отклик")'
+    ).first
+    if await _is_visible(locator):
         return True
-
-    # 2. Проверка текстов уведомлений
-    success_msg = page.locator('text="Отклик отправлен", text="Ваш отклик отправлен", text="Вы уже откликались"').first
-    if await success_msg.count() > 0 and await success_msg.is_visible():
-        return True
-
-    # 3. Проверка URL
-    if "vacancy_response" in page.url or "response" in page.url:
-        return True
-
+    for text in ("Отклик отправлен", "Ваш отклик отправлен", "Вы уже откликались"):
+        if await _is_visible(page.get_by_text(text, exact=True).first):
+            return True
     return False
+
+
+async def _open_letter_and_fill(page: Page, cover_letter: str) -> None:
+    toggle = page.locator(DATA_QA["letter_toggle"]).first
+    if await _is_visible(toggle):
+        await human_click(page, toggle)
+        await page.wait_for_timeout(500)
+    input_locator = page.locator(DATA_QA["letter_input"]).first
+    if await _is_visible(input_locator):
+        await human_type(page, input_locator, cover_letter)
+
+
+async def _submit_response_form(page: Page) -> bool:
+    candidates = page.locator(DATA_QA["submit"])
+    for index in range(await candidates.count()):
+        candidate = candidates.nth(index)
+        if not await candidate.is_visible():
+            continue
+        label = ((await candidate.text_content()) or "").strip().lower()
+        if label and not any(word in label for word in ("отклик", "отправ", "продолж")):
+            continue
+        await human_click(page, candidate)
+        await page.wait_for_timeout(1800)
+        return True
+    return False
+
+
+async def _is_hh_location(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return host == "hh.ru" or host.endswith(".hh.ru")
 
 
 async def apply_to_hh_vacancy(
@@ -129,225 +235,121 @@ async def apply_to_hh_vacancy(
     vacancy_url: str,
     target_resume_title: str | None = None,
     send_cover_letter: bool = True,
-    stop_words: list[str] | None = None
+    stop_words: list[str] | None = None,
 ) -> tuple[str, str | None, dict | None]:
-    """
-    Полный цикл автоматического отклика на вакансию hh.ru:
-    1. Нажатие кнопки 'Откликнуться' на странице.
-    2. Перехват модального окна 'Отклик на вакансию'.
-    3. Клик по кнопке 'Добавить сопроводительное'.
-    4. Ввод письма Gemini (или точки '.') и нажатие финальной кнопки 'Откликнуться'.
-    """
     try:
-        await page.goto(vacancy_url, wait_until="domcontentloaded")
-        await human_scroll(page, steps=3)
+        normalized_url = normalize_hh_vacancy_url(vacancy_url)
+        if not normalized_url:
+            return "ERROR_INVALID_URL", None, None
+        vacancy_url = normalized_url
+        await page.goto(vacancy_url, wait_until="domcontentloaded", timeout=30_000)
+        vacancy = await extract_vacancy_details(page)
+        await human_scroll(page, steps=2)
 
-        vacancy_info = await extract_vacancy_details(page)
-
-        # Проверка стоп-слов в заголовке и описании до совершения отклика
-        if stop_words:
-            full_text = (vacancy_info.get("title", "") + " " + vacancy_info.get("description", "")).lower()
-            if any(sw in full_text for sw in stop_words):
-                logger.info("Вакансия %s пропущена из-за стоп-слова в описании/заголовке", vacancy_url)
-                return "SKIPPED_STOP_WORD", None, vacancy_info
-        
-        # Проверка, откликался ли пользователь ранее
-        already_applied = page.locator('[data-qa="vacancy-response-link-view-topic"]').first
-        if await already_applied.count() > 0 and await already_applied.is_visible():
-            logger.info("Пользователь уже откликался на вакансию: %s", vacancy_url)
-            return "ALREADY_APPLIED", None, vacancy_info
-
-        # Нажатие на главную кнопку "Откликнуться" на странице вакансии
-        response_btn = page.locator(DATA_QA["response_top"]).first
-        if await response_btn.count() == 0:
-            logger.warning("Кнопка отклика не найдена на странице %s", vacancy_url)
-            return "ERROR_NO_BUTTON", None, None
-
-        await human_click(page, DATA_QA["response_top"])
-        await page.wait_for_timeout(1500)
-
-        # 1. Сценарий: Внешний редирект (External Redirect)
-        if "hh.ru" not in page.url:
-            logger.info("Перенаправление на внешнюю систему рекрутинга: %s", page.url)
-            return "SKIPPED_EXTERNAL", None, {"external_url": page.url}
-
-        # 2. Сценарий: Проверка наличия модального окна отклика
-        modal = page.locator(DATA_QA["modal_popup"]).first
-        is_modal = await modal.count() > 0 or await page.locator(DATA_QA["letter_toggle"]).count() > 0
-
-        if is_modal:
-            # Выбор требуемого резюме из списка в модальном окне
-            await handle_resume_selection_if_needed(page, target_resume_title)
-
-            # Извлечение списка вопросов анкеты если есть
-            questions_loc = page.locator(DATA_QA["form_element"])
-            q_count = await questions_loc.count()
-            
-            questions_list = []
-            if q_count > 0:
-                for i in range(q_count):
-                    q_text = await questions_loc.nth(i).text_content()
-                    if q_text:
-                        questions_list.append(q_text.strip())
-
-            # Генерация отклика через Gemini 3.5 Flash Lite
-            ai_payload: JobApplicationPayload = await generate_hh_job_application(
-                resume_context=resume_context,
-                vacancy_description=vacancy_info["description"],
-                questions_list=questions_list
-            )
-
-            # Если опция сопроводительного письма отключена -> заменяем текст на одиночную точку '.'
-            if not send_cover_letter:
-                ai_payload.cover_letter = "."
-
-            # Проверка релевантности вакансии компетенциям из резюме
-            if not ai_payload.is_relevant:
-                logger.info("Вакансия %s пропущена как нерелевантная резюме (причина: %s)", vacancy_url, ai_payload.relevance_reason)
-                # Закрываем модальное окно если открыто
-                await page.keyboard.press("Escape")
-                return "SKIPPED_IRRELEVANT", None, {"reason": ai_payload.relevance_reason, "vacancy": vacancy_info}
-
-            # Заполнение полей анкеты при наличии вопросов
-            if ai_payload.answers:
-                await fill_questionnaire_form(page, ai_payload.answers)
-
-            # Если есть сложные тесты и модель не уверена -> запрос подтверждения в Telegram
-            if q_count > 0 and (not ai_payload.can_auto_submit or ai_payload.confidence_score < 0.85):
-                logger.info("Для вакансии %s требуется ручное подтверждение анкеты.", vacancy_url)
-                return "QUESTIONNAIRE_REQUIRED", ai_payload.cover_letter, {
-                    "vacancy": vacancy_info,
-                    "questions": questions_list,
-                    "ai_payload": ai_payload.model_dump()
-                }
-
-            # Клик по кнопке "Добавить сопроводительное"
-            letter_toggle = page.locator(DATA_QA["letter_toggle"]).first
-            if await letter_toggle.count() > 0 and await letter_toggle.is_visible():
-                logger.info("Нажатие на кнопку 'Добавить сопроводительное'...")
-                await human_click(page, letter_toggle)
-                await page.wait_for_timeout(800)
-
-            # Ввод текста сопроводительного письма в textarea
-            letter_input = page.locator(DATA_QA["letter_input"]).first
-            if await letter_input.count() > 0 and await letter_input.is_visible():
-                logger.info("Ввод сгенерированного сопроводительного письма Gemini...")
-                await human_type(page, letter_input, ai_payload.cover_letter)
-                await page.wait_for_timeout(500)
-
-            # Финальный клик по синей кнопке 'Откликнуться' внутри модального окна
-            modal_submit_selectors = [
-                '[data-qa="vacancy-response-submit-popup"]',
-                '[data-qa="response-submit-popup"]',
-                '[data-qa*="response-submit"]',
-                '[data-qa*="submit-popup"]',
-                'button[type="submit"]',
-                'button:has-text("Откликнуться")',
-                'button:has-text("Отправить отклик")',
-                'button:has-text("Отправить")',
-            ]
-
-            submitted = False
-            for sel in modal_submit_selectors:
-                submit_btn = page.locator(sel).first
-                if await submit_btn.count() > 0 and await submit_btn.is_visible():
-                    logger.info("Отправка отклика через синюю кнопку модального окна (%s)...", sel)
-                    await human_click(page, submit_btn)
-                    await page.wait_for_timeout(2500)
-                    submitted = True
-                    break
-
-
-            if submitted:
-                if await verify_hh_application_success(page):
-                    return "APPLIED_WITH_LETTER", ai_payload.cover_letter, vacancy_info
-                else:
-                    logger.warning("Кнопка отклика нажата, но hh.ru не подтвердил отправку для %s", vacancy_url)
-                    return "ERROR_SUBMIT_UNCONFIRMED", None, vacancy_info
-            else:
-                logger.warning("Не удалось найти и кликнуть кнопку отправки в модальном окне: %s", vacancy_url)
-                return "ERROR_SUBMIT_FAILED", None, vacancy_info
-
-        # 4. Сценарий: Прямой отклик без сразу появившегося модального окна
-        # Дополнительное ожидание на случай задержки отрисовки модалки
-        await page.wait_for_timeout(1500)
-        late_modal = page.locator(DATA_QA["modal_popup"]).first
-        if await late_modal.count() > 0 or await page.locator(DATA_QA["letter_toggle"]).count() > 0:
-            logger.info("Модальное окно отклика открылось с задержкой. Обработка...")
-            # Повторный вызов логики модального окна
-            letter_toggle = page.locator(DATA_QA["letter_toggle"]).first
-            if await letter_toggle.count() > 0 and await letter_toggle.is_visible():
-                await human_click(page, letter_toggle)
-                await page.wait_for_timeout(800)
-            
-            modal_submit_selectors = [
-                '[data-qa="vacancy-response-submit-popup"]',
-                '[data-qa="response-submit-popup"]',
-                '[data-qa*="response-submit"]',
-                '[data-qa*="submit-popup"]',
-                'button[type="submit"]',
-                'button:has-text("Откликнуться")',
-                'button:has-text("Отправить отклик")',
-                'button:has-text("Отправить")',
-            ]
-            for sel in modal_submit_selectors:
-                submit_btn = page.locator(sel).first
-                if await submit_btn.count() > 0 and await submit_btn.is_visible():
-                    await human_click(page, submit_btn)
-                    await page.wait_for_timeout(2500)
-                    break
-
+        full_text = f"{vacancy['title']} {vacancy['description']}".lower()
+        if stop_words and any(word in full_text for word in stop_words):
+            return "SKIPPED_STOP_WORD", None, vacancy
         if await verify_hh_application_success(page):
-            return "APPLIED_DIRECT", None, vacancy_info
-        else:
-            logger.warning("Прямой отклик на %s не был подтвержден сайтом hh.ru", vacancy_url)
-            return "ERROR_DIRECT_UNCONFIRMED", None, vacancy_info
+            return "ALREADY_APPLIED", None, vacancy
 
-    except Exception as e:
-        logger.error("Ошибка при обработке вакансии %s: %s", vacancy_url, e)
-        return f"ERROR: {e}", None, None
+        # Relevance must be decided before the first response click because some
+        # hh.ru vacancies use a one-click response without an intermediate modal.
+        payload = await generate_hh_job_application(
+            resume_context,
+            vacancy["description"],
+            [],
+        )
+        payload.cover_letter = effective_cover_letter(payload.cover_letter, send_cover_letter)
+        if not payload.is_relevant:
+            return "SKIPPED_IRRELEVANT", None, {
+                **vacancy,
+                "reason": payload.relevance_reason,
+            }
+
+        response_button = page.locator(DATA_QA["response"]).first
+        if not await _is_visible(response_button):
+            return "ERROR_NO_BUTTON", None, vacancy
+        await human_click(page, response_button)
+        await page.wait_for_timeout(1500)
+
+        if not await _is_hh_location(page.url):
+            return "SKIPPED_EXTERNAL", None, {**vacancy, "external_url": page.url}
+        if await verify_hh_application_success(page):
+            return "APPLIED_DIRECT", payload.cover_letter, vacancy
+
+        await handle_resume_selection_if_needed(page, target_resume_title)
+        questions = await extract_questionnaire_fields(page)
+        if questions:
+            payload = await generate_hh_job_application(
+                resume_context,
+                vacancy["description"],
+                questions,
+            )
+            payload.cover_letter = effective_cover_letter(
+                payload.cover_letter,
+                send_cover_letter,
+            )
+            if not payload.is_relevant:
+                await page.keyboard.press("Escape")
+                return "SKIPPED_IRRELEVANT", None, {
+                    **vacancy,
+                    "reason": payload.relevance_reason,
+                }
+        if questions and questionnaire_requires_confirmation(questions, payload):
+            return "QUESTIONNAIRE_REQUIRED", payload.cover_letter, {
+                "vacancy": vacancy,
+                "questions": [question.model_dump() for question in questions],
+                "ai_payload": payload.model_dump(),
+            }
+        if payload.answers and not await fill_questionnaire_form(page, payload.answers):
+            return "QUESTIONNAIRE_REQUIRED", payload.cover_letter, {
+                "vacancy": vacancy,
+                "questions": [question.model_dump() for question in questions],
+                "ai_payload": payload.model_dump(),
+            }
+
+        await _open_letter_and_fill(page, payload.cover_letter)
+        if not await _submit_response_form(page):
+            return "ERROR_SUBMIT_BUTTON", None, vacancy
+        if not await verify_hh_application_success(page):
+            return "ERROR_SUBMIT_UNCONFIRMED", None, vacancy
+        return "APPLIED_WITH_LETTER", payload.cover_letter, vacancy
+    except Exception as exc:
+        logger.error("Vacancy processing failed for %s: %s", vacancy_url, type(exc).__name__)
+        return "ERROR_BROWSER", None, None
 
 
 async def submit_approved_questionnaire(
     page: Page,
     vacancy_url: str,
     cover_letter: str,
-    answers: list[dict] | None = None
+    answers: list[dict] | None = None,
+    target_resume_title: str | None = None,
 ) -> tuple[bool, str]:
-    """
-    Выполняет повторную отправку одобренной пользователем анкеты на сайте hh.ru.
-    """
     try:
-        await page.goto(vacancy_url, wait_until="domcontentloaded")
-        await human_scroll(page, steps=2)
-
-        response_btn = page.locator(DATA_QA["response_top"]).first
-        if await response_btn.count() > 0:
-            await human_click(page, DATA_QA["response_top"])
-            await page.wait_for_timeout(1500)
-
-        await handle_resume_selection_if_needed(page)
-
-        if answers:
-            await fill_questionnaire_form(page, answers)
-
-        letter_toggle = page.locator(DATA_QA["letter_toggle"]).first
-        if await letter_toggle.is_visible():
-            await human_click(page, DATA_QA["letter_toggle"])
-            await page.wait_for_timeout(500)
-
-        letter_input = page.locator(DATA_QA["letter_input"]).first
-        if await letter_input.is_visible():
-            await human_type(page, DATA_QA["letter_input"], cover_letter)
-
-        submit_btn = page.locator(DATA_QA["submit_popup"]).first
-        if await submit_btn.is_visible():
-            await human_click(page, DATA_QA["submit_popup"])
-            await page.wait_for_timeout(1000)
-            return True, "Отклик с анкетой успешно отправлен на hh.ru!"
-
-        return True, "Прямой отклик отправлен."
-
-    except Exception as e:
-        logger.error("Ошибка при отправке подтвержденной анкеты на %s: %s", vacancy_url, e)
-        return False, str(e)
+        normalized_url = normalize_hh_vacancy_url(vacancy_url)
+        if not normalized_url:
+            return False, "Некорректная ссылка вакансии hh.ru."
+        vacancy_url = normalized_url
+        await page.goto(vacancy_url, wait_until="domcontentloaded", timeout=30_000)
+        if await verify_hh_application_success(page):
+            return True, "Отклик уже подтвержден на hh.ru."
+        response_button = page.locator(DATA_QA["response"]).first
+        if not await _is_visible(response_button):
+            return False, "Кнопка отклика не найдена."
+        await human_click(page, response_button)
+        await page.wait_for_timeout(1200)
+        if not await _is_hh_location(page.url):
+            return False, "Вакансия перенаправляет на внешний сайт."
+        await handle_resume_selection_if_needed(page, target_resume_title)
+        if answers and not await fill_questionnaire_form(page, answers):
+            return False, "Не удалось заполнить все поля анкеты."
+        await _open_letter_and_fill(page, cover_letter)
+        if not await _submit_response_form(page):
+            return False, "Кнопка отправки анкеты не найдена."
+        if not await verify_hh_application_success(page):
+            return False, "hh.ru не подтвердил отправку отклика."
+        return True, "Отклик с анкетой подтвержден на hh.ru."
+    except Exception as exc:
+        logger.error("Questionnaire submission failed for %s: %s", vacancy_url, type(exc).__name__)
+        return False, "Не удалось отправить анкету из-за ошибки браузера."

@@ -4,9 +4,10 @@ LeadScout AI — Модуль симуляции человеческого по
 """
 
 import asyncio
-import random
-import math
 import logging
+import math
+import random
+
 from patchright.async_api import Page
 
 logger = logging.getLogger(__name__)
