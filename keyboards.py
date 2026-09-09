@@ -3,10 +3,23 @@ LeadScout AI — Меню и клавиатуры Telegram-бота (aiogram 3.x
 Поддерживает управление мульти-аккаунтами, смену аккаунтов без разлогина и премиум инлайн-настройки в стиле THREAD SHOP.
 """
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, WebAppInfo
+
+from config import APP_URL
 
 AUTOAPPLY_ON_TEXT = "⚡️ Автоотклик 🟢"
 AUTOAPPLY_OFF_TEXT = "⚡️ Автоотклик 🔴"
+
+
+def get_mini_app_keyboard(target: str = "") -> InlineKeyboardMarkup | None:
+    """Open a relevant Mini App section while retaining legacy callback controls."""
+    if not APP_URL.startswith("https://"):
+        return None
+    separator = "&" if "?" in APP_URL else "?"
+    url = f"{APP_URL}{separator}target={target}" if target else APP_URL
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="Открыть LeadScout", web_app=WebAppInfo(url=url))]]
+    )
 
 
 def _get_nav_row(back_callback: str = "NAV_BACK") -> list[InlineKeyboardButton]:
@@ -18,14 +31,20 @@ def _get_nav_row(back_callback: str = "NAV_BACK") -> list[InlineKeyboardButton]:
 
 
 def get_main_keyboard(is_auto_apply_running: bool = False) -> ReplyKeyboardMarkup:
-    """Главная клавиатура бота (ReplyKeyboard, 3 ряда кнопок)."""
+    """Compact bot controls with the Mini App as the primary workspace."""
     auto_text = AUTOAPPLY_ON_TEXT if is_auto_apply_running else AUTOAPPLY_OFF_TEXT
-    return ReplyKeyboardMarkup(
-        keyboard=[
+    rows = []
+    if APP_URL.startswith("https://"):
+        rows.append([KeyboardButton(text="Открыть LeadScout", web_app=WebAppInfo(url=APP_URL))])
+    rows.extend(
+        [
             [KeyboardButton(text=auto_text)],
             [KeyboardButton(text="👤 Аккаунты & Резюме"), KeyboardButton(text="📊 ИИ-Аудит & Логи")],
             [KeyboardButton(text="⚙️ Настройки поиска")],
-        ],
+        ]
+    )
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
         resize_keyboard=True
     )
 
@@ -185,7 +204,16 @@ def get_delete_confirmation_keyboard(account_id: int) -> InlineKeyboardMarkup:
 
 def get_questionnaire_confirmation_keyboard(apply_id: int) -> InlineKeyboardMarkup:
     """Клавиатура подтверждения отклика на сложную анкету."""
-    buttons = [
+    buttons = []
+    if APP_URL.startswith("https://"):
+        separator = "&" if "?" in APP_URL else "?"
+        buttons.append(
+            [InlineKeyboardButton(
+                text="Открыть анкету в LeadScout",
+                web_app=WebAppInfo(url=f"{APP_URL}{separator}target=questionnaire&apply_id={apply_id}"),
+            )]
+        )
+    buttons.extend([
         [
             InlineKeyboardButton(text="✅ Отправить отклик", callback_data=f"confirm_apply_{apply_id}"),
             InlineKeyboardButton(text="❌ Пропустить", callback_data=f"skip_apply_{apply_id}")
@@ -195,7 +223,7 @@ def get_questionnaire_confirmation_keyboard(apply_id: int) -> InlineKeyboardMark
             InlineKeyboardButton(text="🧾 Изменить ответы", callback_data=f"edit_answers_{apply_id}")
         ],
         _get_nav_row("NAV_BACK")
-    ]
+    ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 

@@ -33,6 +33,7 @@ from database import (
     delete_hh_account_for_user,
     get_account_for_user,
     get_active_account,
+    get_active_resume_snapshot,
     get_application_stats,
     get_or_create_user,
     get_pending_questionnaire_for_user,
@@ -256,6 +257,17 @@ async def cmd_help(message: Message):
         "4️⃣ **`⚙️ Настройки и Аналитика`**: Настройка фильтров поиска (ЗП, удаленка, прокси, ключевые и стоп-слова), просмотр статистики и истории откликов."
     )
     await message.answer(help_text, parse_mode="Markdown")
+
+
+@router.message(Command("stop_all"))
+async def cmd_stop_all(message: Message):
+    """Emergency stop that remains available when the Mini App cannot be opened."""
+    accounts = await get_user_accounts(message.from_user.id)
+    stopped = 0
+    for account in accounts:
+        if await task_coordinator.stop_account(message.from_user.id, account["id"]):
+            stopped += 1
+    await message.answer(f"⛔️ Автоотклик остановлен для аккаунтов: {stopped}.")
 
 
 # ── 🎛 Хабы Главного Меню (Аккаунты, Резюме, Настройки, Аналитика) ──
@@ -1287,6 +1299,7 @@ async def _process_and_send_resume_audit(event: CallbackQuery | Message, resume_
     # 3. Сохранение результатов в БД
     acc = await get_active_account(user_id)
     acc_id = acc.get("id") if acc else None
+    source_snapshot = await get_active_resume_snapshot(user_id, acc_id) if acc_id and not is_custom else None
     audit_dict = audit_res.model_dump()
     audit_id = await save_resume_audit(
         user_id=user_id,
@@ -1297,7 +1310,9 @@ async def _process_and_send_resume_audit(event: CallbackQuery | Message, resume_
         penalties=audit_res.penalties,
         top_recommendations=audit_res.top_recommendations,
         insights=[ins.model_dump() for ins in audit_res.insights],
-        summary_text=audit_res.summary_text
+        summary_text=audit_res.summary_text,
+        source_resume_text=resume_text,
+        source_resume_snapshot_id=source_snapshot.get("id") if source_snapshot else None,
     )
 
     # 4. Генерация PDF-отчета ReportLab
@@ -1607,8 +1622,13 @@ async def process_vacancy_input_for_matching(message: Message, state: FSMContext
         await message.answer("❌ Введите корректный текст описания вакансии или ссылку с hh.ru.", parse_mode="Markdown")
         return
 
+    context = await state.get_data()
+    audit_id = context.get("audit_id")
+    audit = await get_resume_audit_for_user(message.from_user.id, audit_id) if audit_id else None
     acc = await get_active_account(message.from_user.id)
-    resume_text = (acc.get("resume_text") if acc else "") or ""
+    resume_text = (audit.get("source_resume_text") if audit else "") or ""
+    if not resume_text:
+        resume_text = (acc.get("resume_text") if acc else "") or ""
     if not resume_text:
         user = await get_or_create_user(message.from_user.id)
         resume_text = user.get("resume_text", "")

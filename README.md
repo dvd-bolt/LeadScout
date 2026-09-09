@@ -1,88 +1,113 @@
-# LeadScout AI
+# LeadScout
 
-Локальный Telegram-бот для работы с аккаунтами соискателя hh.ru: синхронизации резюме,
-поиска вакансий, отправки откликов, заполнения анкет и ATS-аудита через Google Gemini.
+LeadScout — личный кабинет в Telegram для работы с аккаунтами соискателя hh.ru.
+Бот остаётся входом в приложение, каналом уведомлений и аварийной остановкой, а аккаунты,
+резюме, поиск, отклики, анкеты и ИИ-аудит доступны в Telegram Mini App.
 
-## Возможности
+## Что реализовано
 
-- Несколько аккаунтов hh.ru с отдельными сессиями, настройками, прокси и лимитами.
-- Один локальный диспетчер задач с ограничением числа Chromium-контекстов и защитой от повторного запуска.
-- Проверка дублей и атомарная фиксация подтвержденных откликов в SQLite.
-- Сопроводительные письма и ответы работодателю через Gemini Structured Output.
-- Автоотправка анкеты только при уверенности не ниже `0.85` и валидных обязательных ответах.
-- Синхронизация резюме по стабильным ID, безопасная загрузка PDF и подтверждение результата на hh.ru.
-- ATS-аудит и PDF-отчет с экранированием содержимого модели.
+- Несколько изолированных аккаунтов hh.ru: повторный вход использует существующий аккаунт и
+  не стирает историю. Сессии и реквизиты прокси никогда не возвращаются HTTP-клиенту.
+- Резюме синхронизируются по стабильному ID hh.ru. Запуск невозможен без явно выбранного
+  резюме, а его удаление требует подтверждения в интерфейсе и подтверждённого результата на
+  hh.ru.
+- Автоматизация использует один `TaskCoordinator`, блокировки аккаунтов и общий лимит
+  Chromium-контекстов. Повторные запуски и подтверждения анкет не создают вторую задачу.
+- Снимок исходного резюме хранится с анкетой и ИИ-аудитом. При перезапуске незавершённая
+  отправка переводится в «Требуется проверка», без слепой повторной отправки.
+- FastAPI API под `/api/v1`, журнал длительных операций и интерфейс React/Vite с нижней
+  навигацией, темой Telegram, безопасными отступами и кнопкой «Назад».
+- Авторизация Mini App проверяет подпись и срок `initData`, принимает только
+  `OWNER_TELEGRAM_ID`, создаёт короткую HttpOnly-сессию и требует Origin + CSRF для изменений.
+- Аудит активного, отдельного текстового или PDF-резюме; сравнение с вакансией и PDF-отчёт.
 
-При выключенном сопроводительном письме в соответствующее поле намеренно отправляется `.`.
-Текст загруженного PDF передается в Google Gemini для анализа. Сам PDF хранится только во
-временном каталоге на локальном компьютере и удаляется после операции.
+## Локальная разработка
 
-## Требования
+Нужны Python 3.13+, Node.js 22+ и токены Telegram/Gemini.
 
-- Windows 10/11.
-- Python 3.13, доступный через launcher `py`.
-- Telegram Bot Token и Google Gemini API key.
+```bash
+python3.13 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/patchright install chromium
 
-Redis, Taskiq, Docker, PostgreSQL и системный Google Chrome не требуются.
-
-## Установка
-
-```powershell
-py -3.13 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\patchright.exe install chromium
+cd web
+npm ci
+npm run build
+cd ..
 ```
 
-Создайте `.env` на основе `.env.example`. Fernet-ключ генерируется так:
+Создайте `.env` из `.env.example`. Fernet-ключ:
 
-```powershell
-.\.venv\Scripts\python.exe -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```bash
+.venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-Обязательные переменные:
+Для одного процесса с ботом, планировщиком и Mini App нужны также:
 
 ```env
-BOT_TOKEN=telegram_bot_token
-GEMINI_API_KEY=google_gemini_api_key
-GEMINI_MODEL=gemini-3.5-flash-lite
-SESSION_ENCRYPTION_KEY=generated_fernet_key
+OWNER_TELEGRAM_ID=ваш_числовой_telegram_id
+APP_URL=https://leadscout.example.com
+WEB_APP_ORIGINS=https://leadscout.example.com
+WEB_SECURE_COOKIES=true
 ```
 
-Запуск:
+Запустите серверный режим:
 
-```powershell
-.\.venv\Scripts\python.exe main.py
+```bash
+.venv/bin/python server_app.py
 ```
 
-## Проверка
+Для разработки UI отдельно:
 
-```powershell
-.\.venv\Scripts\ruff.exe check .
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\python.exe -m compileall -q .
-.\.venv\Scripts\python.exe -m pip check
+```bash
+cd web && npm run dev
 ```
 
-Тесты используют временную SQLite-базу, локальные HTML-фикстуры и Chromium. Они не
-отправляют реальные отклики работодателям.
+Локальная вкладка без Telegram ожидаемо покажет ошибку входа: приложение принимает только
+подписанные данные Mini App. Для продуктивного запуска укажите HTTPS-домен в BotFather как
+URL Mini App. Кнопка «Открыть LeadScout» появится в боте автоматически, когда `APP_URL`
+начинается с `https://`.
 
-## Архитектура
+## Развёртывание на VPS
 
-- `main.py`: lifecycle Telegram, scheduler, Gemini и браузеров.
-- `handlers.py`: команды, callback-проверки владельца и FSM-диалоги.
-- `worker.py`: `TaskCoordinator`, account locks и очередь браузеров.
-- `database.py`: SQLite schema v3, миграции, ownership и атомарные транзакции.
-- `ai_handler.py`: один асинхронный Gemini-клиент, Pydantic-схемы и bounded TTL cache.
-- `parsers/`: авторизация, Chromium pool, резюме и отклики hh.ru.
-- `utils/`: Fernet, валидация URL/прокси, PDF и humanized browser controls.
+1. Скопируйте проект, создайте `.env` по примеру и задайте настоящий `DOMAIN`, `APP_URL`,
+   `WEB_APP_ORIGINS`, `OWNER_TELEGRAM_ID`, токены и исходный `SESSION_ENCRYPTION_KEY`.
+2. До миграции сохраните существующую базу и Fernet-ключ. Ключ нужен для расшифровки
+   сохранённых сессий hh.ru.
+3. Запустите:
 
-SQLite работает в WAL-режиме. Foreign keys включаются на каждом соединении. Диалоги FSM
-хранятся в памяти и после перезапуска начинаются заново; аккаунты, сессии и история остаются
-в `leadscout.db`.
+   ```bash
+   docker compose up -d --build
+   ```
 
-## Эксплуатационные Ограничения
+`docker-compose.yml` запускает один worker приложения, Caddy с HTTPS и ежедневную
+консистентную SQLite-копию. База находится в томе `leadscout-data`, последние 14 копий — в
+`leadscout-backups`. Для проверки копии восстановите её в отдельный файл через SQLite
+`backup` API, затем запустите приложение с временным `DB_PATH`.
 
-- DOM hh.ru может изменяться; успех операции всегда дополнительно проверяется по видимому состоянию страницы.
-- Сессия с неверным Fernet-ключом помечается истекшей и требует повторного входа.
-- Live-проверку отправки отклика выполняйте отдельно и осознанно: финальная кнопка создает реальное действие для работодателя.
+После настройки домена задайте тот же HTTPS URL в BotFather для Menu Button/Mini App.
+
+## Проверки
+
+```bash
+.venv/bin/ruff check .
+.venv/bin/python -m pytest -q
+.venv/bin/python -m compileall -q .
+.venv/bin/python -m pip check
+cd web && npm run build
+```
+
+Тесты используют временную SQLite-базу и локальные браузерные формы. Они не выполняют
+реальные входы или отклики на hh.ru. Перед живой отправкой выполняйте отдельную проверку с
+явным разрешением владельца.
+
+## Структура
+
+- `server_app.py` — единый процесс Uvicorn, Telegram polling и APScheduler.
+- `web_api.py` — авторизованный HTTP API и журнал длительных операций.
+- `web/` — React + TypeScript + Vite Mini App.
+- `worker.py` — задачи аккаунтов, блокировки и отправка анкет.
+- `database.py` — SQLite WAL, миграции, ownership и снимки резюме.
+- `parsers/` — безопасные сценарии hh.ru и PDF.
+- `backup.py`, `Dockerfile`, `docker-compose.yml`, `Caddyfile` — развёртывание и резервные копии.

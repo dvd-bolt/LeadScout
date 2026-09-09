@@ -59,6 +59,7 @@ async def test_main_lifecycle_closes_every_resource(monkeypatch):
         calls.append("gemini_close")
 
     monkeypatch.setattr(main, "validate_runtime_config", lambda: calls.append("config"))
+    monkeypatch.setattr(main, "BOT_TOKEN", "123456:offline-test-token")
     monkeypatch.setattr(main, "init_db", fake_init_db)
     monkeypatch.setattr(main, "Bot", FakeBot)
     monkeypatch.setattr(main, "Dispatcher", FakeDispatcher)

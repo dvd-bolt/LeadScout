@@ -1,4 +1,4 @@
-"""SQLite repository for the local LeadScout runtime."""
+"""SQLite repository shared by the Telegram bot and Mini App runtime."""
 
 from __future__ import annotations
 
@@ -101,6 +101,7 @@ async def init_db() -> None:
                 proxy_url TEXT NOT NULL DEFAULT '',
                 active_account_id INTEGER,
                 active_resume_url TEXT NOT NULL DEFAULT '',
+                active_resume_hh_id TEXT NOT NULL DEFAULT '',
                 active_resume_title TEXT NOT NULL DEFAULT '',
                 auto_apply_enabled INTEGER NOT NULL DEFAULT 0,
                 send_cover_letter INTEGER NOT NULL DEFAULT 1,
@@ -117,6 +118,7 @@ async def init_db() -> None:
                 session_status TEXT NOT NULL DEFAULT 'AUTH_PENDING',
                 resume_text TEXT NOT NULL DEFAULT '',
                 active_resume_url TEXT NOT NULL DEFAULT '',
+                active_resume_hh_id TEXT NOT NULL DEFAULT '',
                 active_resume_title TEXT NOT NULL DEFAULT '',
                 keywords TEXT NOT NULL DEFAULT '',
                 stop_words TEXT NOT NULL DEFAULT '',
@@ -129,6 +131,8 @@ async def init_db() -> None:
                 auto_apply_enabled INTEGER NOT NULL DEFAULT 0,
                 send_cover_letter INTEGER NOT NULL DEFAULT 1,
                 resumes_json TEXT NOT NULL DEFAULT '[]',
+                last_synced_at TEXT NOT NULL DEFAULT '',
+                next_scheduled_search_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
             );
@@ -183,6 +187,10 @@ async def init_db() -> None:
                 cover_letter TEXT NOT NULL DEFAULT '',
                 questions_json TEXT NOT NULL DEFAULT '[]',
                 ai_payload_json TEXT NOT NULL DEFAULT '{}',
+                resume_snapshot_id INTEGER,
+                resume_hh_id TEXT NOT NULL DEFAULT '',
+                resume_title TEXT NOT NULL DEFAULT '',
+                resume_text TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'PENDING',
                 error_text TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -202,6 +210,8 @@ async def init_db() -> None:
                 top_recommendations_json TEXT NOT NULL DEFAULT '[]',
                 insights_json TEXT NOT NULL DEFAULT '[]',
                 summary_text TEXT NOT NULL DEFAULT '',
+                source_resume_snapshot_id INTEGER,
+                source_resume_text TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
                 FOREIGN KEY (account_id) REFERENCES hh_accounts(id) ON DELETE SET NULL
@@ -243,6 +253,18 @@ async def init_db() -> None:
                 enabled_sources TEXT,
                 subscribed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS operations (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                error_text TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            );
             """
         )
 
@@ -271,8 +293,24 @@ async def init_db() -> None:
             "account_id INTEGER DEFAULT NULL",
             "error_text TEXT NOT NULL DEFAULT ''",
             "updated_at TEXT NOT NULL DEFAULT ''",
+            "resume_snapshot_id INTEGER DEFAULT NULL",
+            "resume_hh_id TEXT NOT NULL DEFAULT ''",
+            "resume_title TEXT NOT NULL DEFAULT ''",
+            "resume_text TEXT NOT NULL DEFAULT ''",
         ):
             await _add_missing_column(db, "pending_questionnaires", definition)
+
+        for definition in (
+            "active_resume_hh_id TEXT NOT NULL DEFAULT ''",
+            "last_synced_at TEXT NOT NULL DEFAULT ''",
+            "next_scheduled_search_at TEXT NOT NULL DEFAULT ''",
+        ):
+            await _add_missing_column(db, "hh_accounts", definition)
+        for definition in (
+            "source_resume_snapshot_id INTEGER DEFAULT NULL",
+            "source_resume_text TEXT NOT NULL DEFAULT ''",
+        ):
+            await _add_missing_column(db, "resume_audits", definition)
 
         await db.execute(
             "UPDATE hh_accounts SET normalized_login = lower(replace(trim(phone_or_email), ' ', '')) "
@@ -290,11 +328,12 @@ async def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_pending_owner_status ON pending_questionnaires(user_id, account_id, status);
             CREATE INDEX IF NOT EXISTS idx_audits_owner ON resume_audits(user_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_resume_snapshots_owner ON resume_snapshots(user_id, account_id, id);
-            PRAGMA user_version=3;
+            CREATE INDEX IF NOT EXISTS idx_operations_user_status ON operations(user_id, status, updated_at DESC);
+            PRAGMA user_version=5;
             """
         )
         await db.commit()
-    logger.info("SQLite schema v3 initialized: %s", DB_PATH)
+    logger.info("SQLite schema v5 initialized: %s", DB_PATH)
 
 
 async def get_or_create_user(user_id: int) -> dict:
@@ -342,12 +381,35 @@ async def get_enabled_accounts() -> list[dict]:
         return [dict(row) for row in await cursor.fetchall()]
 
 
+async def set_next_scheduled_search_at(value: str) -> None:
+    """Persist the scheduler's actual next fire time for the Mini App."""
+    async with get_db_connection() as db:
+        await db.execute(
+            """UPDATE hh_accounts SET next_scheduled_search_at = ?
+               WHERE session_status = 'ACTIVE' AND auto_apply_enabled = 1""",
+            (value,),
+        )
+        await db.commit()
+
+
 async def get_account_for_user(user_id: int, account_id: int) -> dict | None:
     async with get_db_connection() as db:
         await _reset_stale_account(db, account_id)
         await db.commit()
         cursor = await db.execute(
             "SELECT * FROM hh_accounts WHERE id = ? AND user_id = ?", (account_id, user_id)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
+async def get_account_by_login(user_id: int, phone_or_email: str) -> dict | None:
+    normalized = _normalize_login(phone_or_email)
+    async with get_db_connection() as db:
+        cursor = await db.execute(
+            """SELECT * FROM hh_accounts
+               WHERE user_id = ? AND normalized_login = ?""",
+            (user_id, normalized),
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
@@ -430,7 +492,7 @@ ACCOUNT_SETTINGS = {
     "account_name", "phone_or_email", "resume_text", "session_status", "daily_limit",
     "applied_today", "applied_date", "min_salary", "only_remote", "stop_words", "keywords",
     "proxy_url", "active_resume_url", "active_resume_title", "auto_apply_enabled",
-    "send_cover_letter", "resumes_json",
+    "active_resume_hh_id", "send_cover_letter", "resumes_json", "last_synced_at", "next_scheduled_search_at",
 }
 
 
@@ -454,11 +516,11 @@ async def update_account_settings_for_user(user_id: int, account_id: int, **kwar
 
 
 async def update_account_session(
-    user_id: int, account_id: int, encrypted_state: bytes, status: str = "ACTIVE"
+    user_id: int, account_id: int, encrypted_state: bytes, status: str | None = "ACTIVE"
 ) -> bool:
     async with get_db_connection() as db:
         cursor = await db.execute(
-            """UPDATE hh_accounts SET encrypted_storage_state = ?, session_status = ?
+            """UPDATE hh_accounts SET encrypted_storage_state = ?, session_status = COALESCE(?, session_status)
                WHERE id = ? AND user_id = ?""",
             (encrypted_state, status, account_id, user_id),
         )
@@ -549,6 +611,14 @@ async def record_successful_application(
             return False, 0
         await _reset_stale_account(db, account_id)
         cursor = await db.execute(
+            "SELECT applied_today, daily_limit FROM hh_accounts WHERE id = ? AND user_id = ?",
+            (account_id, user_id),
+        )
+        account_row = await cursor.fetchone()
+        if not account_row or account_row["applied_today"] >= account_row["daily_limit"]:
+            await db.rollback()
+            return False, int(account_row["applied_today"] if account_row else 0)
+        cursor = await db.execute(
             """INSERT OR IGNORE INTO hh_applies
                    (user_id, account_id, vacancy_hh_id, vacancy_title, company, cover_letter, status)
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -620,6 +690,111 @@ async def get_application_stats(user_id: int, account_id: int | None = None) -> 
         return {key: int(row[key] or 0) for key in ("applied", "processed", "errors", "skipped")}
 
 
+async def list_application_events(user_id: int, limit: int = 50, account_id: int | None = None) -> list[dict]:
+    """Return a bounded user-scoped activity feed for the Mini App."""
+    limit = max(1, min(limit, 100))
+    params: list[object] = [user_id]
+    account_clause = ""
+    if account_id is not None:
+        account_clause = " AND account_id = ?"
+        params.append(account_id)
+    params.append(limit)
+    async with get_db_connection() as db:
+        cursor = await db.execute(
+            f"""SELECT id, account_id, vacancy_hh_id, vacancy_title, company, status, details, created_at
+                FROM application_events WHERE user_id = ?{account_clause}
+                ORDER BY id DESC LIMIT ?""",
+            params,
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def list_pending_questionnaires(
+    user_id: int, account_id: int | None = None, limit: int = 100
+) -> list[dict]:
+    limit = max(1, min(limit, 100))
+    params: list[object] = [user_id]
+    account_clause = ""
+    if account_id is not None:
+        account_clause = " AND account_id = ?"
+        params.append(account_id)
+    params.append(limit)
+    async with get_db_connection() as db:
+        cursor = await db.execute(
+            f"""SELECT * FROM pending_questionnaires WHERE user_id = ?{account_clause}
+                ORDER BY updated_at DESC, id DESC LIMIT ?""",
+            params,
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+
+async def recover_interrupted_questionnaires() -> int:
+    """Avoid retrying an unconfirmed browser action after a process restart."""
+    async with get_db_connection() as db:
+        cursor = await db.execute(
+            """UPDATE pending_questionnaires
+               SET status = 'NEEDS_REVIEW',
+                   error_text = 'Отправка была прервана. Проверьте результат на hh.ru перед повтором.',
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE status = 'SUBMITTING'"""
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def create_operation(operation_id: str, user_id: int, kind: str) -> None:
+    async with get_db_connection() as db:
+        await db.execute(
+            """INSERT INTO operations (id, user_id, kind, status)
+               VALUES (?, ?, ?, 'PENDING')
+               ON CONFLICT(id) DO NOTHING""",
+            (operation_id, user_id, kind),
+        )
+        await db.commit()
+
+
+async def complete_operation(
+    operation_id: str, user_id: int, result: dict | None = None, error: str = ""
+) -> bool:
+    status = "FAILED" if error else "SUCCEEDED"
+    async with get_db_connection() as db:
+        cursor = await db.execute(
+            """UPDATE operations
+               SET status = ?, result_json = ?, error_text = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND user_id = ?""",
+            (status, json.dumps(result or {}, ensure_ascii=False), error[:500], operation_id, user_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def start_operation(operation_id: str, user_id: int) -> bool:
+    async with get_db_connection() as db:
+        cursor = await db.execute(
+            """UPDATE operations SET status = 'RUNNING', updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND user_id = ? AND status = 'PENDING'""",
+            (operation_id, user_id),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def get_operation_for_user(user_id: int, operation_id: str) -> dict | None:
+    async with get_db_connection() as db:
+        cursor = await db.execute(
+            "SELECT * FROM operations WHERE id = ? AND user_id = ?", (operation_id, user_id)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        operation = dict(row)
+        try:
+            operation["result"] = json.loads(operation.pop("result_json") or "{}")
+        except json.JSONDecodeError:
+            operation["result"] = {}
+        return operation
+
+
 async def save_pending_questionnaire_account(
     user_id: int,
     account_id: int,
@@ -628,10 +803,14 @@ async def save_pending_questionnaire_account(
     cover_letter: str,
     questions: list,
     ai_payload: dict,
+    resume_snapshot: dict | None = None,
 ) -> int:
     account = await get_account_for_user(user_id, account_id)
     if not account:
         raise PermissionError("Account does not belong to user")
+    if resume_snapshot is None:
+        resume_snapshot = await get_active_resume_snapshot(user_id, account_id)
+    snapshot = resume_snapshot or {}
     async with get_db_connection() as db:
         cursor = await db.execute(
             """SELECT id FROM pending_questionnaires
@@ -644,8 +823,9 @@ async def save_pending_questionnaire_account(
             return existing[0]
         cursor = await db.execute(
             """INSERT INTO pending_questionnaires
-                   (user_id, account_id, vacancy_url, vacancy_title, cover_letter, questions_json, ai_payload_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (user_id, account_id, vacancy_url, vacancy_title, cover_letter, questions_json, ai_payload_json,
+                    resume_snapshot_id, resume_hh_id, resume_title, resume_text)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 user_id,
                 account_id,
@@ -654,6 +834,10 @@ async def save_pending_questionnaire_account(
                 cover_letter,
                 json.dumps(questions, ensure_ascii=False),
                 json.dumps(ai_payload, ensure_ascii=False),
+                snapshot.get("id"),
+                snapshot.get("hh_resume_id") or account.get("active_resume_hh_id", ""),
+                snapshot.get("title") or account.get("active_resume_title", ""),
+                snapshot.get("extracted_text") or account.get("resume_text", ""),
             ),
         )
         await db.commit()
@@ -694,7 +878,7 @@ async def claim_pending_questionnaire(user_id: int, apply_id: int) -> dict | Non
         cursor = await db.execute(
             """UPDATE pending_questionnaires
                SET status = 'SUBMITTING', error_text = '', updated_at = CURRENT_TIMESTAMP
-               WHERE id = ? AND user_id = ? AND status IN ('PENDING', 'FAILED', 'APPROVED')""",
+               WHERE id = ? AND user_id = ? AND status IN ('PENDING', 'FAILED', 'APPROVED', 'NEEDS_REVIEW')""",
             (apply_id, user_id),
         )
         if cursor.rowcount != 1:
@@ -709,7 +893,7 @@ async def claim_pending_questionnaire(user_id: int, apply_id: int) -> dict | Non
 
 
 async def finish_pending_questionnaire(user_id: int, apply_id: int, status: str, error: str = "") -> bool:
-    if status not in {"PENDING", "SUBMITTED", "FAILED", "SKIPPED"}:
+    if status not in {"PENDING", "SUBMITTED", "FAILED", "SKIPPED", "NEEDS_REVIEW"}:
         raise ValueError("Invalid questionnaire status")
     async with get_db_connection() as db:
         cursor = await db.execute(
@@ -737,7 +921,7 @@ async def update_pending_questionnaire_letter(user_id: int, apply_id: int, cover
     async with get_db_connection() as db:
         cursor = await db.execute(
             """UPDATE pending_questionnaires SET cover_letter = ?, updated_at = CURRENT_TIMESTAMP
-               WHERE id = ? AND user_id = ? AND status IN ('PENDING', 'FAILED')""",
+               WHERE id = ? AND user_id = ? AND status IN ('PENDING', 'FAILED', 'NEEDS_REVIEW')""",
             (cover_letter, apply_id, user_id),
         )
         await db.commit()
@@ -748,7 +932,7 @@ async def update_pending_questionnaire_answers(user_id: int, apply_id: int, ai_p
     async with get_db_connection() as db:
         cursor = await db.execute(
             """UPDATE pending_questionnaires SET ai_payload_json = ?, updated_at = CURRENT_TIMESTAMP
-               WHERE id = ? AND user_id = ? AND status IN ('PENDING', 'FAILED')""",
+               WHERE id = ? AND user_id = ? AND status IN ('PENDING', 'FAILED', 'NEEDS_REVIEW')""",
             (json.dumps(ai_payload, ensure_ascii=False), apply_id, user_id),
         )
         await db.commit()
@@ -797,6 +981,36 @@ async def sync_resume_snapshots(user_id: int, account_id: int, resumes: list[dic
             )
         else:
             await db.execute("DELETE FROM resume_snapshots WHERE account_id = ?", (account_id,))
+        await db.execute(
+            "UPDATE hh_accounts SET last_synced_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
+            (account_id, user_id),
+        )
+        await db.execute(
+            """UPDATE hh_accounts
+               SET active_resume_hh_id = COALESCE(
+                   (SELECT hh_resume_id FROM resume_snapshots
+                    WHERE account_id = hh_accounts.id AND href = hh_accounts.active_resume_url
+                    LIMIT 1),
+                   active_resume_hh_id
+               )
+               WHERE id = ? AND user_id = ? AND active_resume_hh_id = ''""",
+            (account_id, user_id),
+        )
+        # A resume can be deleted on hh.ru in another session.  Do not keep an
+        # orphaned active id: an automation must stop and ask the owner to make
+        # an explicit new choice instead of falling back to a different resume.
+        await db.execute(
+            """UPDATE hh_accounts
+               SET active_resume_url = '', active_resume_hh_id = '',
+                   active_resume_title = '', resume_text = ''
+               WHERE id = ? AND user_id = ? AND active_resume_hh_id <> ''
+                 AND NOT EXISTS (
+                    SELECT 1 FROM resume_snapshots
+                    WHERE account_id = hh_accounts.id
+                      AND hh_resume_id = hh_accounts.active_resume_hh_id
+                 )""",
+            (account_id, user_id),
+        )
         await db.commit()
     return await list_resume_snapshots(user_id, account_id)
 
@@ -840,6 +1054,22 @@ async def get_resume_snapshot_by_hh_id(
         return dict(row) if row else None
 
 
+async def get_active_resume_snapshot(user_id: int, account_id: int) -> dict | None:
+    account = await get_account_for_user(user_id, account_id)
+    if not account:
+        return None
+    async with get_db_connection() as db:
+        cursor = await db.execute(
+            """SELECT * FROM resume_snapshots
+               WHERE user_id = ? AND account_id = ?
+                 AND (hh_resume_id = ? OR href = ?)
+               ORDER BY id LIMIT 1""",
+            (user_id, account_id, account.get("active_resume_hh_id", ""), account.get("active_resume_url", "")),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
 async def attach_resume_text(
     user_id: int, account_id: int, hh_resume_id: str, extracted_text: str
 ) -> bool:
@@ -868,9 +1098,12 @@ async def set_active_resume_snapshot(user_id: int, account_id: int, snapshot_id:
         snapshot = dict(row)
         await db.execute(
             """UPDATE hh_accounts
-               SET active_resume_url = ?, active_resume_title = ?, resume_text = ?
+               SET active_resume_url = ?, active_resume_hh_id = ?, active_resume_title = ?, resume_text = ?
                WHERE id = ? AND user_id = ?""",
-            (snapshot["href"], snapshot["title"], snapshot.get("extracted_text") or "", account_id, user_id),
+            (
+                snapshot["href"], snapshot["hh_resume_id"], snapshot["title"],
+                snapshot.get("extracted_text") or "", account_id, user_id,
+            ),
         )
         await db.commit()
         return snapshot
@@ -900,6 +1133,8 @@ async def save_resume_audit(
     top_recommendations: list,
     insights: list,
     summary_text: str = "",
+    source_resume_text: str = "",
+    source_resume_snapshot_id: int | None = None,
 ) -> int:
     if account_id is not None and not await get_account_for_user(user_id, account_id):
         raise PermissionError("Account does not belong to user")
@@ -907,8 +1142,9 @@ async def save_resume_audit(
         cursor = await db.execute(
             """INSERT INTO resume_audits
                    (user_id, account_id, profession_name, overall_score, category_scores_json,
-                    penalties_json, top_recommendations_json, insights_json, summary_text)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    penalties_json, top_recommendations_json, insights_json, summary_text,
+                    source_resume_snapshot_id, source_resume_text)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 user_id,
                 account_id,
@@ -919,6 +1155,8 @@ async def save_resume_audit(
                 json.dumps(top_recommendations, ensure_ascii=False),
                 json.dumps(insights, ensure_ascii=False),
                 summary_text,
+                source_resume_snapshot_id,
+                source_resume_text,
             ),
         )
         await db.commit()
@@ -942,6 +1180,23 @@ async def get_user_latest_audit(user_id: int) -> dict | None:
             "SELECT * FROM resume_audits WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)
         )
         return _decode_audit(await cursor.fetchone())
+
+
+async def list_resume_audits(user_id: int, account_id: int | None = None, limit: int = 30) -> list[dict]:
+    limit = max(1, min(limit, 100))
+    params: list[object] = [user_id]
+    account_clause = ""
+    if account_id is not None:
+        account_clause = " AND account_id = ?"
+        params.append(account_id)
+    params.append(limit)
+    async with get_db_connection() as db:
+        cursor = await db.execute(
+            f"""SELECT * FROM resume_audits WHERE user_id = ?{account_clause}
+                ORDER BY id DESC LIMIT ?""",
+            params,
+        )
+        return [_decode_audit(row) for row in await cursor.fetchall()]
 
 
 async def get_resume_audit_for_user(user_id: int, audit_id: int) -> dict | None:
@@ -970,4 +1225,3 @@ async def update_user_settings(user_id: int, **kwargs) -> None:
     account = await get_active_account(user_id)
     if account:
         await update_account_settings_for_user(user_id, account["id"], **kwargs)
-

@@ -162,7 +162,7 @@ async def test_irrelevant_vacancy_is_never_clicked(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_direct_response_uses_same_relevance_and_dot_pipeline(monkeypatch):
+async def test_direct_response_does_not_report_an_unsubmitted_cover_letter(monkeypatch):
     import parsers.hh_applicant as applicant
 
     async def fake_generate(*args, **kwargs):
@@ -217,7 +217,7 @@ async def test_direct_response_uses_same_relevance_and_dot_pipeline(monkeypatch)
             send_cover_letter=False,
         )
         assert status == "APPLIED_DIRECT"
-        assert letter == "."
+        assert letter is None
     finally:
         await browser.close()
         await playwright.stop()

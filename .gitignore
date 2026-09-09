@@ -45,3 +45,7 @@ Thumbs.db
 scratch/
 *.png
 
+# Frontend dependencies and generated bundle
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo

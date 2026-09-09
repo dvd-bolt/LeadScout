@@ -17,7 +17,7 @@ from database import (
     update_user_session,
 )
 from parsers.hh_browser import HHBrowserEngine
-from utils.humanization import human_click, human_type, human_type_digits
+from utils.humanization import HumanizationError, human_click, human_type, human_type_digits
 from utils.security import SessionSecurityManager
 
 logger = logging.getLogger(__name__)
@@ -104,7 +104,12 @@ class HHLoginSession:
                 await self.abort()
                 return {"status": "ERROR", "message": "Не найдено поле ввода логина. Проверьте адрес входа hh.ru."}
 
-            await human_type(self.page, login_input, text_to_type)
+            await human_type(
+                self.page,
+                login_input,
+                text_to_type,
+                value_mode="exact" if is_email else "digits",
+            )
             await asyncio.sleep(0.5)
 
             # 4. Нажатие кнопки продолжить / запросить код
@@ -252,68 +257,100 @@ class HHLoginSession:
             self.otp_code = code.strip()
             logger.info("Пользователь %d: ввод полученного СМС-кода...", self.user_id)
 
-            # Поиск поля ввода OTP кода
-            otp_input = self.page.locator('[data-qa="otp-code-input"], input[name="code"], input[autocomplete="one-time-code"]').first
-            if await otp_input.count() > 0:
-                await human_type_digits(self.page, otp_input, self.otp_code)
-                await asyncio.sleep(0.5)
-            else:
-                # Посимвольный ввод в ячейки формы авторизации если несколько полей
-                inputs = await self.page.locator('form input[type="text"], form input[type="number"], [data-qa*="otp"] input').all()
-                if len(inputs) >= len(self.otp_code):
-                    for idx, digit in enumerate(self.otp_code):
-                        await human_type_digits(self.page, inputs[idx], digit)
-                else:
-                    await human_type_digits(self.page, self.page.keyboard, self.otp_code)
-
-            # Плавный клик подтверждения если есть кнопка
-            confirm_btn = self.page.locator('[data-qa="otp-code-submit"], button[type="submit"]').first
-            if await confirm_btn.is_visible():
-                await human_click(self.page, confirm_btn)
-
-            await asyncio.sleep(3.0)
-
-            # URL сам по себе недостаточен: ждем элемент авторизованного профиля.
-            authenticated = self.page.locator(
-                '[data-qa="mainmenu_myResumes"], [data-qa="mainmenu_vacancyResponses"], '
-                'a[href*="/applicant/resumes"]'
+            otp_target = self.page.locator(
+                '[data-qa="otp-code-input"], input[name="code"], input[autocomplete="one-time-code"]'
+            )
+            otp_form_input = self.page.locator(
+                '[data-qa*="otp"] input, input[autocomplete="one-time-code"], '
+                'form input[name*="code" i], form input[type="number"]'
             ).first
             try:
-                await authenticated.wait_for(state="visible", timeout=5000)
-                is_authenticated = "account/login" not in self.page.url
-            except Exception:
-                is_authenticated = False
-
-            if is_authenticated:
-                logger.info("Пользователь %d: успешная авторизация на hh.ru!", self.user_id)
-                storage_state = await self.context.storage_state()
-                
-                sec_mgr = SessionSecurityManager()
-                encrypted_state = sec_mgr.encrypt_storage_state(storage_state)
-                
-                if self.account_id:
-                    updated = await update_account_session(
-                        self.user_id,
-                        self.account_id,
-                        encrypted_state,
-                        status="ACTIVE",
-                    )
-                    if not updated:
-                        await self.cleanup()
-                        return {"status": "ERROR", "message": "Аккаунт для сохранения сессии не найден."}
+                await otp_form_input.wait_for(state="visible", timeout=10_000)
+            except Exception as exc:
+                raise HumanizationError("otp", "target_not_ready") from exc
+            cells = await self._otp_cells(self.otp_code)
+            try:
+                if cells:
+                    await human_type_digits(self.page, cells, self.otp_code)
+                elif await otp_target.count() == 1:
+                    await human_type_digits(self.page, otp_target.first, self.otp_code)
                 else:
-                    await update_user_session(self.user_id, encrypted_state, status="ACTIVE")
-                await self.cleanup()
-                return {"status": "SUCCESS"}
-            else:
-                logger.warning("Пользователь %d: неверный СМС-код или ошибка подтверждения.", self.user_id)
-                await self.abort()
-                return {"status": "INVALID_CODE", "message": "Неверный СМС-код. Попробуйте еще раз через меню авторизации."}
+                    raise HumanizationError("otp", "ambiguous_fields")
+            except HumanizationError:
+                # The last character can trigger a navigation that detaches the
+                # input. It is successful only with a positive auth marker.
+                if not await self._is_authenticated(timeout=2_000):
+                    raise
+
+            if not await self._is_authenticated(timeout=1_500):
+                confirm_btn = self.page.locator('[data-qa="otp-code-submit"], button[type="submit"]').first
+                if await confirm_btn.count() == 0:
+                    raise HumanizationError("otp", "confirm_not_ready")
+                await human_click(self.page, confirm_btn)
+
+            if await self._is_authenticated(timeout=5_000):
+                return await self._finish_authenticated_login()
+
+            logger.warning("Пользователь %d: неверный СМС-код или ошибка подтверждения.", self.user_id)
+            await self.abort()
+            return {"status": "INVALID_CODE", "message": "Неверный СМС-код. Попробуйте еще раз через меню авторизации."}
 
         except Exception as e:
             logger.error("Пользователь %d: ошибка при вводе СМС-кода: %s", self.user_id, type(e).__name__)
             await self.abort()
             return {"status": "ERROR", "message": "Не удалось подтвердить код hh.ru."}
+
+    async def _otp_cells(self, code: str) -> list:
+        """Return a complete, visible set of one-character OTP inputs only."""
+        if not self.page:
+            return []
+        candidates = self.page.locator(
+            '[data-qa*="otp"] input, input[autocomplete="one-time-code"], '
+            'form input[name*="code" i], form input[type="number"]'
+        )
+        cells = []
+        for index in range(await candidates.count()):
+            candidate = candidates.nth(index)
+            if not await candidate.is_visible():
+                continue
+            if await candidate.get_attribute("maxlength") == "1":
+                cells.append(candidate)
+        return cells if len(cells) == len(code) else []
+
+    async def _is_authenticated(self, *, timeout: int) -> bool:
+        if not self.page:
+            return False
+        authenticated = self.page.locator(
+            '[data-qa="mainmenu_myResumes"], [data-qa="mainmenu_vacancyResponses"], '
+            'a[href*="/applicant/resumes"]'
+        ).first
+        try:
+            await authenticated.wait_for(state="visible", timeout=timeout)
+            return "account/login" not in self.page.url
+        except Exception:
+            return False
+
+    async def _finish_authenticated_login(self) -> dict[str, Any]:
+        """Persist a positively verified hh.ru session exactly once."""
+        if not self.context:
+            return {"status": "ERROR", "message": "Контекст браузера уже закрыт."}
+        logger.info("Пользователь %d: успешная авторизация на hh.ru!", self.user_id)
+        storage_state = await self.context.storage_state()
+        encrypted_state = SessionSecurityManager().encrypt_storage_state(storage_state)
+        if self.account_id:
+            updated = await update_account_session(
+                self.user_id,
+                self.account_id,
+                encrypted_state,
+                status="ACTIVE",
+            )
+            if not updated:
+                await self.cleanup()
+                return {"status": "ERROR", "message": "Аккаунт для сохранения сессии не найден."}
+        else:
+            await update_user_session(self.user_id, encrypted_state, status="ACTIVE")
+        await self.cleanup()
+        return {"status": "SUCCESS"}
 
     async def abort(self) -> None:
         """Close browser resources and remove an unfinished account row."""

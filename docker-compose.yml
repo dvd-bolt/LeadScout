@@ -1,0 +1,50 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DB_PATH: /app/data/leadscout.db
+      WEB_SECURE_COOKIES: "true"
+    volumes:
+      - leadscout-data:/app/data
+      - leadscout-backups:/app/backups
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+
+  backup:
+    build: .
+    restart: unless-stopped
+    command: ["sh", "-c", "python backup.py; while true; do sleep 86400; python backup.py; done"]
+    env_file: .env
+    environment:
+      DB_PATH: /app/data/leadscout.db
+      BACKUP_DIR: /app/backups
+    volumes:
+      - leadscout-data:/app/data:ro
+      - leadscout-backups:/app/backups
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  leadscout-data:
+  leadscout-backups:
+  caddy-data:
+  caddy-config:

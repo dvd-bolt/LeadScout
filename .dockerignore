@@ -1,0 +1,11 @@
+.git
+.venv
+.pytest_cache
+.ruff_cache
+__pycache__
+browser_profiles
+leadscout.db*
+.env
+web/node_modules
+web/dist
+scratch

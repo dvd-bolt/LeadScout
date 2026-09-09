@@ -9,7 +9,13 @@ from urllib.parse import urlsplit
 from patchright.async_api import Locator, Page
 
 from ai_handler import FormAnswer, JobApplicationPayload, QuestionField, generate_hh_job_application
-from utils.humanization import human_click, human_scroll, human_type
+from utils.humanization import (
+    DEFAULT_TRANSITION_TIMEOUT_MS,
+    HumanizationError,
+    human_click,
+    human_scroll,
+    human_type,
+)
 from utils.validation import normalize_hh_vacancy_url
 
 logger = logging.getLogger(__name__)
@@ -25,7 +31,8 @@ DATA_QA = {
         '[data-qa*="letter-toggle"]'
     ),
     "letter_input": (
-        '[data-qa="vacancy-response-popup-form-letter-input"], textarea[name="message"], textarea'
+        '[data-qa="vacancy-response-popup-form-letter-input"], '
+        'textarea[name="message"], [data-qa*="response"] textarea[name="letter"]'
     ),
     "submit": (
         '[data-qa="vacancy-response-submit-popup"], [data-qa="response-submit-popup"], '
@@ -67,20 +74,41 @@ async def _is_visible(locator: Locator) -> bool:
     return await locator.count() > 0 and await locator.is_visible()
 
 
-async def handle_resume_selection_if_needed(page: Page, target_resume_title: str | None = None) -> None:
+async def handle_resume_selection_if_needed(page: Page, target_resume_id: str | None = None) -> bool:
+    """Select only the recorded hh.ru resume ID; order and title are unsafe fallbacks."""
     selector = page.locator(DATA_QA["resume_selector"]).first
     if not await _is_visible(selector):
-        return
-    if target_resume_title:
-        exact = selector.get_by_text(target_resume_title, exact=True).first
-        if await _is_visible(exact):
-            await human_click(page, exact)
-            await asyncio.sleep(0.4)
-            return
-    first = selector.locator('input[type="radio"], label, option').first
-    if await first.count() > 0:
-        await human_click(page, first)
+        return True
+    if not target_resume_id:
+        return False
+    candidates = selector.locator('input[type="radio"], option, label, a[href*="/resume/"]')
+    for index in range(await candidates.count()):
+        candidate = candidates.nth(index)
+        attributes = await candidate.evaluate(
+            """element => [
+                element.value, element.id, element.htmlFor, element.href,
+                element.dataset.resumeId, element.getAttribute('data-resume-id'),
+                element.getAttribute('data-qa')
+            ].filter(Boolean).join(' ')"""
+        )
+        if target_resume_id not in str(attributes):
+            continue
+        await human_click(page, candidate)
+        selected = await candidate.evaluate(
+            """element => {
+                const control = element.matches('input[type=radio], input[type=checkbox]')
+                    ? element
+                    : element.querySelector('input[type=radio], input[type=checkbox]')
+                        || (element.tagName === 'LABEL' ? element.control : null);
+                if (control) return control.checked;
+                return element.tagName === 'OPTION' ? element.selected : true;
+            }"""
+        )
+        if not selected:
+            return False
         await asyncio.sleep(0.4)
+        return True
+    return False
 
 
 async def extract_questionnaire_fields(page: Page) -> list[QuestionField]:
@@ -148,11 +176,26 @@ async def fill_questionnaire_form(page: Page, answers: list[dict | FormAnswer]) 
                     continue
                 await human_type(page, input_locator, answer.value)
             else:
-                option = container.get_by_text(answer.value, exact=True).first
-                if not await _is_visible(option):
+                input_locator = None
+                labels = container.locator("label")
+                for label_index in range(await labels.count()):
+                    label = labels.nth(label_index)
+                    if ((await label.text_content()) or "").strip() == answer.value:
+                        candidate = label.locator('input[type="radio"], input[type="checkbox"]').first
+                        if await candidate.count() > 0:
+                            await human_click(page, label)
+                            input_locator = candidate
+                            break
+                if input_locator is None:
+                    inputs = container.locator('input[type="radio"], input[type="checkbox"]')
+                    for input_index in range(await inputs.count()):
+                        candidate = inputs.nth(input_index)
+                        if await candidate.get_attribute("value") == answer.value:
+                            await human_click(page, candidate)
+                            input_locator = candidate
+                            break
+                if input_locator is None or not await input_locator.is_checked():
                     all_filled = False
-                    continue
-                await human_click(page, option)
         except Exception as exc:
             logger.warning("Question field %s could not be filled: %s", answer.field_id, type(exc).__name__)
             all_filled = False
@@ -199,14 +242,23 @@ async def verify_hh_application_success(page: Page) -> bool:
     return False
 
 
-async def _open_letter_and_fill(page: Page, cover_letter: str) -> None:
+async def _open_letter_and_fill(page: Page, cover_letter: str) -> bool:
     toggle = page.locator(DATA_QA["letter_toggle"]).first
     if await _is_visible(toggle):
         await human_click(page, toggle)
-        await page.wait_for_timeout(500)
     input_locator = page.locator(DATA_QA["letter_input"]).first
-    if await _is_visible(input_locator):
+    try:
+        await input_locator.wait_for(state="visible", timeout=DEFAULT_TRANSITION_TIMEOUT_MS)
+        if await input_locator.locator(
+            "xpath=ancestor::*[@data-qa='general-form-element']"
+        ).count() > 0:
+            return False
         await human_type(page, input_locator, cover_letter)
+        return True
+    except HumanizationError:
+        return False
+    except Exception:
+        return False
 
 
 async def _submit_response_form(page: Page) -> bool:
@@ -218,9 +270,12 @@ async def _submit_response_form(page: Page) -> bool:
         label = ((await candidate.text_content()) or "").strip().lower()
         if label and not any(word in label for word in ("отклик", "отправ", "продолж")):
             continue
-        await human_click(page, candidate)
-        await page.wait_for_timeout(1800)
-        return True
+        try:
+            await human_click(page, candidate)
+            await page.wait_for_timeout(1800)
+            return True
+        except HumanizationError:
+            return False
     return False
 
 
@@ -233,7 +288,7 @@ async def apply_to_hh_vacancy(
     page: Page,
     resume_context: str,
     vacancy_url: str,
-    target_resume_title: str | None = None,
+    target_resume_id: str | None = None,
     send_cover_letter: bool = True,
     stop_words: list[str] | None = None,
 ) -> tuple[str, str | None, dict | None]:
@@ -275,9 +330,10 @@ async def apply_to_hh_vacancy(
         if not await _is_hh_location(page.url):
             return "SKIPPED_EXTERNAL", None, {**vacancy, "external_url": page.url}
         if await verify_hh_application_success(page):
-            return "APPLIED_DIRECT", payload.cover_letter, vacancy
+            return "APPLIED_DIRECT", None, vacancy
 
-        await handle_resume_selection_if_needed(page, target_resume_title)
+        if not await handle_resume_selection_if_needed(page, target_resume_id):
+            return "ERROR_RESUME_SELECTION", None, vacancy
         questions = await extract_questionnaire_fields(page)
         if questions:
             payload = await generate_hh_job_application(
@@ -308,7 +364,8 @@ async def apply_to_hh_vacancy(
                 "ai_payload": payload.model_dump(),
             }
 
-        await _open_letter_and_fill(page, payload.cover_letter)
+        if not await _open_letter_and_fill(page, payload.cover_letter):
+            return "ERROR_LETTER_FIELD", None, vacancy
         if not await _submit_response_form(page):
             return "ERROR_SUBMIT_BUTTON", None, vacancy
         if not await verify_hh_application_success(page):
@@ -324,7 +381,7 @@ async def submit_approved_questionnaire(
     vacancy_url: str,
     cover_letter: str,
     answers: list[dict] | None = None,
-    target_resume_title: str | None = None,
+    target_resume_id: str | None = None,
 ) -> tuple[bool, str]:
     try:
         normalized_url = normalize_hh_vacancy_url(vacancy_url)
@@ -341,10 +398,12 @@ async def submit_approved_questionnaire(
         await page.wait_for_timeout(1200)
         if not await _is_hh_location(page.url):
             return False, "Вакансия перенаправляет на внешний сайт."
-        await handle_resume_selection_if_needed(page, target_resume_title)
+        if not await handle_resume_selection_if_needed(page, target_resume_id):
+            return False, "Выбранное резюме не найдено в форме отклика."
         if answers and not await fill_questionnaire_form(page, answers):
             return False, "Не удалось заполнить все поля анкеты."
-        await _open_letter_and_fill(page, cover_letter)
+        if not await _open_letter_and_fill(page, cover_letter):
+            return False, "Поле сопроводительного письма не появилось или не заполнилось."
         if not await _submit_response_form(page):
             return False, "Кнопка отправки анкеты не найдена."
         if not await verify_hh_application_success(page):

@@ -17,6 +17,7 @@ from database import (
     claim_pending_questionnaire,
     finish_pending_questionnaire,
     get_account_for_user,
+    get_active_resume_snapshot,
     get_user_accounts,
     is_account_already_applied,
     record_application_event,
@@ -25,7 +26,7 @@ from database import (
     update_account_session,
     update_account_settings_for_user,
 )
-from keyboards import get_questionnaire_confirmation_keyboard
+from keyboards import get_mini_app_keyboard, get_questionnaire_confirmation_keyboard
 from parsers.hh_applicant import apply_to_hh_vacancy, submit_approved_questionnaire
 from parsers.hh_browser import SharedBrowserPool
 from utils.security import SessionDecryptionError, SessionSecurityManager
@@ -148,7 +149,10 @@ class TaskCoordinator:
             return {"status": "SKIPPED_STOPPED"}
         if account.get("applied_today", 0) >= account.get("daily_limit", 50):
             return {"status": "SKIPPED_LIMIT"}
-        if not account.get("resume_text", "").strip() or not account.get("active_resume_title", "").strip():
+        if (
+            not account.get("resume_text", "").strip()
+            or not account.get("active_resume_hh_id", "").strip()
+        ):
             await update_account_settings_for_user(
                 user_id, account_id, auto_apply_enabled=0
             )
@@ -199,7 +203,7 @@ class TaskCoordinator:
                             page=page,
                             resume_context=current["resume_text"],
                             vacancy_url=vacancy_url,
-                            target_resume_title=current["active_resume_title"],
+                            target_resume_id=current["active_resume_hh_id"],
                             send_cover_letter=bool(current.get("send_cover_letter", 1)),
                             stop_words=stop_words,
                         )
@@ -237,6 +241,7 @@ class TaskCoordinator:
                             cover_letter or "",
                             details.get("questions", []),
                             details.get("ai_payload", {}),
+                            await get_active_resume_snapshot(user_id, account_id),
                         )
                         await self._notify_questionnaire(user_id, apply_id, name, vacancy_url, title, details)
                     elif status != "ALREADY_APPLIED":
@@ -259,7 +264,7 @@ class TaskCoordinator:
                         user_id,
                         account_id,
                         security.encrypt_storage_state(new_state),
-                        "ACTIVE",
+                        None,
                     )
                 except Exception as exc:
                     logger.warning("Could not persist session for account %d: %s", account_id, type(exc).__name__)
@@ -331,10 +336,18 @@ class TaskCoordinator:
         return found
 
     async def _submit_questionnaire_guarded(self, user_id: int, item: dict) -> dict:
-        account_id = item["account_id"]
-        async with self._account_locks[account_id]:
-            async with await self._browser_slot():
-                return await self._submit_questionnaire(user_id, item)
+        try:
+            account_id = item["account_id"]
+            async with self._account_locks[account_id]:
+                async with await self._browser_slot():
+                    return await self._submit_questionnaire(user_id, item)
+        except asyncio.CancelledError:
+            await finish_pending_questionnaire(user_id, item["id"], "FAILED", "Отправка отменена")
+            raise
+        except Exception as exc:
+            logger.error("Questionnaire %d could not start: %s", item["id"], type(exc).__name__)
+            await finish_pending_questionnaire(user_id, item["id"], "FAILED", "Не удалось запустить браузер")
+            return {"status": "ERROR"}
 
     async def _submit_questionnaire(self, user_id: int, item: dict) -> dict:
         apply_id = item["id"]
@@ -342,6 +355,14 @@ class TaskCoordinator:
         if not account or not account.get("encrypted_storage_state"):
             await finish_pending_questionnaire(user_id, apply_id, "FAILED", "Сессия аккаунта не найдена")
             return {"status": "NO_SESSION"}
+        if account.get("applied_today", 0) >= account.get("daily_limit", 50):
+            await finish_pending_questionnaire(user_id, apply_id, "FAILED", "Дневной лимит откликов исчерпан")
+            return {"status": "DAILY_LIMIT"}
+        if not item.get("resume_hh_id"):
+            await finish_pending_questionnaire(
+                user_id, apply_id, "NEEDS_REVIEW", "Не зафиксировано резюме для этой анкеты"
+            )
+            return {"status": "MISSING_RESUME"}
         security = SessionSecurityManager()
         try:
             state = security.decrypt_storage_state(account["encrypted_storage_state"])
@@ -365,14 +386,14 @@ class TaskCoordinator:
                 item["vacancy_url"],
                 item.get("cover_letter", ""),
                 answers,
-                account.get("active_resume_title") or None,
+                item.get("resume_hh_id"),
             )
             await page.close()
             if not success:
                 await finish_pending_questionnaire(user_id, apply_id, "FAILED", message)
                 await self._notify(user_id, f"Не удалось отправить анкету: {escape_html(message)}")
                 return {"status": "ERROR"}
-            await record_successful_application(
+            recorded, _ = await record_successful_application(
                 user_id,
                 account["id"],
                 item["vacancy_url"],
@@ -380,6 +401,14 @@ class TaskCoordinator:
                 "APPLIED_WITH_QUESTIONNAIRE",
                 item.get("vacancy_title", ""),
             )
+            if not recorded and not await is_account_already_applied(user_id, account["id"], item["vacancy_url"]):
+                await finish_pending_questionnaire(
+                    user_id,
+                    apply_id,
+                    "NEEDS_REVIEW",
+                    "hh.ru подтвердил отклик, но запись локально не подтверждена",
+                )
+                return {"status": "NEEDS_REVIEW"}
             await finish_pending_questionnaire(user_id, apply_id, "SUBMITTED")
             await self._notify(
                 user_id,
@@ -402,7 +431,7 @@ class TaskCoordinator:
                         user_id,
                         account["id"],
                         security.encrypt_storage_state(new_state),
-                        "ACTIVE",
+                        None,
                     )
                 except Exception:
                     logger.warning("Could not persist questionnaire session for account %d", account["id"])
@@ -452,6 +481,7 @@ class TaskCoordinator:
             f'<a href="{escape_html(vacancy_url)}">{escape_html(title or "Вакансия")}</a>\n'
             f"Сегодня: <code>{count}/{limit}</code>",
             disable_web_page_preview=True,
+            reply_markup=get_mini_app_keyboard("applications"),
         )
 
     async def _notify_questionnaire(

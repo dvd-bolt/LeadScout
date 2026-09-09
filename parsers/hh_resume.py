@@ -25,7 +25,7 @@ from database import (
 )
 from parsers.hh_applicant import extract_vacancy_details
 from parsers.hh_browser import SharedBrowserPool
-from utils.humanization import human_click, human_type
+from utils.humanization import DEFAULT_TRANSITION_TIMEOUT_MS, HumanizationError, human_click, human_type
 from utils.security import SessionDecryptionError, SessionSecurityManager
 from utils.validation import normalize_hh_vacancy_url
 
@@ -88,6 +88,15 @@ async def _visible(locator: Locator) -> bool:
     return await locator.count() > 0 and await locator.is_visible()
 
 
+async def _wait_visible(locator: Locator, timeout: int = DEFAULT_TRANSITION_TIMEOUT_MS) -> bool:
+    """Wait for a next-step control instead of relying on a cosmetic pause."""
+    try:
+        await locator.wait_for(state="visible", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
 class HHResumeManager:
     @classmethod
     async def _account_and_state(cls, user_id: int, account_id: int) -> tuple[dict, dict] | tuple[None, None]:
@@ -106,7 +115,9 @@ class HHResumeManager:
         try:
             state = await context.storage_state()
             encrypted = SessionSecurityManager().encrypt_storage_state(state)
-            await update_account_session(user_id, account_id, encrypted, "ACTIVE")
+            # A preceding navigation can mark the session expired. Persist the
+            # cookies without reviving that status unless login was verified.
+            await update_account_session(user_id, account_id, encrypted, None)
         except Exception as exc:
             logger.warning("Could not persist resume browser session: %s", type(exc).__name__)
 
@@ -335,24 +346,27 @@ class HHResumeManager:
                 '[data-qa="professional-role-search-input"], [data-qa="resume-title-input"], '
                 'input[placeholder*="профессию"], input[placeholder*="Должность"]'
             ).first
-            if not await _visible(title_input):
+            if not await _wait_visible(title_input):
                 return {"status": "ERROR", "message": "hh.ru не показал поле профессии."}
             await human_type(page, title_input, resume.title)
             option = page.locator('[role="option"], [data-qa="professional-role-item"]').first
-            if await _visible(option):
-                await human_click(page, option)
-            if not await cls._click_continue(page):
-                return {"status": "ERROR", "message": "Не удалось сохранить профессию в мастере hh.ru."}
+            if not await _wait_visible(option):
+                return {"status": "ERROR", "message": "hh.ru не показал вариант профессии."}
+            await human_click(page, option)
 
             first_name = page.locator('[data-qa="resume-person-first-name"], input[name*="firstName"]').first
-            if await _visible(first_name) and not (await first_name.input_value()).strip():
+            if not await cls._click_continue(page, expected=first_name):
+                return {"status": "ERROR", "message": "Не удалось сохранить профессию в мастере hh.ru."}
+
+            if not (await first_name.input_value()).strip():
                 await human_type(page, first_name, resume.first_name)
             city = page.locator('[data-qa="resume-person-area"], input[placeholder*="Город"]').first
-            if await _visible(city) and not (await city.input_value()).strip():
+            if await _wait_visible(city) and not (await city.input_value()).strip():
                 await human_type(page, city, resume.city)
                 option = page.locator('[role="option"]').first
-                if await _visible(option):
-                    await human_click(page, option)
+                if not await _wait_visible(option):
+                    return {"status": "ERROR", "message": "hh.ru не показал вариант города."}
+                await human_click(page, option)
             try:
                 birth = date.fromisoformat(resume.birth_date)
             except ValueError:
@@ -361,17 +375,27 @@ class HHResumeManager:
                 (page.locator('[data-qa="resume-person-birth-day"], input[name*="birthDay"]').first, str(birth.day)),
                 (page.locator('[data-qa="resume-person-birth-year"], input[name*="birthYear"]').first, str(birth.year)),
             ):
-                if await _visible(locator) and not (await locator.input_value()).strip():
+                if await _wait_visible(locator) and not (await locator.input_value()).strip():
                     await human_type(page, locator, value)
             month = page.locator('[data-qa="resume-person-birth-month"], select[name*="birthMonth"]').first
-            if await _visible(month):
-                try:
-                    await month.select_option(index=birth.month)
-                except Exception:
-                    return {"status": "ERROR", "message": "Не удалось выбрать месяц рождения."}
-            await cls._click_continue(page)
+            if not await _wait_visible(month):
+                return {"status": "ERROR", "message": "hh.ru не показал поле месяца рождения."}
+            try:
+                await month.select_option(index=birth.month)
+            except Exception:
+                return {"status": "ERROR", "message": "Не удалось выбрать месяц рождения."}
+
+            experience_input = page.locator('input[placeholder*="Компания"], input[name*="company"]').first
+            institution = page.locator(
+                'input[placeholder*="заведение"], input[name*="institution"]'
+            ).first
+            skill_input = page.locator(
+                'input[placeholder*="навык"], input[placeholder*="Поиск"], input[name*="skill"]'
+            ).first
 
             if resume.experiences:
+                if not await cls._click_continue(page, expected=experience_input):
+                    return {"status": "ERROR", "message": "hh.ru не открыл шаг опыта работы."}
                 experience = resume.experiences[0]
                 fields = (
                     ('input[placeholder*="Компания"], input[name*="company"]', experience.company),
@@ -379,58 +403,65 @@ class HHResumeManager:
                     ('textarea[placeholder*="занимались"], textarea[name*="description"]', experience.description),
                 )
                 for selector, value in fields:
+                    if not value:
+                        continue
                     locator = page.locator(selector).first
-                    if value and await _visible(locator):
-                        await human_type(page, locator, value[:3000])
-                await cls._click_continue(page)
+                    if not await _wait_visible(locator):
+                        return {"status": "ERROR", "message": "hh.ru не показал обязательное поле опыта."}
+                    await human_type(page, locator, value[:3000])
+                next_step = institution if resume.education else skill_input
+                if not await cls._click_continue(page, expected=next_step):
+                    return {"status": "ERROR", "message": "hh.ru не открыл следующий шаг резюме."}
+            elif resume.education:
+                if not await cls._click_continue(page, expected=institution):
+                    return {"status": "ERROR", "message": "hh.ru не открыл шаг образования."}
+            elif not await cls._click_continue(page, expected=skill_input):
+                return {"status": "ERROR", "message": "hh.ru не открыл шаг навыков."}
 
             if resume.education:
                 education = resume.education[0]
-                institution = page.locator(
-                    'input[placeholder*="заведение"], input[name*="institution"]'
-                ).first
-                if education.institution and await _visible(institution):
+                if education.institution:
+                    if not await _wait_visible(institution):
+                        return {"status": "ERROR", "message": "hh.ru не показал поле образования."}
                     await human_type(page, institution, education.institution)
-                await cls._click_continue(page)
-
-            skill_input = page.locator(
-                'input[placeholder*="навык"], input[placeholder*="Поиск"], input[name*="skill"]'
-            ).first
-            if resume.skills and await _visible(skill_input):
+                if not await cls._click_continue(page, expected=skill_input):
+                    return {"status": "ERROR", "message": "hh.ru не открыл шаг навыков."}
+            if resume.skills:
                 for skill in resume.skills[:10]:
                     await human_type(page, skill_input, skill)
                     exact = page.get_by_text(skill, exact=True).first
-                    if await _visible(exact):
-                        await human_click(page, exact)
-                    else:
-                        await skill_input.press("Enter")
-            await cls._click_continue(page)
+                    if not await _wait_visible(exact):
+                        return {"status": "ERROR", "message": "hh.ru не подтвердил навык из подсказки."}
+                    await human_click(page, exact)
 
             publish = page.locator(
                 '[data-qa="resume-publish"], [data-qa="resume-save"], [data-qa="resume-submit"], '
                 'button:has-text("Опубликовать"), button:has-text("Сохранить и опубликовать")'
             ).first
-            if not await _visible(publish):
+            if not await cls._click_continue(page, expected=publish):
                 return {"status": "ERROR", "message": "Кнопка публикации резюме не найдена."}
             await human_click(page, publish)
-            await page.wait_for_timeout(2500)
             return {"status": "SUBMITTED"}
+        except HumanizationError:
+            return {"status": "ERROR", "message": "Мастер hh.ru не подтвердил действие в форме."}
         except Exception as exc:
             logger.error("Step-by-step resume wizard failed: %s", type(exc).__name__)
             return {"status": "ERROR", "message": "Мастер hh.ru остановился на обязательном поле."}
 
     @staticmethod
-    async def _click_continue(page: Page) -> bool:
+    async def _click_continue(page: Page, expected: Locator | None = None) -> bool:
         button = page.locator(
             '[data-qa="resume-submit"], [data-qa="professional-role-submit"], '
             'button:has-text("Сохранить и продолжить"), button:has-text("Продолжить"), '
             'button:has-text("Далее"), button[type="submit"]'
         ).first
-        if not await _visible(button):
+        if not await _wait_visible(button):
             return False
-        await human_click(page, button)
-        await page.wait_for_timeout(1500)
-        return True
+        try:
+            await human_click(page, button)
+        except HumanizationError:
+            return False
+        return expected is None or await _wait_visible(expected)
 
     @classmethod
     async def delete_resume_on_hh(
@@ -465,17 +496,16 @@ class HHResumeManager:
                 if await _visible(more):
                     await human_click(page, more)
                     delete_button = page.get_by_text("Удалить", exact=True).first
-            if not await _visible(delete_button):
+            if not await _wait_visible(delete_button):
                 return {"status": "ERROR", "message": "Кнопка удаления резюме не найдена."}
             await human_click(page, delete_button)
             confirm = page.locator(
                 '[data-qa="resume-delete-confirm"], [data-qa="confirm-delete"], '
                 '[role="dialog"] button:has-text("Удалить")'
             ).first
-            if not await _visible(confirm):
+            if not await _wait_visible(confirm):
                 return {"status": "ERROR", "message": "hh.ru не показал подтверждение удаления."}
             await human_click(page, confirm)
-            await page.wait_for_timeout(1800)
         except Exception as exc:
             logger.error("Resume deletion failed: %s", type(exc).__name__)
             return {"status": "ERROR", "message": "Не удалось удалить резюме на hh.ru."}
