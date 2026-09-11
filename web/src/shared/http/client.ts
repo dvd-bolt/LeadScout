@@ -3,7 +3,7 @@ import { telegram } from "../telegram/sdk";
 let csrfToken = "";
 
 export class ApiError extends Error {
-  constructor(message: string, public status: number) {
+  constructor(message: string, public status: number, public code = "") {
     super(message);
     this.name = "ApiError";
   }
@@ -23,7 +23,10 @@ export async function request<T>(path: string, options: RequestInit = {}): Promi
     const detail = typeof error.detail === "string" ? error.detail : Array.isArray(error.detail)
       ? error.detail.map((item: { loc?: string[]; msg?: string }) => `${item.loc?.slice(1).join(".") || "Поле"}: ${item.msg || "некорректное значение"}`).join("; ")
       : "Не удалось выполнить запрос";
-    throw new ApiError(detail, response.status);
+    const structured = error.detail && typeof error.detail === "object" && !Array.isArray(error.detail) ? error.detail as { message?: string; code?: string } : null;
+    const apiError = new ApiError(structured?.message || detail, response.status, structured?.code);
+    if (response.status === 401 || ["ACCESS_BLOCKED", "FORBIDDEN"].includes(apiError.code)) window.dispatchEvent(new CustomEvent("leadscout-access", { detail: apiError }));
+    throw apiError;
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;

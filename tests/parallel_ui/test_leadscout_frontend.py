@@ -145,6 +145,8 @@ class ContractApi:
         pending = sum(item["status"] in {"PENDING", "FAILED", "NEEDS_REVIEW"} for item in self.questionnaires.values())
         return {
             "user_id": 42,
+            "role": "USER",
+            "admin_capabilities": [],
             "csrf_token": "browser-csrf",
             "accounts": self.accounts,
             "active_account_id": self.active_id,

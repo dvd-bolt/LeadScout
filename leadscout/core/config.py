@@ -73,11 +73,12 @@ def _owner_telegram_ids() -> tuple[int, ...]:
         values = tuple(dict.fromkeys(int(value) for value in re.split(r"[,\s]+", raw)))
     except ValueError as exc:
         raise ConfigurationError("OWNER_TELEGRAM_IDS must contain positive integer IDs") from exc
-    if any(value <= 0 for value in values):
+    if any(value <= 0 or value > 2**63 - 1 for value in values):
         raise ConfigurationError("OWNER_TELEGRAM_IDS must contain positive integer IDs")
     return values
 
 
+ROOT_ADMIN_TELEGRAM_ID = _env_int("ROOT_ADMIN_TELEGRAM_ID", 0, 0, 2**63 - 1) or None
 OWNER_TELEGRAM_IDS = _owner_telegram_ids()
 # Legacy callers can still read the primary owner; authorization uses the full list.
 OWNER_TELEGRAM_ID = OWNER_TELEGRAM_IDS[0] if OWNER_TELEGRAM_IDS else None
@@ -131,8 +132,8 @@ def validate_runtime_config() -> None:
 def validate_web_runtime_config() -> None:
     """Validate settings needed only when the Mini App HTTP server is started."""
     validate_runtime_config()
-    if not OWNER_TELEGRAM_IDS:
-        raise ConfigurationError("OWNER_TELEGRAM_IDS (or OWNER_TELEGRAM_ID) is required for the Mini App")
+    if not ROOT_ADMIN_TELEGRAM_ID:
+        raise ConfigurationError("ROOT_ADMIN_TELEGRAM_ID is required for the Mini App")
     if not APP_URL.startswith("https://"):
         raise ConfigurationError("APP_URL must be an HTTPS URL")
     if not WEB_APP_ORIGINS:

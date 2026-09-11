@@ -1,6 +1,5 @@
 """Mono design: real React/API/SQLite, account counts and responsive interactions."""
 
-from dataclasses import replace
 from pathlib import Path
 
 from patchright.async_api import expect
@@ -33,7 +32,9 @@ async def test_active_review_count_is_exact_and_owner_scoped(audit_client, runti
     await db.set_active_account(42, second["id"])
     assert (await audit_client.get("/api/v1/me")).json()["active_pending_review_count"] == 1
     assert await db.count_pending_reviews(43, first["id"]) == 0
-    runtime_context.settings = replace(runtime_context.settings, owner_telegram_ids=(42, 43))
+    await runtime_context.admin.add_member(
+        42, {"telegram_id": "43", "role": "USER", "display_label": ""}, "test-add-43"
+    )
     await db.set_active_account(43, foreign["id"])
     import time
 
@@ -41,7 +42,8 @@ async def test_active_review_count_is_exact_and_owner_scoped(audit_client, runti
     audit_client.cookies.set(
         SESSION_COOKIE,
         sign_session(
-            {"user_id": 43, "csrf": "test", "expires_at": int(time.time()) + 600}, runtime_context.settings.bot_token
+            {"user_id": 43, "auth_version": 1, "csrf": "test", "expires_at": int(time.time()) + 600},
+            runtime_context.settings.bot_token,
         ),
     )
     response = await audit_client.get("/api/v1/me")

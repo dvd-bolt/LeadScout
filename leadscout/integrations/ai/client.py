@@ -30,6 +30,8 @@ class GeminiService:
         self.timeout_ms = config.GEMINI_TIMEOUT_MS if timeout_ms is None else timeout_ms
         self._client: genai.Client | None = None
         self._lock = asyncio.Lock()
+        self.monitor = None
+        self.diagnostics_store = None
 
     async def _get_client(self) -> genai.Client:
         if not self.api_key:
@@ -42,7 +44,27 @@ class GeminiService:
                 )
             return self._client
 
+    async def _observed(self, function, *args, **kwargs):
+        from leadscout.core.task_scope import checkpoint
+
+        await checkpoint()
+        try:
+            result = await function(*args, **kwargs)
+        except AIServiceError:
+            if self.monitor:
+                self.monitor.ai_result(False)
+                await self.diagnostics_store.error("ai", "AI_FAILED")
+            raise
+        if self.monitor:
+            self.monitor.ai_result(result is not False)
+            if result is False:
+                await self.diagnostics_store.error("ai", "AI_FAILED")
+        return result
+
     async def check_capability(self) -> bool:
+        return await self._observed(self._check_capability)
+
+    async def _check_capability(self) -> bool:
         try:
             client = await self._get_client()
             await client.aio.models.get(model=self.model)
@@ -51,7 +73,10 @@ class GeminiService:
             logger.warning("Gemini capability check failed: %s", _error_label(exc))
             return False
 
-    async def generate(
+    async def generate(self, contents, schema, **kwargs):
+        return await self._observed(self._generate, contents, schema, **kwargs)
+
+    async def _generate(
         self,
         contents: str,
         schema: type[T],
@@ -65,7 +90,10 @@ class GeminiService:
             response_schema=schema,
             system_instruction=system_instruction,
         )
+        from leadscout.core.task_scope import checkpoint
+
         for attempt in range(attempts):
+            await checkpoint()
             try:
                 response = await client.aio.models.generate_content(
                     model=self.model,

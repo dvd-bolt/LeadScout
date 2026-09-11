@@ -38,12 +38,10 @@ def decode_session(token: str, bot_token: str) -> dict:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Сессия Mini App истекла") from exc
 
 
-def validate_telegram_init_data(
+def verify_telegram_identity(
     init_data: str,
     *,
     bot_token: str,
-    owner_telegram_id: int | None = None,
-    owner_telegram_ids: tuple[int, ...] = (),
     max_age_seconds: int = 300,
 ) -> dict:
     try:
@@ -61,14 +59,21 @@ def validate_telegram_init_data(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Данные Telegram некорректны") from exc
     if abs(int(time.time()) - auth_date) > max_age_seconds:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Данные Telegram устарели; откройте приложение заново")
-    allowed_ids = owner_telegram_ids or ((owner_telegram_id,) if owner_telegram_id else ())
-    if user_id not in allowed_ids:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Этот личный кабинет недоступен для данного аккаунта")
     return {
         "id": user_id,
         "name": user.get("first_name") or "",
         "username": user.get("username") or "",
     }
+
+
+def validate_telegram_init_data(
+    init_data, *, bot_token, owner_telegram_id=None, owner_telegram_ids=(), max_age_seconds=300
+):
+    """Compatibility signature verifier; runtime access is resolved from the database."""
+    user = verify_telegram_identity(init_data, bot_token=bot_token, max_age_seconds=max_age_seconds)
+    if user["id"] not in (owner_telegram_ids or ((owner_telegram_id,) if owner_telegram_id else ())):
+        raise HTTPException(403, "Этот личный кабинет недоступен для данного аккаунта")
+    return user
 
 
 __all__ = ["SESSION_COOKIE", "decode_session", "sign_session", "validate_telegram_init_data"]

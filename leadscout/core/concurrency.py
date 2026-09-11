@@ -5,6 +5,8 @@ import inspect
 from collections import defaultdict
 from functools import wraps
 
+from .task_scope import checkpoint
+
 
 class AccountLock:
     def __init__(self):
@@ -43,6 +45,7 @@ def serialize_account(function):
         if account_id is None:
             return await function(self, *args, **kwargs)
         async with self.locks.account_locks[account_id]:
+            await checkpoint()
             return await function(self, *args, **kwargs)
 
     return wrapped
@@ -51,7 +54,13 @@ def serialize_account(function):
 def serialize_login(function):
     @wraps(function)
     async def wrapped(self, user_id, *args, **kwargs):
-        async with self.locks.login_locks[user_id]:
-            return await function(self, user_id, *args, **kwargs)
+        async def run():
+            async with self.locks.login_locks[user_id]:
+                await checkpoint()
+                return await function(self, user_id, *args, **kwargs)
+
+        if getattr(self, "monitor", None):
+            return await self.monitor.perform_login(self, user_id, function.__name__, run)
+        return await run()
 
     return wrapped

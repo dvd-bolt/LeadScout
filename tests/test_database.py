@@ -144,7 +144,7 @@ async def test_schema_version_and_foreign_keys(isolated_db):
     async with database.get_db_connection() as db:
         version = (await (await db.execute("PRAGMA user_version")).fetchone())[0]
         foreign_keys = (await (await db.execute("PRAGMA foreign_keys")).fetchone())[0]
-    assert version == 6
+    assert version == 7
     assert foreign_keys == 1
 
 
@@ -224,4 +224,4 @@ async def test_legacy_users_table_is_migrated(tmp_path, monkeypatch):
         columns = await database._table_columns(db, "users")
         version = (await (await db.execute("PRAGMA user_version")).fetchone())[0]
     assert {"applied_date", "active_account_id", "send_cover_letter"} <= columns
-    assert version == 6
+    assert version == 7

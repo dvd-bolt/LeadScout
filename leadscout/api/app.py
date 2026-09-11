@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from leadscout.core.access import AccessError
 from leadscout.runtime import AppContext, get_default_context
 
 from .routes import ROUTERS
@@ -19,6 +21,10 @@ def create_app(context: AppContext | None = None) -> FastAPI:
         redoc_url=None,
     )
     app.state.context = context
+
+    @app.exception_handler(AccessError)
+    async def access_error(request, exc):
+        return JSONResponse(status_code=exc.status, content={"detail": {"code": exc.code, "message": exc.message}})
 
     @app.get("/healthz")
     async def healthcheck() -> dict:

@@ -8,7 +8,9 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from leadscout.core.task_scope import checkpoint
 from leadscout.services import ServiceError
+from leadscout.services.access import admitted
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,8 @@ class OperationManager:
         self.resources: dict[tuple[int, str, str], tuple[str, asyncio.Task]] = {}
         self.lock = asyncio.Lock()
         self.accepting = True
+        self.monitor = None
+        self.access = None
 
     async def _run(
         self,
@@ -36,6 +40,7 @@ class OperationManager:
                 return
             if not self.accepting:
                 raise asyncio.CancelledError
+            await checkpoint()
             result = await job()
             if not isinstance(result, dict):
                 raise TypeError("Operation result must be a mapping")
@@ -80,12 +85,24 @@ class OperationManager:
                     error=result.get("message") or "Операция завершилась с ошибкой.",
                 )
 
+        operation = await self.db.get_operation_for_user(user_id, operation_id)
+        return {"status": operation["status"] if operation else "ERROR"}
+
+    async def cancel_persisted(self, user_id, operation_id):
+        operation = await self.db.get_operation_for_user(user_id, operation_id)
+        if operation and operation["status"] in {"PENDING", "RUNNING", "NEEDS_INPUT"}:
+            await self.db.complete_operation(
+                operation_id, user_id, error="Операция отменена. Проверьте результат перед повтором."
+            )
+
+    @admitted
     async def schedule(
         self,
         user_id: int,
         kind: str,
         job: Callable[[], Awaitable[dict]],
         resource: str | None = None,
+        account_id: int | None = None,
     ) -> dict:
         async with self.lock:
             if not self.accepting:
@@ -97,10 +114,19 @@ class OperationManager:
 
             operation_id = str(uuid.uuid4())
             await self.db.create_operation(operation_id, user_id, kind)
-            task = asyncio.create_task(
-                self._run(operation_id, user_id, job),
-                name=f"leadscout-{kind}-{operation_id}",
-            )
+            if self.monitor:
+                _, task = await self.monitor.start(
+                    user_id,
+                    kind,
+                    lambda: self._run(operation_id, user_id, job),
+                    account_id=account_id,
+                    source_id=operation_id,
+                    cleanup=lambda: self.cancel_persisted(user_id, operation_id),
+                )
+            else:
+                task = asyncio.create_task(
+                    self._run(operation_id, user_id, job), name=f"leadscout-{kind}-{operation_id}"
+                )
             self.tasks.add(task)
             task.add_done_callback(self._task_done)
             if key:

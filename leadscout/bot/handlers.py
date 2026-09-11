@@ -6,16 +6,31 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, Message
 
+from leadscout.core.access import AccessError
 from leadscout.runtime import AppContext
 
 from .keyboards import get_entry_keyboard, get_mini_app_keyboard, get_stop_keyboard
 
 
-def owner_only_factory(owner_id: int | None = None, *, owner_ids: tuple[int, ...] = ()):
+def owner_only_factory(owner_id: int | None = None, *, owner_ids: tuple[int, ...] = (), deny_notice=True):
     allowed_ids = owner_ids or ((owner_id,) if owner_id else ())
 
-    async def owner_only(event: Message | CallbackQuery) -> bool:
-        return bool(event.from_user and event.from_user.id in allowed_ids)
+    async def owner_only(event: Message | CallbackQuery, app_context: AppContext | None = None) -> bool:
+        if app_context is None:
+            return bool(event.from_user and event.from_user.id in allowed_ids)
+        if not event.from_user:
+            return False
+        try:
+            await app_context.access.require(event.from_user.id)
+            return True
+        except AccessError:
+            if not deny_notice:
+                return False
+            if isinstance(event, Message) and (event.text or "").split(" ")[0].split("@")[0] == "/start":
+                await event.answer("Доступ к LeadScout закрыт. Обратитесь к главному администратору.")
+            elif isinstance(event, CallbackQuery):
+                await event.answer("Доступ закрыт", show_alert=True)
+            return False
 
     return owner_only
 

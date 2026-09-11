@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import time
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from urllib.parse import urlencode, urlsplit
@@ -27,13 +29,20 @@ from utils.security import SessionSecurityManager
 
 @pytest_asyncio.fixture(autouse=True)
 async def runtime_context(tmp_path, monkeypatch):
+    from leadscout.core import config
+
+    monkeypatch.setattr(config, "ROOT_ADMIN_TELEGRAM_ID", 42)
+    monkeypatch.setattr(config, "OWNER_TELEGRAM_ID", 42)
+    monkeypatch.setattr(config, "OWNER_TELEGRAM_IDS", (42,))
     settings = replace(
         default_settings(),
         bot_token="123456:offline-test-token",
         owner_telegram_id=42,
+        root_admin_telegram_id=42,
         owner_telegram_ids=(),
         web_app_origins=("http://test",),
         web_secure_cookies=False,
+        web_dist_dir=Path(os.environ.get("LEADSCOUT_TEST_WEB_DIST", web_api.WEB_DIST_DIR)).resolve(),
     )
     test_key = Fernet.generate_key().decode()
     context = build_context(
@@ -63,6 +72,7 @@ async def audit_client(isolated_db, monkeypatch, runtime_context):
             web_api._sign_session(
                 {
                     "user_id": 42,
+                    "auth_version": 1,
                     "csrf": "test-csrf",
                     "expires_at": int(time.time()) + 600,
                 }
@@ -75,7 +85,7 @@ async def audit_client(isolated_db, monkeypatch, runtime_context):
 
 @pytest_asyncio.fixture
 async def mini_app(isolated_db, monkeypatch, runtime_context, request):
-    if not (web_api.WEB_DIST_DIR / "index.html").exists():
+    if not (runtime_context.settings.web_dist_dir / "index.html").exists():
         pytest.skip("Run npm ci && npm run build in web/ to verify the Mini App")
     runtime_context.settings = replace(runtime_context.settings, web_app_origins=("http://leadscout.test",))
     account = await database.create_hh_account(42, "ui@example.com", "Первый аккаунт")
@@ -116,7 +126,9 @@ async def mini_app(isolated_db, monkeypatch, runtime_context, request):
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=web_api.create_app()), base_url="http://leadscout.test"
     ) as client:
-        session_cookie = web_api._sign_session({"user_id": 42, "csrf": "ui-csrf", "expires_at": int(time.time()) + 600})
+        session_cookie = web_api._sign_session(
+            {"user_id": 42, "auth_version": 1, "csrf": "ui-csrf", "expires_at": int(time.time()) + 600}
+        )
         client.cookies.set(web_api.SESSION_COOKIE, session_cookie)
         client.headers.update({"Origin": "http://leadscout.test", "X-CSRF-Token": "ui-csrf"})
         async with async_playwright() as playwright:

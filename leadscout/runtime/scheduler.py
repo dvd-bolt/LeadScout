@@ -8,6 +8,8 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from leadscout.core.access import AccessError
+
 logger = logging.getLogger(__name__)
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 SEARCH_INTERVAL_MINUTES = 45
@@ -25,7 +27,15 @@ async def trigger_all_users_search(*, db, coordinator) -> None:
     next_run = datetime.now(MOSCOW_TZ) + timedelta(minutes=SEARCH_INTERVAL_MINUTES)
     await db.set_next_scheduled_search_at(next_run.isoformat())
     for account in accounts:
-        state = await coordinator.start_account(account["user_id"], account["id"])
+        try:
+            state = await coordinator.start_account(account["user_id"], account["id"])
+        except AccessError:
+            continue
+        except Exception:
+            if getattr(coordinator, "monitor", None):
+                await coordinator.monitor.store.error("scheduler", "SCHEDULER_FAILED", user_id=account["user_id"])
+            logger.exception("Scheduled task failed")
+            continue
         if state == "STARTED":
             logger.info("Scheduled auto-apply for account %d", account["id"])
 
@@ -54,6 +64,16 @@ def start_scheduler(coordinator, *, db) -> AsyncIOScheduler:
         misfire_grace_time=3600,
         replace_existing=True,
     )
+    if getattr(coordinator, "monitor", None):
+        scheduler.add_job(
+            coordinator.monitor.store.prune,
+            "cron",
+            hour=3,
+            minute=20,
+            id="admin_retention",
+            max_instances=1,
+            coalesce=True,
+        )
     scheduler.start()
     logger.info("APScheduler started in Europe/Moscow timezone")
     return scheduler

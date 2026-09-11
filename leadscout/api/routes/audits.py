@@ -52,7 +52,9 @@ async def create_audit(
         )
     except ServiceError as exc:
         raise service_http_error(exc) from exc
-    return await context.operations.schedule(user_id, "resume-audit", lambda: context.services.audits.run(source))
+    return await context.operations.schedule(
+        user_id, "resume-audit", lambda: context.services.audits.run(source), account_id=source.account_id
+    )
 
 
 @router.post("/pdf", status_code=status.HTTP_202_ACCEPTED)
@@ -78,7 +80,7 @@ async def create_pdf_audit(
         source = await context.services.audits.prepare(user_id, account_id=account_id, resume_text=resume_text)
         return await context.services.audits.run(source)
 
-    return await context.operations.schedule(user_id, "pdf-resume-audit", job)
+    return await context.operations.schedule(user_id, "pdf-resume-audit", job, account_id=account_id)
 
 
 @router.post("/{audit_id}/match", status_code=status.HTTP_202_ACCEPTED)
@@ -102,6 +104,7 @@ async def match_audit(
             vacancy_text=payload.vacancy_text,
             vacancy_url=payload.vacancy_url,
         ),
+        account_id=audit.get("account_id"),
     )
 
 

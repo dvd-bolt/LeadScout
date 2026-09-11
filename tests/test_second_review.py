@@ -46,14 +46,17 @@ async def test_login_cleanup_closes_engine_despite_context_error(runtime_context
         engine_factory=None,
         security_factory=runtime_context.security_factory,
     )
-    context = SimpleNamespace(close=AsyncMock(side_effect=RuntimeError("context failure")))
+    context = SimpleNamespace(close=AsyncMock(side_effect=[RuntimeError("context failure"), None]))
     engine = SimpleNamespace(close=AsyncMock())
     session.context, session.engine = context, engine
     with pytest.raises(ExceptionGroup):
         await session.cleanup()
     engine.close.assert_awaited_once()
+    assert session.context is context
+    assert session.engine is None
     await session.cleanup()
-    context.close.assert_awaited_once()
+    assert session.context is None
+    assert context.close.await_count == 2
     engine.close.assert_awaited_once()
 
 

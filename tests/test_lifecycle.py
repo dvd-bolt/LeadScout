@@ -145,7 +145,7 @@ async def test_scheduler_uses_moscow_single_instance_jobs(runtime_context):
     runtime_context.scheduler = scheduler
     assert str(scheduler.timezone) == "Europe/Moscow"
     jobs = {job.id: job for job in scheduler.get_jobs()}
-    assert set(jobs) == {"hh_auto_search", "daily_reset"}
+    assert set(jobs) == {"hh_auto_search", "daily_reset", "admin_retention"}
     assert all(job.max_instances == 1 and job.coalesce for job in jobs.values())
     assert jobs["hh_auto_search"].kwargs["db"] is runtime_context.db
     assert jobs["hh_auto_search"].kwargs["coordinator"] is runtime_context.coordinator

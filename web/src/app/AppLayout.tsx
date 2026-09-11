@@ -10,7 +10,9 @@ import { Icon, type IconName } from "../shared/ui/Icon";
 import styles from "./AppLayout.module.css";
 
 function NavItem({ to, label, icon, count = 0, end = false }: { to: string; label: string; icon: IconName; count?: number; end?: boolean }) {
-  return <NavLink to={to} end={end} aria-label={label} aria-description={count > 0 ? `${count} анкет требуют проверки` : undefined} className={({ isActive }) => `${styles.navLink} ${isActive ? styles.navLinkActive : ""}`}>
+  const location = useLocation();
+  const adminActive = to === "/settings" && location.pathname === "/admin";
+  return <NavLink to={to} end={end} aria-label={label} aria-description={count > 0 ? `${count} анкет требуют проверки` : undefined} className={({ isActive }) => `${styles.navLink} ${isActive || adminActive ? styles.navLinkActive : ""}`}>
     <span className={styles.navIcon}><Icon name={icon} size={28} /><Badge count={count} /></span><span>{label}</span>
   </NavLink>;
 }

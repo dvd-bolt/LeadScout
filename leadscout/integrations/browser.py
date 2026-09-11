@@ -86,10 +86,16 @@ class HHBrowserEngine:
                 self.slots.release()
 
         try:
+            from leadscout.core.task_scope import checkpoint
+
+            await checkpoint()
             await self.start()
             context = await self.browser.new_context(**options)
             context.on("close", release_slot)
             await context.route("**/*", intercept_network_traffic)
+            from leadscout.core.task_scope import register_resource
+
+            register_resource(context)
             return context
         except BaseException:
             try:

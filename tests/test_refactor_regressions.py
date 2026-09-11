@@ -167,6 +167,7 @@ async def test_api_real_coordinator_job_and_sqlite(isolated_db, monkeypatch, tmp
     settings = RuntimeSettings(
         bot_token="123456:offline-review",
         owner_telegram_id=42,
+        root_admin_telegram_id=42,
         web_app_origins=("http://review.test",),
         web_secure_cookies=False,
         web_session_ttl_sec=600,
@@ -186,6 +187,7 @@ async def test_api_real_coordinator_job_and_sqlite(isolated_db, monkeypatch, tmp
                 sign_session(
                     {
                         "user_id": 42,
+                        "auth_version": 1,
                         "csrf": "review-csrf",
                         "expires_at": int(time.time()) + 600,
                     },
@@ -216,9 +218,11 @@ async def test_api_real_coordinator_job_and_sqlite(isolated_db, monkeypatch, tmp
 
 
 @pytest.mark.parametrize("user_id", [42, 99])
-async def test_compact_bot_dispatch_enforces_owner_and_stops(user_id):
+async def test_compact_bot_dispatch_enforces_owner_and_stops(user_id, runtime_context):
     stop = AsyncMock(return_value={"account_ids": [1]})
-    context = SimpleNamespace(services=SimpleNamespace(automation=SimpleNamespace(stop_all=stop)))
+    context = SimpleNamespace(
+        access=runtime_context.access, services=SimpleNamespace(automation=SimpleNamespace(stop_all=stop))
+    )
     session = AsyncMock(return_value=True)
     bot = Bot(token="123456:offline-review", session=session)
     dispatcher = Dispatcher()
@@ -249,10 +253,11 @@ async def test_compact_bot_dispatch_enforces_owner_and_stops(user_id):
         await bot.session.close()
 
 
-async def test_legacy_confirm_callback_only_opens_owned_questionnaire():
+async def test_legacy_confirm_callback_only_opens_owned_questionnaire(runtime_context):
     confirm = AsyncMock()
     lookup = AsyncMock(return_value={"id": 7, "account_id": 3, "status": "PENDING"})
     context = SimpleNamespace(
+        access=runtime_context.access,
         services=SimpleNamespace(questionnaires=SimpleNamespace(confirm=confirm)),
         db=SimpleNamespace(get_pending_questionnaire_for_user=lookup),
         settings=SimpleNamespace(app_url="https://review.example/"),

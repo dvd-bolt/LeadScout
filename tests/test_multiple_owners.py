@@ -1,6 +1,5 @@
 """Both owners can enter; ownership and revocation still apply per request."""
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -38,7 +37,9 @@ async def test_bot_owner_filter_and_empty_allowlist():
 
 
 async def test_two_owners_login_isolation_and_revocation(runtime_context, signed_init_data):
-    runtime_context.settings = replace(runtime_context.settings, owner_telegram_ids=(42, 43))
+    await runtime_context.admin.add_member(
+        42, {"telegram_id": "43", "role": "ADMIN", "display_label": ""}, "test-add-43"
+    )
     db = runtime_context.db
     first = await db.create_hh_account(42, "first@example.com")
     second = await db.create_hh_account(43, "second@example.com")
@@ -61,7 +62,7 @@ async def test_two_owners_login_isolation_and_revocation(runtime_context, signed
             assert (
                 await client.patch(f"/api/v1/accounts/{own['id']}", headers=headers, json={"daily_limit": 11})
             ).status_code == 200
-        runtime_context.settings = replace(runtime_context.settings, owner_telegram_ids=(42,))
+        await runtime_context.admin.change_member(42, 43, {"expected_revision": 1}, "BLOCK", "test-block-43")
         assert (await client.get("/api/v1/me")).status_code == 403
         for outsider in (43, 99):
             assert (

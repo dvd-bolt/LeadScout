@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 
+from leadscout.core.access import capabilities
 from leadscout.runtime import AppContext
 from leadscout.services import ServiceError
 
@@ -24,6 +25,8 @@ async def me(
     account_id = active["id"] if active else None
     return {
         "user_id": user_id,
+        "role": session["role"],
+        "admin_capabilities": capabilities(session["role"]),
         "csrf_token": session["csrf"],
         "accounts": [public_account(item, context.coordinator, context.scheduler) for item in accounts],
         "active_account_id": account_id,

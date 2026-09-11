@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from leadscout.services.access import admitted
+
 from .common import _await, _Service
 from .errors import ServiceError
 
@@ -20,7 +22,10 @@ class AutomationService(_Service):
         if int(account.get("applied_today") or 0) >= int(account.get("daily_limit") or 50):
             raise ServiceError("LIMIT_REACHED", "Дневной лимит откликов уже исчерпан.")
 
+    @admitted
     async def start(self, user_id: int, account_id: int) -> dict:
+        if getattr(self, "access", None):
+            self.access.check_account_start(account_id)
         account = await self._account(user_id, account_id)
         self._validate(account)
         enabled = await _await(self.db.update_account_settings_for_user(user_id, account_id, auto_apply_enabled=1))

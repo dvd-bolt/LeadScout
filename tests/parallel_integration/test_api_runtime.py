@@ -119,7 +119,7 @@ class FakeAI:
 @pytest.fixture
 def api_context(tmp_path, isolated_db):
     return build_context(
-        db=database,
+        db=isolated_db,
         coordinator=FakeCoordinator(),
         login_manager=FakeLoginManager,
         resume_manager=FakeResumeManager,
@@ -127,6 +127,7 @@ def api_context(tmp_path, isolated_db):
         settings=RuntimeSettings(
             bot_token="123456:test-token",
             owner_telegram_id=42,
+            root_admin_telegram_id=42,
             web_app_origins=("http://test",),
             web_secure_cookies=False,
             web_session_ttl_sec=600,
@@ -145,7 +146,7 @@ async def client(api_context):
         current.cookies.set(
             SESSION_COOKIE,
             sign_session(
-                {"user_id": 42, "csrf": "csrf", "expires_at": int(time.time()) + 300},
+                {"user_id": 42, "auth_version": 1, "csrf": "csrf", "expires_at": int(time.time()) + 300},
                 api_context.settings.bot_token,
             ),
         )

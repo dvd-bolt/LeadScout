@@ -19,13 +19,17 @@ from leadscout.integrations.login import HHLoginManager
 from leadscout.integrations.resumes import HHResumeManager
 from leadscout.integrations.vacancies import HHVacancyManager
 from leadscout.services import Services, build_services
+from leadscout.services.access import AccessService
+from leadscout.services.admin import AdminService
 from leadscout.storage import Database
+from leadscout.storage.admin import AdminStore
 from leadscout.storage.facade import Storage
 from utils.security import SessionSecurityManager
 
 from .coordinator import TaskCoordinator
 from .dependencies import RuntimeJobDependencies
 from .operations import OperationManager
+from .task_registry import TaskRegistry
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +43,7 @@ class RuntimeSettings:
     web_dist_dir: Path
     app_url: str = ""
     owner_telegram_ids: tuple[int, ...] = ()
+    root_admin_telegram_id: int | None = None
 
     @property
     def allowed_owner_ids(self) -> tuple[int, ...]:
@@ -59,6 +64,10 @@ class AppContext:
     browser_pool: Any
     applications: Any
     security_factory: Any
+    access: Any = None
+    admin_store: Any = None
+    task_registry: Any = None
+    admin: Any = None
     scheduler: Any = None
     bot: Any = None
     dispatcher: Any = None
@@ -74,6 +83,7 @@ class AppContext:
 
 def default_settings() -> RuntimeSettings:
     return RuntimeSettings(
+        root_admin_telegram_id=config.ROOT_ADMIN_TELEGRAM_ID,
         bot_token=config.BOT_TOKEN,
         owner_telegram_id=config.OWNER_TELEGRAM_ID,
         owner_telegram_ids=config.OWNER_TELEGRAM_IDS,
@@ -158,7 +168,7 @@ def build_context(
         resume_manager=resume_manager,
         ai=ai,
     )
-    return AppContext(
+    context = AppContext(
         db=db,
         coordinator=coordinator,
         login_manager=login_manager,
@@ -172,6 +182,18 @@ def build_context(
         applications=applications,
         security_factory=security_factory,
     )
+
+    context.admin_store = AdminStore(db.database)
+    context.access = AccessService(context.admin_store)
+    context.task_registry = TaskRegistry(context.admin_store, context.access)
+    context.admin = AdminService(context.admin_store, context.access, context.task_registry, context)
+    for resource in (coordinator, context.operations, login_manager):
+        resource.monitor = context.task_registry
+        resource.access = context.access
+    services.automation.access = context.access
+    if hasattr(ai, "set_diagnostics"):
+        ai.set_diagnostics(context.task_registry, context.admin_store)
+    return context
 
 
 def build_default_context(*, settings=None) -> AppContext:

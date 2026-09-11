@@ -9,6 +9,7 @@ from aiogram import Bot
 
 from leadscout.core.concurrency import Coordination
 from leadscout.core.config import MAX_CONCURRENT_BROWSERS
+from leadscout.core.task_scope import checkpoint
 from leadscout.jobs import AccountSearchJob, QuestionnaireSubmissionJob
 from leadscout.notifications import (
     Notification,
@@ -21,6 +22,7 @@ from leadscout.notifications.formatters import (
     successful_application,
 )
 from leadscout.runtime.dependencies import RuntimeJobDependencies
+from leadscout.services.access import admitted
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,8 @@ class TaskCoordinator:
         self._search_job = AccountSearchJob(self._dependencies, self._notifier)
         self._questionnaire_job = QuestionnaireSubmissionJob(self._dependencies, self._notifier)
         self._shutting_down = False
+        self.monitor = None
+        self.access = None
 
     def configure_bot(self, bot: Bot) -> None:
         self.configure_notifier(TelegramNotifier(bot))
@@ -70,7 +74,10 @@ class TaskCoordinator:
         owner = self._questionnaire_owners.get(apply_id)
         return bool(task and not task.done() and owner and owner[0] == user_id)
 
+    @admitted
     async def start_account(self, user_id: int, account_id: int) -> str:
+        if self.access:
+            self.access.check_account_start(account_id)
         if self._shutting_down:
             return "SHUTTING_DOWN"
         account = await self._dependencies.get_account_for_user(user_id, account_id)
@@ -82,10 +89,14 @@ class TaskCoordinator:
             existing = self._account_tasks.get(account_id)
             if existing and not existing.done():
                 return "ALREADY_RUNNING"
-            task = asyncio.create_task(
-                self._run_account_guarded(user_id, account_id),
-                name=f"hh-account-{account_id}",
-            )
+            if self.monitor:
+                _, task = await self.monitor.start(
+                    user_id, "search", lambda: self._run_account_guarded(user_id, account_id), account_id=account_id
+                )
+            else:
+                task = asyncio.create_task(
+                    self._run_account_guarded(user_id, account_id), name=f"hh-account-{account_id}"
+                )
             self._account_tasks[account_id] = task
             self._account_task_users[account_id] = user_id
             task.add_done_callback(lambda completed, key=account_id: self._task_done("account", key, completed))
@@ -119,6 +130,7 @@ class TaskCoordinator:
                     self._questionnaire_owners.pop(apply_id, None)
         return True
 
+    @admitted
     async def start_questionnaire(self, user_id: int, apply_id: int, *, expected_revision: int) -> str:
         if self._shutting_down:
             return "SHUTTING_DOWN"
@@ -134,10 +146,19 @@ class TaskCoordinator:
             )
             if not item:
                 return "NOT_AVAILABLE"
-            task = asyncio.create_task(
-                self._submit_questionnaire_guarded(user_id, item),
-                name=f"hh-questionnaire-{apply_id}",
-            )
+            if self.monitor:
+                _, task = await self.monitor.start(
+                    user_id,
+                    "questionnaire",
+                    lambda: self._submit_questionnaire_guarded(user_id, item),
+                    account_id=item["account_id"],
+                    source_id=apply_id,
+                    cleanup=lambda: self._mark_interrupted_questionnaire(user_id, apply_id),
+                )
+            else:
+                task = asyncio.create_task(
+                    self._submit_questionnaire_guarded(user_id, item), name=f"hh-questionnaire-{apply_id}"
+                )
             self._questionnaire_tasks[apply_id] = task
             self._questionnaire_owners[apply_id] = (
                 user_id,
@@ -176,6 +197,7 @@ class TaskCoordinator:
 
     async def _run_account_guarded(self, user_id: int, account_id: int) -> dict:
         async with self._account_locks[account_id]:
+            await checkpoint()
             return await self._run_account(user_id, account_id)
 
     async def _run_account(self, user_id: int, account_id: int) -> dict:
@@ -185,6 +207,7 @@ class TaskCoordinator:
         try:
             account_id = item["account_id"]
             async with self._account_locks[account_id]:
+                await checkpoint()
                 return await self._submit_questionnaire(user_id, item)
         except asyncio.CancelledError:
             await self._mark_interrupted_questionnaire(user_id, item["id"])

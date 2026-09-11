@@ -54,6 +54,7 @@ scratch/
 # Versioned design references and verification screenshots
 !output/design-concepts/**/*.png
 !output/mono-verification/**/*.png
+!output/admin-verification/**/*.png
 
 # Frontend dependencies and generated bundle
 web/node_modules/

@@ -1,6 +1,7 @@
 """Route groups exported for application assembly."""
 
 from .accounts import router as accounts_router
+from .admin import router as admin_router
 from .applications import router as applications_router
 from .audits import router as audits_router
 from .auth import router as auth_router
@@ -11,6 +12,7 @@ from .questionnaires import router as questionnaires_router
 from .resumes import router as resumes_router
 
 ROUTERS = (
+    admin_router,
     auth_router,
     accounts_router,
     login_router,

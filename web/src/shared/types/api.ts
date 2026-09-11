@@ -32,6 +32,8 @@ export type Event = {
 };
 
 export type Dashboard = {
+  role: "ROOT" | "ADMIN" | "USER";
+  admin_capabilities: string[];
   user_id: number;
   csrf_token: string;
   accounts: Account[];

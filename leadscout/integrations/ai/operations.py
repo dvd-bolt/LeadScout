@@ -48,6 +48,10 @@ class AIIntegration:
         self.client = client if client is not None else GeminiService()
         self.cache = cache if cache is not None else AICache()
 
+    def set_diagnostics(self, monitor, store):
+        self.client.monitor = monitor
+        self.client.diagnostics_store = store
+
     async def generate_hh_job_application(
         self,
         resume_context: str,

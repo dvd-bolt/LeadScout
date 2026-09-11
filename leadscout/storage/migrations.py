@@ -7,10 +7,11 @@ import logging
 import aiosqlite
 
 from leadscout.core.identity import normalize_login
+from leadscout.storage.admin_schema import SCHEMA as ADMIN_SCHEMA
 from leadscout.storage.connection import Database
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 async def table_columns(connection: aiosqlite.Connection, table: str) -> set[str]:
@@ -59,7 +60,7 @@ async def normalized_accounts(connection: aiosqlite.Connection) -> list[tuple[st
 
 
 async def init_db(database: Database) -> None:
-    """Create or transactionally migrate a database to schema v6."""
+    """Create or transactionally migrate a database to schema v7."""
     async with database.connection() as connection:
         await connection.execute("PRAGMA synchronous=NORMAL")
         await connection.execute("PRAGMA temp_store=MEMORY")
@@ -70,6 +71,12 @@ async def init_db(database: Database) -> None:
             raise RuntimeError(f"Unsupported database schema v{version}; expected <= {SCHEMA_VERSION}")
         if version == SCHEMA_VERSION:
             await connection.commit()
+            return
+        if version == 6:
+            await execute_statements(connection, ADMIN_SCHEMA)
+            await connection.execute("PRAGMA user_version=7")
+            await connection.commit()
+            await connection.execute("PRAGMA journal_mode=WAL")
             return
         updates = await normalized_accounts(connection)
 
@@ -321,6 +328,8 @@ async def init_db(database: Database) -> None:
             PRAGMA user_version=6;
             """,
         )
+        await execute_statements(connection, ADMIN_SCHEMA)
+        await connection.execute("PRAGMA user_version=7")
         await connection.commit()
         await connection.execute("PRAGMA journal_mode=WAL")
     logger.info("SQLite schema v%s initialized: %s", SCHEMA_VERSION, database.path)

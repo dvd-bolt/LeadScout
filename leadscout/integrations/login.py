@@ -389,13 +389,14 @@ class HHLoginSession:
     async def cleanup(self):
         """Close each owned resource, even if closing another one fails."""
         self.is_done = True
-        context, engine = self.context, self.engine
-        self.context = self.engine = self.page = None
+        self.page = None
         errors = []
-        for resource in (context, engine):
+        for name in ("context", "engine"):
+            resource = getattr(self, name)
             if resource is not None:
                 try:
                     await resource.close()
+                    setattr(self, name, None)
                 except Exception as exc:
                     errors.append(exc)
         if errors:
@@ -412,6 +413,8 @@ class HHLoginManager:
         self.locks = locks
         self.stop_account = stop_account
         self.session_factory = HHLoginSession
+        self.monitor = None
+        self.access = None
         self._sessions: dict[int, HHLoginSession] = {}
         self._cleanup_tasks: dict[int, asyncio.Task] = {}
 
@@ -424,6 +427,11 @@ class HHLoginManager:
                 logger.info("Closing inactive login session for user %d", user_id)
                 await session.abort()
                 self._sessions.pop(user_id, None)
+                if self.monitor:
+                    task_id = self.monitor.login_ids.pop(user_id, None)
+                    if task_id:
+                        await self.monitor.store.task_state(task_id, "INTERRUPTED", "INTERRUPTED")
+                        self.monitor.live.pop(task_id, None)
             if self._cleanup_tasks.get(user_id) is asyncio.current_task():
                 self._cleanup_tasks.pop(user_id, None)
 
@@ -512,6 +520,22 @@ class HHLoginManager:
         session = self._sessions.pop(user_id, None)
         if session:
             await session.abort()
+
+    def login_account_id(self, user_id: int):
+        session = self._sessions.get(user_id)
+        return session.account_id if session else None
+
+    async def close_user(self, user_id: int) -> None:
+        """Administrative cleanup preserves the account and retains failed resources for retry."""
+        async with self.locks.login_locks[user_id]:
+            timer = self._cleanup_tasks.pop(user_id, None)
+            if timer and timer is not asyncio.current_task():
+                timer.cancel()
+                await asyncio.gather(timer, return_exceptions=True)
+            session = self._sessions.get(user_id)
+            if session:
+                await session.cleanup()
+                self._sessions.pop(user_id, None)
 
     async def shutdown(self) -> None:
         timers = list(self._cleanup_tasks.values())

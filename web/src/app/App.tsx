@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { HashRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
+import { AdminPage } from "../pages/AdminPage";
 import { ApplicationsPage } from "../pages/ApplicationsPage";
 import { HomePage } from "../pages/HomePage";
 import { ResumesPage } from "../pages/ResumesPage";
@@ -107,23 +108,52 @@ function DirectLinkController({ dashboard }: { dashboard: Dashboard }) {
 }
 
 function Root() {
+  const client = useQueryClient();
+  const navigate = useNavigate();
+  const [accessError, setAccessError] = useState<ApiError | null>(null);
+  const entered = useRef(false);
+  const authAttempted = useRef(false);
+  useEffect(() => {
+    const revoked = (event: Event) => {
+      const error = (event as CustomEvent<ApiError>).detail;
+      if (error.code === "FORBIDDEN") {
+        void client.cancelQueries({ queryKey: ["admin"] });
+        client.removeQueries({ queryKey: ["admin"] });
+        navigate("/settings", { replace: true });
+        void client.invalidateQueries({ queryKey: ["dashboard"] });
+      } else if (error.status === 403 || entered.current) {
+        setAccessError(error);
+        setCsrfToken("");
+        void client.cancelQueries();
+        client.clear();
+      }
+    };
+    window.addEventListener("leadscout-access", revoked);
+    return () => window.removeEventListener("leadscout-access", revoked);
+  }, [client, navigate]);
   const dashboard = useQuery({
     queryKey: ["dashboard"],
     queryFn: async () => {
       try {
         const data = await api.dashboard();
         setCsrfToken(data.csrf_token);
+        entered.current = true;
         return data;
       } catch (error) {
-        if (!(error instanceof ApiError) || error.status !== 401) throw error;
+        if (!(error instanceof ApiError) || error.status !== 401 || entered.current || authAttempted.current) throw error;
+        authAttempted.current = true;
         await authenticate();
         const data = await api.dashboard();
         setCsrfToken(data.csrf_token);
+        entered.current = true;
         return data;
       }
     },
-    refetchInterval: () => document.visibilityState === "visible" ? 15000 : false,
+    enabled: !accessError,
+    retry: false,
+    refetchInterval: () => !accessError && document.visibilityState === "visible" ? 15000 : false,
   });
+  if (accessError) return <div className={styles.loading}><h1>LeadScout</h1><Message notice={{ text: accessError.message, error: true }} /><p>{accessError.code === "ACCESS_BLOCKED" ? "Данные кабинета скрыты. Обратитесь к главному администратору." : "Закройте и заново откройте Mini App для входа с актуальными правами."}</p></div>;
   if (dashboard.isPending) return <div className={styles.loading} role="status"><strong>LeadScout</strong>Загружаем кабинет…</div>;
   if (dashboard.isError || !dashboard.data) return <div className={styles.loading}><h1>LeadScout</h1><Message notice={{ text: `Не удалось открыть кабинет. ${dashboard.error instanceof Error ? dashboard.error.message : ""}`, error: true }} /><Button onClick={() => { void dashboard.refetch(); }} disabled={dashboard.isFetching}>Повторить</Button></div>;
   const accountKey = dashboard.data.active_account_id ?? "none";
@@ -134,6 +164,7 @@ function Root() {
       <Route path="/" element={<HomePage dashboard={dashboard.data} key={`home:${accountKey}`} />} />
       <Route path="/applications" element={<ApplicationsPage dashboard={dashboard.data} key={`applications:${accountKey}`} />} />
       <Route path="/resumes" element={<ResumesPage dashboard={dashboard.data} key={`resumes:${accountKey}`} />} />
+      <Route path="/admin" element={<AdminPage dashboard={dashboard.data} />} />
       <Route path="/settings" element={<SettingsPage dashboard={dashboard.data} key={`settings:${accountKey}`} />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

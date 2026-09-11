@@ -29,8 +29,10 @@ async def current_user(request: Request, context: AppContext = Depends(get_conte
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Откройте приложение через Telegram")
     session = decode_session(token, context.settings.bot_token)
     user_id = int(session["user_id"])
-    if user_id not in context.settings.allowed_owner_ids:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Нет доступа к личному кабинету")
+    if not isinstance(session.get("auth_version"), int):
+        raise HTTPException(401, {"code": "SESSION_REVOKED", "message": "Откройте Mini App заново."})
+    member = await context.access.require(user_id, auth_version=session["auth_version"])
+    session["role"] = member["role"]
     return session
 
 

@@ -34,7 +34,7 @@ def _identifier(data: str, prefixes: tuple[str, ...]) -> int | None:
 
 def create_legacy_router(owner_id: int | None = None, *, owner_ids: tuple[int, ...] = ()) -> Router:
     router = Router(name="leadscout-legacy-redirects")
-    owner_only = owner_only_factory(owner_id, owner_ids=owner_ids)
+    owner_only = owner_only_factory(owner_id, owner_ids=owner_ids, deny_notice=False)
     router.message.filter(owner_only)
     router.callback_query.filter(owner_only)
 

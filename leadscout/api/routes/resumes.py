@@ -53,6 +53,7 @@ async def sync_resumes(
         "resume-sync",
         lambda: context.services.resumes.sync(user_id, account_id),
         str(account_id),
+        account_id=account_id,
     )
 
 
@@ -100,7 +101,7 @@ async def import_resume(
             path.write_bytes(contents)
             return await context.services.resumes.import_pdf(user_id, account_id, str(path), structured)
 
-    return await context.operations.schedule(user_id, "resume-import", job)
+    return await context.operations.schedule(user_id, "resume-import", job, account_id=account_id)
 
 
 @router.delete("/{snapshot_id}", status_code=status.HTTP_202_ACCEPTED)
@@ -129,4 +130,4 @@ async def delete_resume(
     snapshot = await context.db.get_resume_snapshot_for_user(user_id, snapshot_id)
     if not snapshot or int(snapshot.get("account_id", -1)) != account_id:
         raise service_http_error(ServiceError("NOT_FOUND", "Резюме не найдено"))
-    return await context.operations.schedule(user_id, "resume-delete", job, str(snapshot_id))
+    return await context.operations.schedule(user_id, "resume-delete", job, str(snapshot_id), account_id=account_id)

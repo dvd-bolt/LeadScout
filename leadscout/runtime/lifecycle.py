@@ -19,8 +19,11 @@ async def initialize(context: AppContext) -> tuple[int, int]:
             return 0, 0
         await context.db.init_db()
         context.storage_ready = True
+        await context.admin_store.bootstrap(context.settings.root_admin_telegram_id, context.settings.allowed_owner_ids)
         operations = await context.db.recover_interrupted_operations()
         questionnaires = await context.db.recover_interrupted_questionnaires()
+        await context.admin_store.recover_tasks()
+        await context.admin.recover()
         context.initialized = True
         return operations, questionnaires
 
@@ -63,6 +66,9 @@ async def _shutdown_resources(context: AppContext) -> None:
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
     context.serving_tasks.clear()
+    if context.storage_ready:
+        await attempt("administrative commands", context.admin.shutdown)
+        await attempt("tracked tasks", context.task_registry.shutdown)
     await attempt("operations", lambda: context.operations.shutdown(recover=context.storage_ready))
     if hasattr(context.login_manager, "shutdown"):
         await attempt("login", context.login_manager.shutdown)
