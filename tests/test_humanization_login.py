@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from patchright.async_api import async_playwright
 
@@ -22,8 +24,6 @@ async def test_otp_auto_submit_persists_only_after_a_positive_auth_marker(monkey
     async def no_cleanup(self):
         self.is_done = True
 
-    monkeypatch.setattr(hh_login, "SessionSecurityManager", FakeSecurityManager)
-    monkeypatch.setattr(hh_login, "update_user_session", save_session)
     monkeypatch.setattr(hh_login.HHLoginSession, "cleanup", no_cleanup)
 
     playwright = await async_playwright().start()
@@ -49,7 +49,12 @@ async def test_otp_auto_submit_persists_only_after_a_positive_auth_marker(monkey
             ),
         )
         await page.goto("https://hh.ru/account/login", wait_until="domcontentloaded")
-        session = hh_login.HHLoginSession(42, "+79990000000")
+        session = hh_login.HHLoginSession(
+            42,
+            "+79990000000",
+            db=SimpleNamespace(update_user_session=save_session),
+            security_factory=FakeSecurityManager,
+        )
         session.page = page
         session.context = page.context
 

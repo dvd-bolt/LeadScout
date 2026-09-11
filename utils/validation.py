@@ -26,7 +26,7 @@ def strip_telegram_html(value: str) -> str:
 def parse_callback_id(data: str | None, prefix: str) -> int | None:
     if not data or not data.startswith(prefix):
         return None
-    raw = data[len(prefix):]
+    raw = data[len(prefix) :]
     if not raw.isascii() or not raw.isdigit():
         return None
     value = int(raw)
@@ -70,10 +70,11 @@ def mask_proxy_url(raw: str | None) -> str:
 def normalize_hh_vacancy_url(raw: str) -> str | None:
     try:
         parsed = urlsplit(raw.strip())
+        port = parsed.port
     except ValueError:
         return None
     host = (parsed.hostname or "").lower().rstrip(".")
-    if parsed.scheme.lower() != "https" or parsed.username or parsed.password or parsed.port not in {None, 443}:
+    if parsed.scheme.lower() != "https" or parsed.username or parsed.password or port not in {None, 443}:
         return None
     if host != "hh.ru" and not host.endswith(".hh.ru"):
         return None

@@ -1,0 +1,29 @@
+.page { display: grid; gap: 16px; min-width: 0; }
+.title { margin: 0 0 8px; font-size: clamp(38px,10.8vw,56px); line-height: .99; letter-spacing: -.06em; font-weight: 900; }
+.metrics { display: grid; grid-template-columns: minmax(0,1.6fr) minmax(0,1fr); gap: 12px; }
+.metric { min-width: 0; padding: 14px; border: 2px solid var(--text); border-radius: var(--radius); background: white; }
+.progressMetric { grid-row: span 2; display: flex; flex-direction: column; justify-content: center; gap: 8px; }
+.numbers { display: flex; align-items: baseline; white-space: nowrap; gap: 5px; letter-spacing: -.065em; font-weight: 900; font-size: clamp(34px,10.8vw,65px); line-height: 1; font-variant-numeric: tabular-nums; }
+.numbers span { color: var(--muted); }
+.metricLabel { display: block; font-size: 0.875rem; line-height: 1.25; }
+.metricButton { display: block; text-align: left; box-shadow: var(--card-shadow); font: inherit; color: var(--text); text-decoration: none; }
+.smallTop { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px; margin-bottom: 5px; }
+.smallTop strong { font-size: clamp(25px,7.2vw,37px); font-weight: 900; letter-spacing: -.065em; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.smallTop svg { flex-shrink: 0; }
+.timeText { overflow-wrap: anywhere; min-width: 0; display: block; font-size: 0.875rem; font-weight: 750; line-height: 1.2; margin: 4px 0; }
+.percent { display: flex; justify-content: flex-end; font-size: 0.8125rem; color: var(--muted); font-weight: 700; }
+.selection { display: grid; grid-template-columns: minmax(0,1.25fr) minmax(0,1fr); gap: 12px; padding: 14px; border: 2px solid var(--text); border-radius: var(--radius); }
+.resumeLink { display: flex; align-items: center; gap: 10px; min-width: 0; text-decoration: none; }
+.resumeLink svg { flex-shrink: 0; }
+.resumeLink strong { display: block; font-size: 1.0625rem; font-weight: 800; line-height: 1.25; overflow-wrap: anywhere; margin-top: 5px; }
+.status { border-left: 1px solid var(--border); padding-left: 12px; min-width: 0; }
+.caption { display: block; color: var(--muted); font-size: 0.8125rem; line-height: 1.25; }
+.statusValue { display: flex; align-items: flex-start; gap: 7px; font-size: 0.8125rem; margin-top: 7px; font-weight: 650; overflow-wrap: anywhere; }
+.dot { width: 10px; height: 10px; flex-shrink: 0; border: 2px solid var(--text); border-radius: 50%; background: var(--text); margin-top: 4px; }
+.review { display: flex; align-items: center; gap: 12px; padding: 15px; min-height: 56px; border-radius: var(--radius); background: var(--text); color: white; text-decoration: none; font-size: 1rem; font-weight: 750; }
+.review svg { flex-shrink: 0; } .review svg:last-child { margin-left: auto; }
+.events { margin-top: 8px; min-width: 0; } .events h2 { font-weight: 900; letter-spacing: -.045em; font-size: 1.6875rem; line-height: 1.1; margin: 0 0 16px; }
+.onboarding { padding: 22px; border: 2px solid var(--text); border-radius: var(--radius); }
+.onboarding h2 { margin: 0 0 12px; font-size: 1.4375rem; font-weight: 800; }
+.onboarding ol { padding-left: 22px; color: var(--muted); line-height: 1.8; margin-bottom: 22px; }
+@media(max-width:359px) { .metrics { grid-template-columns: repeat(2,minmax(0,1fr)); } .progressMetric { grid-column: 1 / -1; grid-row: auto; } .numbers { font-size: 3.25rem; } .selection { grid-template-columns: 1fr; } .status { border-left: 0; border-top: 1px solid var(--border); padding: 10px 0 0; } }

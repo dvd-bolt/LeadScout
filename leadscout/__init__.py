@@ -1,0 +1,1 @@
+"""LeadScout backend package."""

@@ -56,6 +56,12 @@ async def test_resume_selection_never_falls_back_to_the_first_resume(monkeypatch
 
         assert await handle_resume_selection_if_needed(page, "wanted-resume")
         assert await page.locator('input[value="wanted-resume"]').is_checked()
+        assert not await handle_resume_selection_if_needed(page, "wanted")
+        await page.set_content("""<select data-qa="resume-selector">
+            <option value="wrong-resume">Первое</option><option value="wanted-resume">Нужное</option>
+            </select>""")
+        assert await handle_resume_selection_if_needed(page, "wanted-resume")
+        assert await page.locator("select").input_value() == "wanted-resume"
     finally:
         await browser.close()
         await playwright.stop()

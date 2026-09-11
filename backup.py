@@ -19,8 +19,8 @@ def main() -> None:
     destination_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d_%H-%M-%S")
     destination = destination_dir / f"leadscout_{stamp}.db"
-    # The backup container mounts the live database read-only. SQLite's backup
-    # API reads a consistent WAL snapshot without copying ``-wal`` or ``-shm``.
+    # mode=ro protects the source database. The directory must still be writable
+    # so SQLite can create WAL/SHM sidecars when no other connection holds them.
     source_uri = f"file:{source_path.as_posix()}?mode=ro"
     with sqlite3.connect(source_uri, uri=True) as source, sqlite3.connect(destination) as target:
         source.backup(target)

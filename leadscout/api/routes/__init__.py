@@ -1,0 +1,25 @@
+"""Route groups exported for application assembly."""
+
+from .accounts import router as accounts_router
+from .applications import router as applications_router
+from .audits import router as audits_router
+from .auth import router as auth_router
+from .automation import router as automation_router
+from .login import router as login_router
+from .operations import router as operations_router
+from .questionnaires import router as questionnaires_router
+from .resumes import router as resumes_router
+
+ROUTERS = (
+    auth_router,
+    accounts_router,
+    login_router,
+    resumes_router,
+    questionnaires_router,
+    automation_router,
+    applications_router,
+    audits_router,
+    operations_router,
+)
+
+__all__ = ["ROUTERS"]

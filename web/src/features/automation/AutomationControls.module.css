@@ -1,0 +1,5 @@
+.controls { display: grid; gap: 12px; }
+.primary, .parameters { display: flex; justify-content: flex-start; gap: 14px; width: 100%; min-height: 56px; padding: 14px; font-size: 1.25rem; font-weight: 800; letter-spacing: -.035em; }
+.primary svg:last-child, .parameters svg:last-child { margin-left: auto; flex-shrink: 0; }
+.primary svg:first-child, .parameters svg:first-child { flex-shrink: 0; }
+.all { border-bottom: 1px solid var(--border); }.all summary { font-size: 0.8125rem; color: var(--muted); }

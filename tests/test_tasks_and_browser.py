@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from patchright.async_api import async_playwright
 
+import database
 import worker
 from ai_handler import JobApplicationPayload
 from parsers.hh_applicant import (
@@ -13,6 +16,8 @@ from parsers.hh_applicant import (
     fill_questionnaire_form,
     verify_hh_application_success,
 )
+from parsers.hh_browser import HHBrowserEngine
+from parsers.hh_resume import HHResumeManager
 
 
 @pytest.mark.asyncio
@@ -30,8 +35,8 @@ async def test_task_coordinator_suppresses_duplicate_account_tasks(monkeypatch):
     async def fake_update(*args, **kwargs):
         return True
 
-    monkeypatch.setattr(worker, "get_account_for_user", fake_get_account)
-    monkeypatch.setattr(worker, "update_account_settings_for_user", fake_update)
+    monkeypatch.setattr(coordinator._dependencies, "get_account_for_user", fake_get_account)
+    monkeypatch.setattr(coordinator._dependencies, "update_account_settings_for_user", fake_update)
     monkeypatch.setattr(coordinator, "_run_account_guarded", fake_run)
 
     assert await coordinator.start_account(10, 1) == "STARTED"
@@ -41,6 +46,49 @@ async def test_task_coordinator_suppresses_duplicate_account_tasks(monkeypatch):
     release.set()
     await asyncio.sleep(0)
     await coordinator.shutdown()
+
+
+async def test_real_browser_context_close_releases_global_slot(monkeypatch):
+
+    slots = asyncio.Semaphore(1)
+    engine = HHBrowserEngine(slots=slots)
+    try:
+        first = await engine.create_context()
+        pending = asyncio.create_task(engine.create_context())
+        await asyncio.sleep(0)
+        assert not pending.done()
+        await first.close()
+        second = await asyncio.wait_for(pending, timeout=5)
+        await second.close()
+        assert slots._value == 1
+    finally:
+        await engine.close()
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [("<main>Пройдите проверку CAPTCHA</main>", "ERROR"), ("<main>У вас пока нет резюме</main>", "SUCCESS")],
+)
+async def test_resume_sync_only_clears_confirmed_empty_lists(isolated_db, monkeypatch, body, expected):
+    account = await database.create_hh_account(42, "sync-check@example.com")
+    await database.sync_resume_snapshots(
+        42, account["id"], [{"id": "resume123", "href": "https://hh.ru/resume/resume123", "title": "Keep me"}]
+    )
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context()
+        await context.route("**/*", lambda route: route.fulfill(body=body, content_type="text/html; charset=utf-8"))
+        engine = SimpleNamespace(create_context=AsyncMock(return_value=context))
+        monkeypatch.setattr(HHResumeManager, "_account_and_state", AsyncMock(return_value=(account, {})))
+        monkeypatch.setattr(HHResumeManager, "_persist_context", AsyncMock())
+        monkeypatch.setattr(worker.SharedBrowserPool, "get_engine", AsyncMock(return_value=engine))
+        try:
+            result = await HHResumeManager.fetch_user_resumes(42, account["id"])
+            assert result["status"] == expected
+            snapshots = await database.list_resume_snapshots(42, account["id"])
+            assert len(snapshots) == (1 if expected == "ERROR" else 0)
+        finally:
+            await browser.close()
 
 
 @pytest.mark.asyncio
@@ -61,8 +109,8 @@ async def test_task_coordinator_cancels_and_scopes_stop(monkeypatch):
     async def fake_pool_shutdown():
         return None
 
-    monkeypatch.setattr(worker, "get_account_for_user", fake_get_account)
-    monkeypatch.setattr(worker, "update_account_settings_for_user", fake_update)
+    monkeypatch.setattr(coordinator._dependencies, "get_account_for_user", fake_get_account)
+    monkeypatch.setattr(coordinator._dependencies, "update_account_settings_for_user", fake_update)
     monkeypatch.setattr(coordinator, "_run_account_guarded", fake_run)
     monkeypatch.setattr(worker.SharedBrowserPool, "shutdown", fake_pool_shutdown)
 
@@ -112,7 +160,7 @@ async def test_patchright_fixture_questionnaire_and_success_detection():
 
 @pytest.mark.asyncio
 async def test_irrelevant_vacancy_is_never_clicked(monkeypatch):
-    import parsers.hh_applicant as applicant
+    import leadscout.integrations.application_forms as applicant
 
     async def fake_generate(*args, **kwargs):
         return JobApplicationPayload(
@@ -129,7 +177,7 @@ async def test_irrelevant_vacancy_is_never_clicked(monkeypatch):
     async def never_applied(page):
         return False
 
-    monkeypatch.setattr(applicant, "generate_hh_job_application", fake_generate)
+    monkeypatch.setattr(worker.get_default_context().ai, "generate_hh_job_application", fake_generate)
     monkeypatch.setattr(applicant, "human_scroll", fake_scroll)
     monkeypatch.setattr(applicant, "verify_hh_application_success", never_applied)
 
@@ -163,7 +211,7 @@ async def test_irrelevant_vacancy_is_never_clicked(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_direct_response_does_not_report_an_unsubmitted_cover_letter(monkeypatch):
-    import parsers.hh_applicant as applicant
+    import leadscout.integrations.application_forms as applicant
 
     async def fake_generate(*args, **kwargs):
         return JobApplicationPayload(
@@ -188,7 +236,7 @@ async def test_direct_response_does_not_report_an_unsubmitted_cover_letter(monke
         checks += 1
         return checks >= 2 and await page.evaluate("Boolean(window.responseClicked)")
 
-    monkeypatch.setattr(applicant, "generate_hh_job_application", fake_generate)
+    monkeypatch.setattr(worker.get_default_context().ai, "generate_hh_job_application", fake_generate)
     monkeypatch.setattr(applicant, "human_scroll", fake_scroll)
     monkeypatch.setattr(applicant, "human_click", fake_click)
     monkeypatch.setattr(applicant, "verify_hh_application_success", fake_verify)
@@ -225,7 +273,7 @@ async def test_direct_response_does_not_report_an_unsubmitted_cover_letter(monke
 
 @pytest.mark.asyncio
 async def test_modal_questionnaire_pipeline_fills_and_confirms(monkeypatch):
-    import parsers.hh_applicant as applicant
+    import leadscout.integrations.application_forms as applicant
 
     async def fake_generate(resume, vacancy, questions):
         answers = []
@@ -278,7 +326,7 @@ async def test_modal_questionnaire_pipeline_fills_and_confirms(monkeypatch):
         fill_results.append(result)
         return result
 
-    monkeypatch.setattr(applicant, "generate_hh_job_application", fake_generate)
+    monkeypatch.setattr(worker.get_default_context().ai, "generate_hh_job_application", fake_generate)
     monkeypatch.setattr(applicant, "human_scroll", fake_scroll)
     monkeypatch.setattr(applicant, "human_click", fake_click)
     monkeypatch.setattr(applicant, "human_type", fake_type)

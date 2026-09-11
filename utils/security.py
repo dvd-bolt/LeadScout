@@ -6,7 +6,7 @@ import json
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from config import SESSION_ENCRYPTION_KEY
+from leadscout.core.config import SESSION_ENCRYPTION_KEY
 
 
 class SessionDecryptionError(ValueError):

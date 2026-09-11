@@ -1,36 +1,28 @@
-from __future__ import annotations
+from urllib.parse import parse_qs, urlsplit
 
-from keyboards import (
-    AUTOAPPLY_OFF_TEXT,
-    AUTOAPPLY_ON_TEXT,
-    get_main_keyboard,
-    get_resume_audit_result_keyboard,
-    get_resume_inline_keyboard,
-    get_settings_analytics_hub_keyboard,
-)
+from keyboards import get_entry_keyboard, get_questionnaire_confirmation_keyboard, get_stop_keyboard, mini_app_url
 
 
-def _callbacks(markup):
-    return [button.callback_data for row in markup.inline_keyboard for button in row if button.callback_data]
+def test_entry_has_only_app_stop_and_help():
+    rows = get_entry_keyboard(app_url="https://test.example/").keyboard
+    assert rows[0][0].web_app.url.startswith("https://test.example/")
+    assert [button.text for button in rows[1]] == ["⛔ Остановить", "❓ Помощь"]
+    assert mini_app_url(app_url="http://insecure.example/") is None
 
 
-def test_main_button_texts_are_stable():
-    assert get_main_keyboard(False).keyboard[0][0].text == AUTOAPPLY_OFF_TEXT
-    assert get_main_keyboard(True).keyboard[0][0].text == AUTOAPPLY_ON_TEXT
+def test_questionnaire_links_preserve_real_ids_and_query():
+    markup = get_questionnaire_confirmation_keyboard(77, account_id=33, app_url="https://test.example/?ref=bot")
+    button = markup.inline_keyboard[0][0]
+    assert button.callback_data is None
+    assert parse_qs(urlsplit(button.web_app.url).query) == {
+        "ref": ["bot"],
+        "target": ["questionnaire"],
+        "apply_id": ["77"],
+        "account_id": ["33"],
+    }
 
 
-def test_audit_and_resume_callbacks_use_real_ids():
-    callbacks = _callbacks(get_resume_audit_result_keyboard(77))
-    assert "show_audit_insights_77" in callbacks
-    assert "match_with_vacancy_77" in callbacks
-
-    resume_markup = get_resume_inline_keyboard(
-        [{"snapshot_id": 33, "title": "Backend", "href": "https://hh.ru/resume/x"}]
-    )
-    assert "manage_res_33" in _callbacks(resume_markup)
-
-
-def test_settings_hub_does_not_toggle_autoapply_as_a_threads_control():
-    callbacks = _callbacks(get_settings_analytics_hub_keyboard({"proxy_url": ""}))
-    assert "open_settings_menu_hub" in callbacks
-    assert "toggle_account_auto_apply" not in callbacks
+def test_stop_buttons_use_real_ids():
+    markup = get_stop_keyboard([{"id": 3}, {"id": 7}], app_url="https://test.example/")
+    callbacks = [b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data]
+    assert callbacks == ["stop_account:3", "stop_account:7", "stop_all:confirm"]

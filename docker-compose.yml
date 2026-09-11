@@ -37,7 +37,8 @@ services:
       DB_PATH: /app/data/leadscout.db
       BACKUP_DIR: /app/backups
     volumes:
-      - leadscout-data:/app/data:ro
+      # SQLite may need to create WAL/SHM sidecars even for mode=ro readers.
+      - leadscout-data:/app/data
       - leadscout-backups:/app/backups
     depends_on:
       app:

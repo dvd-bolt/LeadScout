@@ -4,7 +4,7 @@ import pytest
 from pypdf import PdfReader
 from reportlab.pdfgen.canvas import Canvas
 
-import parsers.hh_resume as hh_resume
+import leadscout.integrations.resumes as hh_resume
 from ai_handler import StructuredResume
 from parsers.hh_resume import PDFValidationError, extract_text_from_pdf, missing_resume_fields
 from utils.pdf_generator import generate_resume_audit_pdf

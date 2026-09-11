@@ -6,10 +6,22 @@ import sqlite3
 import pytest
 
 import database
+from leadscout.storage import Database, init_db
+from leadscout.storage.repositories import accounts, users
 
 
 @pytest.mark.asyncio
-async def test_account_ownership_limit_and_duplicate(isolated_db):
+async def test_explicit_database_can_be_reinitialized(isolated_db):
+    await init_db(isolated_db)
+    await users.get_or_create_user(isolated_db, 101)
+    account = await accounts.create_hh_account(isolated_db, 101, "package@example.com")
+
+    assert account["user_id"] == 101
+    assert isolated_db.path.name == "leadscout-test.db"
+
+
+@pytest.mark.asyncio
+async def test_account_ownership_limit_and_duplicate(isolated_db, monkeypatch):
     await database.get_or_create_user(10)
     await database.get_or_create_user(20)
     account = await database.create_hh_account(10, "+7 999 000-00-00")
@@ -21,6 +33,10 @@ async def test_account_ownership_limit_and_duplicate(isolated_db):
 
     with pytest.raises(database.DuplicateAccountError):
         await database.create_hh_account(10, "+79990000000")
+
+    monkeypatch.setattr(accounts, "MAX_ACCOUNTS_PER_USER", 1)
+    with pytest.raises(database.AccountLimitError):
+        await database.create_hh_account(10, "second@example.com")
 
 
 @pytest.mark.asyncio
@@ -73,7 +89,13 @@ async def test_resume_snapshots_and_questionnaire_state_are_scoped(isolated_db):
                 "title": "Backend",
                 "href": "https://hh.ru/resume/resume_123",
                 "extracted_text": "Python " * 20,
-            }
+            },
+            {
+                "id": "resume_456",
+                "title": "Data",
+                "href": "https://hh.ru/resume/resume_456",
+                "extracted_text": "SQL " * 20,
+            },
         ],
     )
     snapshot_id = snapshots[0]["snapshot_id"]
@@ -90,6 +112,24 @@ async def test_resume_snapshots_and_questionnaire_state_are_scoped(isolated_db):
         [],
         {},
     )
+    audit_id = await database.save_resume_audit(
+        1,
+        account["id"],
+        "Backend",
+        80,
+        {},
+        [],
+        [],
+        [],
+        source_resume_text="Python " * 20,
+        source_resume_snapshot_id=snapshot_id,
+    )
+    await database.set_active_resume_snapshot(1, account["id"], snapshots[1]["snapshot_id"])
+
+    questionnaire = await database.get_pending_questionnaire_for_user(1, apply_id)
+    audit = await database.get_resume_audit_for_user(1, audit_id)
+    assert questionnaire["resume_text"] == "Python " * 20
+    assert audit["source_resume_text"] == "Python " * 20
     assert await database.get_pending_questionnaire_for_user(2, apply_id) is None
     claims = await asyncio.gather(
         database.claim_pending_questionnaire(1, apply_id),
@@ -104,7 +144,7 @@ async def test_schema_version_and_foreign_keys(isolated_db):
     async with database.get_db_connection() as db:
         version = (await (await db.execute("PRAGMA user_version")).fetchone())[0]
         foreign_keys = (await (await db.execute("PRAGMA foreign_keys")).fetchone())[0]
-    assert version == 5
+    assert version == 6
     assert foreign_keys == 1
 
 
@@ -176,7 +216,7 @@ async def test_legacy_users_table_is_migrated(tmp_path, monkeypatch):
             )"""
         )
         db.execute("INSERT INTO users (user_id) VALUES (1)")
-    monkeypatch.setattr(database, "DB_PATH", str(path))
+    monkeypatch.setattr(database, "DEFAULT_DATABASE", Database(path))
 
     await database.init_db()
 
@@ -184,4 +224,4 @@ async def test_legacy_users_table_is_migrated(tmp_path, monkeypatch):
         columns = await database._table_columns(db, "users")
         version = (await (await db.execute("PRAGMA user_version")).fetchone())[0]
     assert {"applied_date", "active_account_id", "send_cover_letter"} <= columns
-    assert version == 5
+    assert version == 6

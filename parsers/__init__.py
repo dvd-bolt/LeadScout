@@ -16,4 +16,3 @@ __all__ = [
     "submit_approved_questionnaire",
     "extract_vacancy_details",
 ]
-

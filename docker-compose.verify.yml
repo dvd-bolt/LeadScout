@@ -1,0 +1,11 @@
+# Standalone offline verification; no .env, host ports or production volumes.
+services:
+  verify:
+    build: .
+    command: ["python", "-m", "scripts.container_smoke"]
+    network_mode: none
+    environment:
+      BROWSER_HEADLESS: "true"
+    shm_size: 512mb
+    healthcheck:
+      disable: true

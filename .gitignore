@@ -1,12 +1,18 @@
 # Environment variables
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # SQLite Database
 *.db
 *.sqlite
 *.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
 leadscout.db
 
 # Telegram Telethon / Pyrogram sessions
@@ -44,6 +50,10 @@ Thumbs.db
 # Scratch and temporary media
 scratch/
 *.png
+
+# Versioned design references and verification screenshots
+!output/design-concepts/**/*.png
+!output/mono-verification/**/*.png
 
 # Frontend dependencies and generated bundle
 web/node_modules/

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="4" skipped="0" tests="9" time="21.290" timestamp="2026-09-11T12:21:20.620811+03:00" hostname="MacBook-Air-cight.local"><testcase classname="tests.review_checks_2026_09_11" name="test_migrated_phone_login_uses_same_normalization" time="0.021"><failure message="AssertionError: 8(999)123-45-67&#10;assert (None)">tests/review_checks_2026_09_11.py:45: in test_migrated_phone_login_uses_same_normalization
+    assert found and found["id"] == account["id"], migrated["normalized_login"]
+E   AssertionError: 8(999)123-45-67
+E   assert (None)</failure></testcase><testcase classname="tests.review_checks_2026_09_11" name="test_match_provider_failure_is_a_failed_operation" time="0.035"><failure message="AssertionError: {'id': 'da8e714f-96ba-48ab-9121-73ecca840ba5', 'user_id': 42, 'kind': 'vacancy-match', 'status': 'SUCCEEDED', ...}&#10;assert 'SUCCEEDED' == 'FAILED'&#10;  &#10;  - FAILED&#10;  + SUCCEEDED">tests/review_checks_2026_09_11.py:66: in test_match_provider_failure_is_a_failed_operation
+    assert operation["status"] == "FAILED", operation
+E   AssertionError: {'id': 'da8e714f-96ba-48ab-9121-73ecca840ba5', 'user_id': 42, 'kind': 'vacancy-match', 'status': 'SUCCEEDED', ...}
+E   assert 'SUCCEEDED' == 'FAILED'
+E
+E     - FAILED
+E     + SUCCEEDED</failure></testcase><testcase classname="tests.review_checks_2026_09_11" name="test_save_incomplete_questionnaire_preserves_draft" time="1.177"><failure message="AssertionError: Заполните все обязательные поля анкеты.&#10;assert 'Old letter' == 'Saved draft letter'&#10;  &#10;  - Saved draft letter&#10;  + Old letter">tests/review_checks_2026_09_11.py:83: in test_save_incomplete_questionnaire_preserves_draft
+    assert saved["cover_letter"] == "Saved draft letter", await page.get_by_role("status").inner_text()
+E   AssertionError: Заполните все обязательные поля анкеты.
+E   assert 'Old letter' == 'Saved draft letter'
+E
+E     - Saved draft letter
+E     + Old letter</failure></testcase><testcase classname="tests.review_checks_2026_09_11" name="test_direct_questionnaire_refreshes_after_submission" time="17.652"><failure message="AssertionError: Locator expected to be visible&#10;Actual value: None&#10;Error: Error: element(s) not found &#10;Call log:&#10;  - Expect &quot;to_be_visible&quot; with timeout 17000ms&#10;  - waiting for get_by_text(&quot;Отправлена&quot;, exact=True)&#10;&#10;Aria snapshot:&#10;- main:&#10;  - text: ↗ LeadScout&#10;  - combobox &quot;Активный аккаунт&quot;:&#10;    - option &quot;Первый аккаунт&quot; [selected]&#10;    - option &quot;Второй аккаунт&quot;&#10;  - strong: Анкета из уведомления&#10;  - button &quot;Показать весь список&quot;&#10;  - status: Анкета передана на отправку&#10;  - article:&#10;    - text: &quot;Direct review probe Резюме: Python developer Ожидает решения Сопроводительное письмо&quot;&#10;    - textbox &quot;Сопроводительное письмо&quot;: Approved letter&#10;    - button &quot;Сохранить&quot;&#10;    - button &quot;Подтвердить отправку&quot;&#10;    - button &quot;Пропустить&quot;&#10;  - navigation &quot;Основная навигация&quot;:&#10;    - link &quot;Главная&quot;:&#10;      - /url: &quot;#/&quot;&#10;    - link &quot;Отклики&quot;:&#10;      - /url: &quot;#/applications&quot;&#10;    - link &quot;Резюме&quot;:&#10;      - /url: &quot;#/resumes&quot;&#10;    - link &quot;Настройки&quot;:&#10;      - /url: &quot;#/settings&quot;">tests/review_checks_2026_09_11.py:105: in test_direct_questionnaire_refreshes_after_submission
+    await expect(page.get_by_text("Отправлена", exact=True)).to_be_visible(timeout=17000)
+E   AssertionError: Locator expected to be visible
+E   Actual value: None
+E   Error: Error: element(s) not found
+E   Call log:
+E     - Expect "to_be_visible" with timeout 17000ms
+E     - waiting for get_by_text("Отправлена", exact=True)
+E
+E   Aria snapshot:
+E   - main:
+E     - text: ↗ LeadScout
+E     - combobox "Активный аккаунт":
+E       - option "Первый аккаунт" [selected]
+E       - option "Второй аккаунт"
+E     - strong: Анкета из уведомления
+E     - button "Показать весь список"
+E     - status: Анкета передана на отправку
+E     - article:
+E       - text: "Direct review probe Резюме: Python developer Ожидает решения Сопроводительное письмо"
+E       - textbox "Сопроводительное письмо": Approved letter
+E       - button "Сохранить"
+E       - button "Подтвердить отправку"
+E       - button "Пропустить"
+E     - navigation "Основная навигация":
+E       - link "Главная":
+E         - /url: "#/"
+E       - link "Отклики":
+E         - /url: "#/applications"
+E       - link "Резюме":
+E         - /url: "#/resumes"
+E       - link "Настройки":
+E         - /url: "#/settings"</failure></testcase><testcase classname="tests.review_checks_2026_09_11" name="test_api_real_coordinator_job_and_sqlite[success]" time="0.041" /><testcase classname="tests.review_checks_2026_09_11" name="test_api_real_coordinator_job_and_sqlite[stop]" time="0.041" /><testcase classname="tests.review_checks_2026_09_11" name="test_compact_bot_dispatch_enforces_owner_and_stops[42]" time="0.004" /><testcase classname="tests.review_checks_2026_09_11" name="test_compact_bot_dispatch_enforces_owner_and_stops[99]" time="0.004" /><testcase classname="tests.review_checks_2026_09_11" name="test_legacy_confirm_callback_only_opens_owned_questionnaire" time="0.003" /></testsuite></testsuites>

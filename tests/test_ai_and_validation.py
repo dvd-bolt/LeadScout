@@ -5,8 +5,8 @@ from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
 import ai_handler
-import config
 from ai_handler import FormAnswer, JobApplicationPayload, QuestionField
+from leadscout.core import config
 from parsers.hh_applicant import effective_cover_letter, questionnaire_requires_confirmation
 from utils.security import SessionDecryptionError, SessionSecurityManager
 from utils.validation import (
@@ -75,9 +75,7 @@ def _payload(confidence: float, answer: str = "Да") -> JobApplicationPayload:
 
 
 def test_questionnaire_threshold_and_intentional_dot():
-    questions = [
-        QuestionField(field_id="q0", label="Работали с Python?", answer_type="radio", options=["Да", "Нет"])
-    ]
+    questions = [QuestionField(field_id="q0", label="Работали с Python?", answer_type="radio", options=["Да", "Нет"])]
     assert questionnaire_requires_confirmation(questions, _payload(0.849))
     assert not questionnaire_requires_confirmation(questions, _payload(0.85))
     assert questionnaire_requires_confirmation(questions, _payload(0.99, "Возможно"))

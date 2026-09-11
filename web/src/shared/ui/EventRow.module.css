@@ -1,0 +1,5 @@
+.event { display: flex; align-items: center; gap: 12px; min-width: 0; padding: 15px 0; border-bottom: 1px solid var(--border); text-decoration: none; }
+.icon { display: grid; place-items: center; background: var(--subtle-surface); width: 44px; height: 44px; border-radius: 12px; flex-shrink: 0; }
+.body { min-width: 0; flex: 1; }.body strong { display: block; font-size: 1rem; font-weight: 750; overflow-wrap: anywhere; line-height: 1.25; }.body small { display: block; color: var(--muted); margin-top: 4px; font-size: 0.8125rem; }
+.time { color: var(--muted); font-size: 0.8125rem; white-space: nowrap; }.event > svg { flex-shrink: 0; }
+@media(max-width:359px) { .event { gap: 8px; flex-wrap: wrap; }.time { margin-left: 52px; } }
