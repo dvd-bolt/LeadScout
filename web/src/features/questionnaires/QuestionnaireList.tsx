@@ -14,6 +14,7 @@ type QuestionnaireAction = {
 };
 
 const FINISHED = new Set(["SUBMITTED", "SKIPPED"]);
+const REVIEW_LOCKED = new Set(["NEEDS_REVIEW"]);
 
 function cacheQuestionnaire(client: QueryClient, item: Questionnaire) {
   client.setQueryData<Questionnaire>(["questionnaire", item.account_id, item.id], item);
@@ -151,6 +152,7 @@ function QuestionnaireCard({
     .filter((answer) => answer.value.trim());
   const incomplete = item.questions.some((question) => question.required && !answers[question.field_id]?.trim());
   const finished = FINISHED.has(item.status);
+  const reviewLocked = REVIEW_LOCKED.has(item.status);
 
   return <article className={`${styles.question} ${finished ? styles.finished : ""}`}>
     <div className={styles.row}>
@@ -162,6 +164,7 @@ function QuestionnaireCard({
     </div>
     {item.error_text ? <div className={`${styles.notice} ${styles.error}`} style={{ marginTop: 10 }}>{item.error_text}</div> : null}
     {finished ? <p className={styles.meta}>Решение уже принято. Ссылка только показывает текущее состояние и ничего не отправляет повторно.</p> : <>
+      {reviewLocked ? <p className={styles.meta}>Проверьте результат на hh.ru и зафиксируйте его во вкладке «История». До этого повторная отправка заблокирована, чтобы не создать дубликат.</p> : null}
       <label className={styles.field} style={{ marginTop: 12 }}>Сопроводительное письмо<textarea disabled={busy} value={letter} onChange={(event) => setLetter(event.target.value)} /></label>
       {item.questions.length > 0 ? <details><summary>Ответы на вопросы ({item.questions.length})</summary><div className={styles.form} style={{ marginTop: 10 }}>
         {item.questions.map((question) => <label className={styles.field} key={question.field_id}>{question.required ? "* " : ""}{question.label}
@@ -172,7 +175,7 @@ function QuestionnaireCard({
       </div></details> : null}
       <div className={styles.actionRow} style={{ marginTop: 12 }}>
         <Button className={styles.secondary} disabled={busy} onClick={() => onSave(letter, savedAnswers)}>Сохранить</Button>
-        <Button disabled={busy || incomplete} onClick={() => onConfirm(letter, savedAnswers)}>Подтвердить отправку</Button>
+        {!reviewLocked ? <Button disabled={busy || incomplete} onClick={() => onConfirm(letter, savedAnswers)}>Подтвердить отправку</Button> : null}
         <Button className={`${styles.secondary} ${styles.danger}`} disabled={busy} onClick={onSkip}>Пропустить</Button>
       </div>
     </>}

@@ -97,8 +97,13 @@ delete_hh_account_for_user = _using_default(accounts.delete_hh_account_for_user)
 reset_all_account_daily_limits = _using_default(accounts.reset_all_account_daily_limits)
 
 is_account_already_applied = _using_default(applications.is_account_already_applied)
+has_unresolved_application_attempt = _using_default(applications.has_unresolved_application_attempt)
 record_application_event = _using_default(applications.record_application_event)
 record_successful_application = _using_default(applications.record_successful_application)
+create_application_attempt = _using_default(applications.create_application_attempt)
+update_application_attempt = _using_default(applications.update_application_attempt)
+get_application_attempt = _using_default(applications.get_application_attempt)
+resolve_application_attempt = _using_default(applications.resolve_application_attempt)
 is_already_applied = _using_default(applications.is_already_applied)
 get_user_recent_applies = _using_default(applications.get_user_recent_applies)
 get_application_stats = _using_default(applications.get_application_stats)
@@ -150,6 +155,7 @@ __all__ = [
     "calculate_text_hash",
     "claim_pending_questionnaire",
     "complete_operation",
+    "create_application_attempt",
     "create_hh_account",
     "create_operation",
     "delete_hh_account_for_user",
@@ -159,6 +165,8 @@ __all__ = [
     "get_account_by_login",
     "get_account_for_user",
     "get_active_account",
+    "get_application_attempt",
+    "has_unresolved_application_attempt",
     "get_active_resume_snapshot",
     "get_application_stats",
     "get_db_connection",
@@ -183,6 +191,7 @@ __all__ = [
     "list_resume_snapshots",
     "record_application_event",
     "record_successful_application",
+    "resolve_application_attempt",
     "recover_interrupted_operations",
     "recover_interrupted_questionnaires",
     "reset_all_account_daily_limits",
@@ -197,6 +206,7 @@ __all__ = [
     "skip_pending_questionnaire",
     "sync_resume_snapshots",
     "update_account_session",
+    "update_application_attempt",
     "update_account_settings_for_user",
     "update_pending_questionnaire_answers",
     "update_pending_questionnaire_letter",

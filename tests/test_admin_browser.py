@@ -2,7 +2,6 @@
 
 import asyncio
 import time
-from pathlib import Path
 
 import pytest
 from patchright.async_api import expect
@@ -67,7 +66,9 @@ async def test_admin_full_browser_cycle_and_real_submission_stop(mini_app, exter
     await page.get_by_role("button", name="Остановить", exact=True).click()
     await page.get_by_role("button", name="Подтвердить остановку", exact=True).click()
     await expect(page.get_by_role("button", name="Остановить", exact=True)).to_have_count(0)
-    assert (await c.db.get_pending_questionnaire_for_user(42, qid))["status"] == "NEEDS_REVIEW"
+    # The traced submission was still filling the form, so stopping it is safe
+    # to retry and must not create a permanent manual-review lock.
+    assert (await c.db.get_pending_questionnaire_for_user(42, qid))["status"] == "FAILED"
     assert len(external_submission.calls) == 1
     await page.get_by_role("button", name="Люди", exact=True).click()
     await page.get_by_role("button", name="Отключить доступ", exact=True).click()
@@ -110,7 +111,7 @@ async def test_open_admin_loses_access_and_clears_content(mini_app):
     assert await page.get_by_role("navigation").count() == 0
 
 
-async def test_admin_mono_layout_screenshots_and_revision_conflict(mini_app):
+async def test_admin_mono_layout_screenshots_and_revision_conflict(mini_app, tmp_path):
     page = mini_app.page
     c = mini_app.runtime
     await grant(c, 9223372036854775807, "USER")
@@ -125,7 +126,9 @@ async def test_admin_mono_layout_screenshots_and_revision_conflict(mini_app):
         key(),
     )
     await c.admin_store.error("browser", "RESOURCE_FAILED")
-    output = Path(__file__).resolve().parents[1] / "output" / "admin-verification"
+    # Screenshots are verification artifacts, not source files. A per-test
+    # directory avoids dirtying the worktree and OneDrive file-lock races.
+    output = tmp_path / "admin-verification"
     output.mkdir(parents=True, exist_ok=True)
     for width in (320, 390, 430, 760, 1280):
         await page.set_viewport_size({"width": width, "height": 900})

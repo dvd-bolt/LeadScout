@@ -11,7 +11,7 @@ from leadscout.storage.admin_schema import SCHEMA as ADMIN_SCHEMA
 from leadscout.storage.connection import Database
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 async def table_columns(connection: aiosqlite.Connection, table: str) -> set[str]:
@@ -60,7 +60,7 @@ async def normalized_accounts(connection: aiosqlite.Connection) -> list[tuple[st
 
 
 async def init_db(database: Database) -> None:
-    """Create or transactionally migrate a database to schema v7."""
+    """Create or transactionally migrate a database to schema v8."""
     async with database.connection() as connection:
         await connection.execute("PRAGMA synchronous=NORMAL")
         await connection.execute("PRAGMA temp_store=MEMORY")
@@ -72,9 +72,34 @@ async def init_db(database: Database) -> None:
         if version == SCHEMA_VERSION:
             await connection.commit()
             return
-        if version == 6:
-            await execute_statements(connection, ADMIN_SCHEMA)
-            await connection.execute("PRAGMA user_version=7")
+        if version in {6, 7}:
+            if version == 6:
+                await execute_statements(connection, ADMIN_SCHEMA)
+            await add_missing_column(connection, "application_events", "attempt_id TEXT NOT NULL DEFAULT ''")
+            await add_missing_column(connection, "application_events", "stage TEXT NOT NULL DEFAULT ''")
+            await execute_statements(
+                connection,
+                """
+                CREATE TABLE IF NOT EXISTS application_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    account_id INTEGER NOT NULL,
+                    vacancy_hh_id TEXT NOT NULL DEFAULT '',
+                    vacancy_title TEXT NOT NULL DEFAULT '',
+                    current_stage TEXT NOT NULL DEFAULT 'SEARCH',
+                    outcome TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+                    safe_reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                    FOREIGN KEY (account_id) REFERENCES hh_accounts(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_attempts_owner_account
+                    ON application_attempts(user_id, account_id, updated_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_events_attempt ON application_events(attempt_id);
+                PRAGMA user_version=8;
+                """,
+            )
             await connection.commit()
             await connection.execute("PRAGMA journal_mode=WAL")
             return
@@ -329,7 +354,31 @@ async def init_db(database: Database) -> None:
             """,
         )
         await execute_statements(connection, ADMIN_SCHEMA)
-        await connection.execute("PRAGMA user_version=7")
+        await add_missing_column(connection, "application_events", "attempt_id TEXT NOT NULL DEFAULT ''")
+        await add_missing_column(connection, "application_events", "stage TEXT NOT NULL DEFAULT ''")
+        await execute_statements(
+            connection,
+            """
+            CREATE TABLE IF NOT EXISTS application_attempts (
+                attempt_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                vacancy_hh_id TEXT NOT NULL DEFAULT '',
+                vacancy_title TEXT NOT NULL DEFAULT '',
+                current_stage TEXT NOT NULL DEFAULT 'SEARCH',
+                outcome TEXT NOT NULL DEFAULT 'IN_PROGRESS',
+                safe_reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+                FOREIGN KEY (account_id) REFERENCES hh_accounts(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_attempts_owner_account
+                ON application_attempts(user_id, account_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_events_attempt ON application_events(attempt_id);
+            PRAGMA user_version=8;
+            """,
+        )
         await connection.commit()
         await connection.execute("PRAGMA journal_mode=WAL")
     logger.info("SQLite schema v%s initialized: %s", SCHEMA_VERSION, database.path)

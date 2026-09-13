@@ -25,6 +25,10 @@ from .account_client import HHAccountClient
 
 logger = logging.getLogger(__name__)
 RESUME_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{6,64}$")
+_DETAIL_BLOCKED_MESSAGE = (
+    "hh.ru запросил вход или проверку при открытии резюме. "
+    "Локальный текст сохранён; войдите заново и повторите синхронизацию."
+)
 
 
 def extract_text_from_pdf(pdf_path: str | os.PathLike[str]) -> str:
@@ -48,6 +52,45 @@ async def _wait_visible(locator: Locator, timeout: int = DEFAULT_TRANSITION_TIME
         return True
     except Exception:
         return False
+
+
+async def _extract_visible_resume_text(page: Page) -> tuple[str, bool]:
+    """Read only visible resume blocks, excluding navigation and executable DOM content."""
+    extracted = await page.evaluate(
+        r"""() => {
+            const pageText = (document.body?.innerText || '').trim();
+            const blocked = Boolean(document.querySelector(
+                'input[type="password"], [data-qa*="captcha" i], [data-qa*="login" i], [role="dialog"]'
+            )) || /(?:captcha|пройдите\s+(?:проверку|капчу)|подтвердите,?\s*что\s+вы\s+не\s+робот|войдите\s+(?:в|или)|вход\s+на\s+hh)/i.test(pageText);
+            const pageContent = document.querySelector('[data-qa="resume-page-content"], [data-qa="resume-view"]');
+            const blocks = [...document.querySelectorAll('[data-qa="resume-block-container"]')]
+                .filter((node) => !node.parentElement?.closest('[data-qa="resume-block-container"]'));
+            const sources = pageContent ? [pageContent] : (blocks.length ? blocks : [...document.querySelectorAll('main')]);
+            const ignored = 'script, style, noscript, svg, nav, header, footer, form, button, input, select, textarea, [hidden], [aria-hidden="true"], [role="dialog"], [aria-modal="true"], [data-qa*="header" i], [data-qa*="footer" i], [data-qa*="menu" i], [data-qa*="sidebar" i]';
+            const text = sources.map((source) => {
+                const clone = source.cloneNode(true);
+                clone.querySelectorAll(ignored).forEach((node) => node.remove());
+                // innerText only honours CSS visibility and rendered line breaks
+                // while the clone is attached. Keep it off-screen and inert for
+                // the duration of this synchronous read.
+                Object.assign(clone.style, {
+                    position: 'fixed',
+                    left: '-100000px',
+                    top: '0',
+                    width: Math.max(320, source.getBoundingClientRect().width) + 'px',
+                    opacity: '0',
+                    pointerEvents: 'none',
+                    zIndex: '-1',
+                });
+                document.body.appendChild(clone);
+                const value = (clone.innerText || '').replace(/\r\n?/g, '\n').trim();
+                clone.remove();
+                return value;
+            }).filter(Boolean).join('\n\n');
+            return { blocked, text };
+        }"""
+    )
+    return str(extracted.get("text") or "").strip(), bool(extracted.get("blocked"))
 
 
 class HHResumeManager(HHAccountClient):
@@ -115,11 +158,10 @@ class HHResumeManager(HHAccountClient):
                 detail_page = await context.new_page()
                 try:
                     await detail_page.goto(raw["href"], wait_until="domcontentloaded", timeout=20_000)
-                    body = detail_page.locator(
-                        '[data-qa="resume-block-container"], [data-qa="resume-page-content"], main'
-                    ).first
-                    if await body.count() > 0:
-                        resume_text = ((await body.text_content()) or "").strip()[:PDF_MAX_TEXT_CHARS]
+                    resume_text, blocked = await _extract_visible_resume_text(detail_page)
+                    if "/account/login" in detail_page.url or blocked:
+                        return {"status": "ERROR", "message": _DETAIL_BLOCKED_MESSAGE}
+                    resume_text = resume_text[:PDF_MAX_TEXT_CHARS]
                 except Exception:
                     logger.debug("Resume text was not available for %s", raw["id"])
                 finally:

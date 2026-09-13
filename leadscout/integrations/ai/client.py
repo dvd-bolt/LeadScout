@@ -9,7 +9,7 @@ from typing import TypeVar
 
 from google import genai
 from google.genai import errors, types
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from leadscout.core import config
 
@@ -85,6 +85,9 @@ class GeminiService:
         attempts: int = 3,
     ) -> T:
         client = await self._get_client()
+        # The one configured key is intentionally kept for the whole service
+        # lifetime.  Retrying a transient request never rotates credentials.
+        attempts = max(1, min(int(attempts), 3))
         generation_config = types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=schema,
@@ -95,23 +98,33 @@ class GeminiService:
         for attempt in range(attempts):
             await checkpoint()
             try:
-                response = await client.aio.models.generate_content(
-                    model=self.model,
-                    contents=contents,
-                    config=generation_config,
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=self.model,
+                        contents=contents,
+                        config=generation_config,
+                    ),
+                    timeout=self.timeout_ms / 1_000,
                 )
                 parsed = response.parsed
-                if isinstance(parsed, schema):
-                    return parsed
-                if isinstance(parsed, dict):
-                    return schema.model_validate(parsed)
+                try:
+                    if isinstance(parsed, schema):
+                        return parsed
+                    if isinstance(parsed, dict):
+                        return schema.model_validate(parsed)
+                except (TypeError, ValueError, ValidationError) as exc:
+                    raise AIServiceError("ИИ-сервис вернул пустой или некорректный ответ.") from exc
                 raise AIServiceError("ИИ-сервис вернул пустой или некорректный ответ.")
+            except asyncio.CancelledError:
+                # Stopping an account must interrupt its AI wait immediately;
+                # cancellation is never converted into a retry or a provider error.
+                raise
             except Exception as exc:
                 if not _is_transient(exc) or attempt == attempts - 1:
                     logger.error("Gemini request failed: %s", _error_label(exc))
                     if isinstance(exc, AIServiceError):
                         raise
-                    raise AIServiceError("ИИ-сервис временно недоступен. Повторите попытку позже.") from exc
+                    raise AIServiceError(_safe_error_message(exc)) from exc
                 delay = (2**attempt) + random.uniform(0.0, 0.5)
                 logger.warning("Transient Gemini failure (%s), retrying in %.1fs", _error_label(exc), delay)
                 await asyncio.sleep(delay)
@@ -127,10 +140,25 @@ class GeminiService:
 def _is_transient(exc: Exception) -> bool:
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
         return True
-    return isinstance(exc, errors.APIError) and exc.code in {429, 500, 502, 503, 504}
+    return isinstance(exc, errors.APIError) and _api_error_code(exc) in {429, 500, 502, 503, 504}
+
+
+def _api_error_code(exc: errors.APIError) -> int | None:
+    try:
+        return int(exc.code)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_error_message(exc: Exception) -> str:
+    if isinstance(exc, errors.APIError) and _api_error_code(exc) in {401, 403}:
+        return "ИИ-сервис отклонил настроенный ключ. Проверьте GEMINI_API_KEY."
+    if isinstance(exc, AIServiceError):
+        return str(exc)
+    return "ИИ-сервис временно недоступен. Повторите попытку позже."
 
 
 def _error_label(exc: Exception) -> str:
     if isinstance(exc, errors.APIError):
-        return f"APIError {exc.code} {exc.status or ''}".strip()
+        return f"APIError {_api_error_code(exc) or ''} {exc.status or ''}".strip()
     return type(exc).__name__

@@ -47,5 +47,19 @@ export function eventStatusLabel(status: string) {
   if (status.startsWith("SKIPPED")) return "Вакансия пропущена";
   if (status === "QUESTIONNAIRE_REQUIRED") return "Нужны ответы";
   if (status === "ALREADY_APPLIED") return "Отклик уже отправлен";
+  if (status === "REVIEWED_NOT_APPLIED") return "Проверено: отклик не отправлен";
   return status;
+}
+
+export function applicationStageLabel(stage?: string) {
+  switch (stage) {
+    case "SEARCH": return "поиск";
+    case "LOADING": return "загрузка вакансии";
+    case "PARSING": return "разбор вакансии";
+    case "AI_PREPARATION": return "подготовка ИИ";
+    case "FILLING": return "заполнение формы";
+    case "SUBMITTING": return "отправка формы";
+    case "CONFIRMING": return "подтверждение результата";
+    default: return stage || "";
+  }
 }

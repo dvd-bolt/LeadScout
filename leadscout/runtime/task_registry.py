@@ -110,9 +110,12 @@ class TaskRegistry:
             ):
                 self.live.pop(task_id, None)
 
-    async def perform_login(self, manager, user_id, method, run):
+    async def perform_login(self, manager, user_id, method, run, *, account_id=None):
+        # Keep the no-account compatibility flow addressable by user, while
+        # all current account-backed flows use the composite key.
+        login_key = (user_id, account_id) if account_id is not None else user_id
         async with self.access.admission(user_id):
-            existing = self.login_ids.get(user_id)
+            existing = self.login_ids.get(login_key)
             if existing:
                 item = await self.store.task(existing)
                 stopping = self.stop_attempts.get(existing)
@@ -126,10 +129,14 @@ class TaskRegistry:
                     if item and item["status"] in ACTIVE_TASKS:
                         await self.store.task_state(existing, "CANCELLED", "CANCELLED")
                     self.live.pop(existing, None)
-                task_id, task = await self.start(user_id, "login", run, cleanup=lambda: manager.close_user(user_id))
-                self.login_ids[user_id] = task_id
+                close_login = getattr(manager, "close_login", None)
+                cleanup = (
+                    (lambda: close_login(user_id, account_id)) if close_login else (lambda: manager.close_user(user_id))
+                )
+                task_id, task = await self.start(user_id, "login", run, account_id=account_id, cleanup=cleanup)
+                self.login_ids[login_key] = task_id
             else:
-                task_id = self.login_ids.get(user_id)
+                task_id = self.login_ids.get(login_key)
                 if not task_id or task_id not in self.live:
                     raise AccessError("LOGIN_NOT_FOUND", "Вход не найден. Начните заново.", 409)
                 live = self.live[task_id]
@@ -142,13 +149,17 @@ class TaskRegistry:
             result = await task
             if method == "cancel":
                 await self.store.task_state(task_id, "CANCELLED", "CANCELLED")
-            account_id = manager.login_account_id(user_id)
-            if account_id is not None:
-                await self.store.execute("UPDATE admin_tasks SET account_id=? WHERE id=?", (account_id, task_id))
+            tracked_account_id = (
+                manager.login_account_id(user_id)
+                if account_id is None
+                else manager.login_account_id(user_id, account_id)
+            )
+            if tracked_account_id is not None:
+                await self.store.execute("UPDATE admin_tasks SET account_id=? WHERE id=?", (tracked_account_id, task_id))
             item = await self.store.task(task_id)
             if item and item["status"] not in ACTIVE_TASKS:
                 self.live.pop(task_id, None)
-                self.login_ids.pop(user_id, None)
+                self.login_ids.pop(login_key, None)
             return result
         except asyncio.CancelledError:
             raise AccessError("TASK_CANCELLED", "Вход остановлен. Откройте приложение заново.", 409) from None
@@ -226,8 +237,9 @@ class TaskRegistry:
                 return {"task_id": task_id, "status": "FAILED", "code": "RESOURCE_FAILED"}
         await self.store.task_state(task_id, "CANCELLED", "CANCELLED")
         self.live.pop(task_id, None)
-        if self.login_ids.get(live.user_id) == task_id:
-            self.login_ids.pop(live.user_id, None)
+        for key, current in tuple(self.login_ids.items()):
+            if current == task_id:
+                self.login_ids.pop(key, None)
         return {"task_id": task_id, "status": "STOPPED"}
 
     def ai_result(self, success):

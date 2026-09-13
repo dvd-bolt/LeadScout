@@ -102,6 +102,8 @@ async def test_resume_snapshots_and_questionnaire_state_are_scoped(isolated_db):
     assert await database.get_resume_snapshot_for_user(2, snapshot_id) is None
     assert await database.set_active_resume_snapshot(1, account["id"], snapshot_id)
     assert (await database.get_account_for_user(1, account["id"]))["resume_text"] == "Python " * 20
+    assert not await database.attach_resume_text(1, account["id"], "resume_123", "")
+    assert (await database.get_resume_snapshot_for_user(1, snapshot_id))["extracted_text"] == "Python " * 20
 
     apply_id = await database.save_pending_questionnaire_account(
         1,
@@ -144,7 +146,7 @@ async def test_schema_version_and_foreign_keys(isolated_db):
     async with database.get_db_connection() as db:
         version = (await (await db.execute("PRAGMA user_version")).fetchone())[0]
         foreign_keys = (await (await db.execute("PRAGMA foreign_keys")).fetchone())[0]
-    assert version == 7
+    assert version == database.SCHEMA_VERSION
     assert foreign_keys == 1
 
 
@@ -186,7 +188,7 @@ async def test_account_delete_cascades_owned_records(isolated_db):
 
     assert await database.delete_hh_account_for_user(1, account["id"])
     async with database.get_db_connection() as db:
-        for table in ("resume_snapshots", "hh_applies", "pending_questionnaires", "application_events"):
+        for table in ("resume_snapshots", "hh_applies", "pending_questionnaires", "application_events", "application_attempts"):
             count = (await (await db.execute(f"SELECT COUNT(*) FROM {table}")).fetchone())[0]
             assert count == 0
         audit_account = (
@@ -224,4 +226,4 @@ async def test_legacy_users_table_is_migrated(tmp_path, monkeypatch):
         columns = await database._table_columns(db, "users")
         version = (await (await db.execute("PRAGMA user_version")).fetchone())[0]
     assert {"applied_date", "active_account_id", "send_cover_letter"} <= columns
-    assert version == 7
+    assert version == database.SCHEMA_VERSION

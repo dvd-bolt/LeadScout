@@ -6,7 +6,7 @@ import type { LoginFlowResponse } from "../../shared/types/api";
 import { Button, Message, type Notice } from "../../shared/ui";
 import styles from "../../shared/ui/UI.module.css";
 
-type LoginStep = { status: string; captcha?: string; message?: string };
+type LoginStep = { status: string; accountId?: number; captcha?: string; message?: string };
 
 export function LoginPanel() {
   const client = useQueryClient();
@@ -24,7 +24,7 @@ export function LoginPanel() {
       return;
     }
     const status = data.status === "INVALID_CAPTCHA" ? "WAITING_FOR_CAPTCHA" : data.status;
-    setStep((previous) => ({ status, captcha: data.captcha_data_uri ?? previous?.captcha, message: data.message }));
+    setStep((previous) => ({ status, accountId: data.account_id ?? previous?.accountId, captcha: data.captcha_data_uri ?? previous?.captcha, message: data.message }));
     setNotice(data.status === "SUCCESS"
       ? { text: "Вход выполнен" }
       : data.message ? { text: data.message, error: data.status === "INVALID_CAPTCHA" } : null);
@@ -32,14 +32,14 @@ export function LoginPanel() {
   const handleError = (error: unknown) => setNotice({ text: errorMessage(error), error: true });
   const start = useMutation({ mutationFn: () => api.startLogin(login), onSuccess: handleResult, onError: handleError });
   const submit = useMutation({
-    mutationFn: () => step?.status === "WAITING_FOR_CAPTCHA" ? api.submitCaptcha(code) : api.submitOtp(code),
+    mutationFn: () => step?.status === "WAITING_FOR_CAPTCHA" ? api.submitCaptcha(code, step.accountId) : api.submitOtp(code, step?.accountId),
     onSuccess: handleResult,
     onError: handleError,
   });
-  const reload = useMutation({ mutationFn: api.reloadCaptcha, onSuccess: handleResult, onError: handleError });
-  const language = useMutation({ mutationFn: api.switchCaptchaLanguage, onSuccess: handleResult, onError: handleError });
+  const reload = useMutation({ mutationFn: () => api.reloadCaptcha(step?.accountId), onSuccess: handleResult, onError: handleError });
+  const language = useMutation({ mutationFn: () => api.switchCaptchaLanguage(step?.accountId), onSuccess: handleResult, onError: handleError });
   const cancel = useMutation({
-    mutationFn: api.cancelLogin,
+    mutationFn: () => api.cancelLogin(step?.accountId),
     onSuccess: () => { setStep(null); setCode(""); setNotice({ text: "Вход отменён" }); },
     onError: handleError,
   });

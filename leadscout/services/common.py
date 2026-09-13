@@ -21,7 +21,10 @@ _ACCOUNT_SETTINGS = {
 
 _EDITABLE_QUESTIONNAIRE_STATES = {"PENDING", "FAILED", "NEEDS_REVIEW"}
 
-_CONFIRMABLE_QUESTIONNAIRE_STATES = _EDITABLE_QUESTIONNAIRE_STATES | {"APPROVED"}
+# NEEDS_REVIEW means that the browser may already have sent the response.  It
+# is visible and may be corrected or skipped, but cannot start another external
+# submission until the result has been checked on hh.ru through a new flow.
+_CONFIRMABLE_QUESTIONNAIRE_STATES = {"PENDING", "FAILED", "APPROVED"}
 
 
 async def _await(value: Any) -> Any:

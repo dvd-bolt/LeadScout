@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit
 
 from patchright.async_api import Locator, Page
 
-from leadscout.integrations.vacancies import extract_vacancy_details
+from leadscout.integrations.vacancies import extract_vacancy_details, vacancy_id_from_url, vacancy_page_status
 from leadscout.models.questions import FormAnswer, JobApplicationPayload, QuestionField
 from utils.humanization import (
     DEFAULT_TRANSITION_TIMEOUT_MS,
@@ -20,6 +21,8 @@ from utils.humanization import (
 from utils.validation import normalize_hh_vacancy_url
 
 logger = logging.getLogger(__name__)
+
+TraceCallback = Callable[[str], Awaitable[None]]
 
 DATA_QA = {
     "response": (
@@ -279,6 +282,26 @@ async def _is_hh_location(url: str) -> bool:
     return host == "hh.ru" or host.endswith(".hh.ru")
 
 
+async def _trace_stage(trace: TraceCallback | None, stage: str) -> None:
+    """Diagnostics must not replace the original browser result with their own error."""
+    if trace is None:
+        return
+    try:
+        await trace(stage)
+    except Exception:
+        logger.warning("Application stage trace could not be recorded")
+
+
+async def _known_application_block(page: Page, expected_vacancy_id: str | None = None) -> str | None:
+    """Use the same observable page-state classifier as vacancy extraction."""
+    return await vacancy_page_status(page, expected_vacancy_id)
+
+
+def _application_page_status(status: str) -> str:
+    """An external handoff is skipped, while blocked pages remain explicit errors."""
+    return "SKIPPED_EXTERNAL" if status == "ERROR_EXTERNAL" else status
+
+
 async def apply_to_hh_vacancy(
     page: Page,
     resume_context: str,
@@ -288,14 +311,21 @@ async def apply_to_hh_vacancy(
     stop_words: list[str] | None = None,
     *,
     ai,
+    trace: TraceCallback | None = None,
 ) -> tuple[str, str | None, dict | None]:
     try:
         normalized_url = normalize_hh_vacancy_url(vacancy_url)
         if not normalized_url:
             return "ERROR_INVALID_URL", None, None
         vacancy_url = normalized_url
+        await _trace_stage(trace, "LOADING")
         await page.goto(vacancy_url, wait_until="domcontentloaded", timeout=30_000)
+        if blocked := await _known_application_block(page, vacancy_id_from_url(vacancy_url)):
+            return _application_page_status(blocked), None, None
+        await _trace_stage(trace, "PARSING")
         vacancy = await extract_vacancy_details(page)
+        if vacancy.get("status", "SUCCESS") != "SUCCESS":
+            return _application_page_status(str(vacancy.get("status"))), None, vacancy
         await human_scroll(page, steps=2)
 
         full_text = f"{vacancy['title']} {vacancy['description']}".lower()
@@ -306,11 +336,12 @@ async def apply_to_hh_vacancy(
 
         # Relevance must be decided before the first response click because some
         # hh.ru vacancies use a one-click response without an intermediate modal.
-        payload = await ai.generate_hh_job_application(
-            resume_context,
-            vacancy["description"],
-            [],
-        )
+        await _trace_stage(trace, "AI_PREPARATION")
+        try:
+            payload = await ai.generate_hh_job_application(resume_context, vacancy["description"], [])
+        except Exception:
+            logger.warning("AI application preparation failed")
+            return "ERROR_AI", None, vacancy
         payload.cover_letter = effective_cover_letter(payload.cover_letter, send_cover_letter)
         if not payload.is_relevant:
             return (
@@ -325,23 +356,29 @@ async def apply_to_hh_vacancy(
         response_button = page.locator(DATA_QA["response"]).first
         if not await _is_visible(response_button):
             return "ERROR_NO_BUTTON", None, vacancy
+        await _trace_stage(trace, "SUBMITTING")
         await human_click(page, response_button)
         await page.wait_for_timeout(1500)
 
         if not await _is_hh_location(page.url):
             return "SKIPPED_EXTERNAL", None, {**vacancy, "external_url": page.url}
+        if blocked := await _known_application_block(page, vacancy_id_from_url(vacancy_url)):
+            return _application_page_status(blocked), None, vacancy
+        await _trace_stage(trace, "CONFIRMING")
         if await verify_hh_application_success(page):
             return "APPLIED_DIRECT", None, vacancy
 
+        await _trace_stage(trace, "FILLING")
         if not await handle_resume_selection_if_needed(page, target_resume_id):
             return "ERROR_RESUME_SELECTION", None, vacancy
         questions = await extract_questionnaire_fields(page)
         if questions:
-            payload = await ai.generate_hh_job_application(
-                resume_context,
-                vacancy["description"],
-                questions,
-            )
+            await _trace_stage(trace, "AI_PREPARATION")
+            try:
+                payload = await ai.generate_hh_job_application(resume_context, vacancy["description"], questions)
+            except Exception:
+                logger.warning("AI questionnaire preparation failed")
+                return "ERROR_AI", None, vacancy
             payload.cover_letter = effective_cover_letter(
                 payload.cover_letter,
                 send_cover_letter,
@@ -379,14 +416,17 @@ async def apply_to_hh_vacancy(
 
         if not await _open_letter_and_fill(page, payload.cover_letter):
             return "ERROR_LETTER_FIELD", None, vacancy
+        await _trace_stage(trace, "SUBMITTING")
         if not await _submit_response_form(page):
             return "ERROR_SUBMIT_BUTTON", None, vacancy
+        await _trace_stage(trace, "CONFIRMING")
         if not await verify_hh_application_success(page):
             return "ERROR_SUBMIT_UNCONFIRMED", None, vacancy
         return "APPLIED_WITH_LETTER", payload.cover_letter, vacancy
     except Exception as exc:
-        logger.error("Vacancy processing failed for %s: %s", vacancy_url, type(exc).__name__)
-        return "ERROR_BROWSER", None, None
+        status = "ERROR_TIMEOUT" if "timeout" in type(exc).__name__.lower() else "ERROR_BROWSER"
+        logger.error("Vacancy processing failed: %s", type(exc).__name__)
+        return status, None, None
 
 
 async def submit_approved_questionnaire(
@@ -395,13 +435,22 @@ async def submit_approved_questionnaire(
     cover_letter: str,
     answers: list[dict] | None = None,
     target_resume_id: str | None = None,
+    *,
+    trace: TraceCallback | None = None,
 ) -> tuple[bool, str]:
     try:
         normalized_url = normalize_hh_vacancy_url(vacancy_url)
         if not normalized_url:
             return False, "Некорректная ссылка вакансии hh.ru."
         vacancy_url = normalized_url
+        await _trace_stage(trace, "LOADING")
         await page.goto(vacancy_url, wait_until="domcontentloaded", timeout=30_000)
+        if blocked := await _known_application_block(page, vacancy_id_from_url(vacancy_url)):
+            return False, _safe_submit_message(_application_page_status(blocked))
+        await _trace_stage(trace, "PARSING")
+        vacancy = await extract_vacancy_details(page)
+        if vacancy.get("status", "SUCCESS") != "SUCCESS":
+            return False, _safe_submit_message(_application_page_status(str(vacancy.get("status"))))
         if await verify_hh_application_success(page):
             return True, "Отклик уже подтвержден на hh.ru."
         response_button = page.locator(DATA_QA["response"]).first
@@ -413,18 +462,33 @@ async def submit_approved_questionnaire(
             return False, "Вакансия перенаправляет на внешний сайт."
         if not await handle_resume_selection_if_needed(page, target_resume_id):
             return False, "Выбранное резюме не найдено в форме отклика."
+        await _trace_stage(trace, "FILLING")
         if answers and not await fill_questionnaire_form(page, answers):
             return False, "Не удалось заполнить все поля анкеты."
         if not await _open_letter_and_fill(page, cover_letter):
             return False, "Поле сопроводительного письма не появилось или не заполнилось."
+        await _trace_stage(trace, "SUBMITTING")
         if not await _submit_response_form(page):
             return False, "Кнопка отправки анкеты не найдена."
+        await _trace_stage(trace, "CONFIRMING")
         if not await verify_hh_application_success(page):
             return False, "hh.ru не подтвердил отправку отклика."
         return True, "Отклик с анкетой подтвержден на hh.ru."
     except Exception as exc:
-        logger.error("Questionnaire submission failed for %s: %s", vacancy_url, type(exc).__name__)
-        return False, "Не удалось отправить анкету из-за ошибки браузера."
+        logger.error("Questionnaire submission failed: %s", type(exc).__name__)
+        if "timeout" in type(exc).__name__.lower():
+            return False, "Операция превысила время ожидания; отправка не подтверждена."
+        return False, "Не удалось отправить анкету; точная причина не установлена."
+
+
+def _safe_submit_message(status: str) -> str:
+    return {
+        "ERROR_SESSION_EXPIRED": "Сессия требует повторного входа.",
+        "ERROR_CAPTCHA": "hh.ru запросил CAPTCHA; требуется действие пользователя.",
+        "ERROR_UNAVAILABLE": "Вакансия недоступна или закрыта.",
+        "ERROR_INCOMPLETE": "Страница вакансии не завершила загрузку.",
+        "SKIPPED_EXTERNAL": "Вакансия перенаправляет на внешний сайт.",
+    }[status]
 
 
 __all__ = [

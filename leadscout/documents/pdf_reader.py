@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import unicodedata
 from pathlib import Path
 
 from pypdf import PdfReader
@@ -16,6 +17,26 @@ logger = logging.getLogger(__name__)
 
 class PDFValidationError(ValueError):
     """A user-safe validation failure for an uploaded resume PDF."""
+
+
+def _validate_extracted_text(text: str) -> None:
+    """Reject a broken PDF text layer without attempting to rewrite its encoding."""
+    visible = [character for character in text if not character.isspace()]
+    if not visible:
+        raise PDFValidationError("В PDF не найден читаемый текст. Скан без текстового слоя не поддерживается.")
+    unreadable = sum(
+        character == "\ufffd"
+        or (ord(character) < 32 and character not in "\t\n\r")
+        or unicodedata.category(character) == "Co"
+        for character in visible
+    )
+    # A few unusual glyphs can be legitimate, but a text layer made mostly of
+    # replacement/control/private-use glyphs cannot be safely shown or sent to AI.
+    if unreadable >= max(3, len(visible) // 50):
+        raise PDFValidationError(
+            "Текстовый слой PDF повреждён или использует неподдерживаемый шрифт. "
+            "Загрузите PDF с корректным текстовым слоем; OCR не поддерживается."
+        )
 
 
 def extract_text_from_pdf(
@@ -60,6 +81,7 @@ def extract_text_from_pdf(
         raise PDFValidationError("Не удалось прочитать PDF. Проверьте, что файл не поврежден.") from exc
     if len(result) < 50:
         raise PDFValidationError("В PDF не найден читаемый текст. Скан без текстового слоя не поддерживается.")
+    _validate_extracted_text(result)
     logger.info("Extracted %d characters from a PDF", len(result))
     return result
 

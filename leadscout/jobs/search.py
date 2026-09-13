@@ -9,6 +9,8 @@ from typing import Any
 from urllib.parse import quote_plus
 
 from leadscout.core.config import DEFAULT_MAX_DELAY_SEC, DEFAULT_MIN_DELAY_SEC
+from leadscout.diagnostics import ApplicationAttemptTracer, safe_reason_for_status
+from leadscout.integrations.vacancies import extract_search_vacancies, vacancy_id_from_url
 from leadscout.notifications import Notifier
 from leadscout.notifications.formatters import (
     automation_stopped_no_resume,
@@ -45,10 +47,13 @@ class AccountSearchJob:
             return {"status": "NOT_FOUND"}
         name = account.get("account_name") or account.get("phone_or_email") or f"ID {account_id}"
         if account.get("session_status") != "ACTIVE":
+            await self._record_terminal(user_id, account_id, "", "SKIPPED_NOT_AUTHORIZED")
             return {"status": "SKIPPED_NOT_AUTHORIZED"}
         if not account.get("auto_apply_enabled"):
+            await self._record_terminal(user_id, account_id, "", "SKIPPED_STOPPED")
             return {"status": "SKIPPED_STOPPED"}
         if account.get("applied_today", 0) >= account.get("daily_limit", 50):
+            await self._record_terminal(user_id, account_id, "", "SKIPPED_LIMIT")
             return {"status": "SKIPPED_LIMIT"}
         if not account.get("resume_text", "").strip() or not account.get("active_resume_hh_id", "").strip():
             await self.dependencies.update_account_settings_for_user(user_id, account_id, auto_apply_enabled=0)
@@ -58,10 +63,12 @@ class AccountSearchJob:
                 automation_stopped_no_resume(),
                 logger=logger,
             )
+            await self._record_terminal(user_id, account_id, "", "SKIPPED_NO_RESUME")
             return {"status": "SKIPPED_NO_RESUME"}
 
         encrypted_state = account.get("encrypted_storage_state")
         if not encrypted_state:
+            await self._record_terminal(user_id, account_id, "", "SKIPPED_NO_SESSION")
             return {"status": "SKIPPED_NO_SESSION"}
         security = self.dependencies.session_security()
         try:
@@ -69,11 +76,13 @@ class AccountSearchJob:
         except SessionDecryptionError:
             await self.dependencies.update_account_session(user_id, account_id, b"", "EXPIRED")
             await deliver_safely(self.notifier, user_id, expired_session(name), logger=logger)
+            await self._record_terminal(user_id, account_id, "", "ERROR_SESSION_EXPIRED")
             return {"status": "EXPIRED_SESSION"}
 
         engine = await self.dependencies.get_browser_engine(account.get("proxy_url") or None)
         context = None
         processed = 0
+        active_attempt: ApplicationAttemptTracer | None = None
         try:
             context = await engine.create_context(storage_state=storage_state)
             search_page = await context.new_page()
@@ -89,9 +98,47 @@ class AccountSearchJob:
                     current = await self.dependencies.get_account_for_user(user_id, account_id)
                     if not current or not await self._account_may_continue(user_id, account_id):
                         break
+                    active_attempt = await ApplicationAttemptTracer.start(
+                        self.dependencies, user_id, account_id, vacancy_url, vacancy_title
+                    )
                     if stop_words and any(word in vacancy_title.lower() for word in stop_words):
+                        await self._record_terminal(
+                            user_id, account_id, vacancy_url, "SKIPPED_STOP_WORD", vacancy_title, tracer=active_attempt
+                        )
+                        active_attempt = None
                         continue
                     if await self.dependencies.is_account_already_applied(user_id, account_id, vacancy_url):
+                        await self._record_terminal(
+                            user_id,
+                            account_id,
+                            vacancy_url,
+                            "SKIPPED_ALREADY_APPLIED",
+                            vacancy_title,
+                            tracer=active_attempt,
+                        )
+                        active_attempt = None
+                        continue
+                    if await self.dependencies.has_unresolved_application_attempt(user_id, account_id, vacancy_url):
+                        await self._record_terminal(
+                            user_id,
+                            account_id,
+                            vacancy_url,
+                            "SKIPPED_NEEDS_REVIEW",
+                            vacancy_title,
+                            tracer=active_attempt,
+                        )
+                        active_attempt = None
+                        continue
+                    if await self.dependencies.has_open_questionnaire_for_vacancy(user_id, account_id, vacancy_url):
+                        await self._record_terminal(
+                            user_id,
+                            account_id,
+                            vacancy_url,
+                            "SKIPPED_NEEDS_REVIEW",
+                            vacancy_title,
+                            tracer=active_attempt,
+                        )
+                        active_attempt = None
                         continue
                     page = await context.new_page()
                     snapshot = await self.dependencies.get_active_resume_snapshot(user_id, account_id)
@@ -106,13 +153,20 @@ class AccountSearchJob:
                         "extracted_text": current["resume_text"],
                     }
                     try:
-                        status, cover_letter, extra = await self.dependencies.apply_to_hh_vacancy(
+                        apply = self.dependencies.apply_to_hh_vacancy
+                        kwargs = (
+                            {"trace": active_attempt.stage}
+                            if active_attempt and self._supports_trace("apply_to_hh_vacancy")
+                            else {}
+                        )
+                        status, cover_letter, extra = await apply(
                             page=page,
                             resume_context=current["resume_text"],
                             vacancy_url=vacancy_url,
                             target_resume_id=current["active_resume_hh_id"],
                             send_cover_letter=bool(current.get("send_cover_letter", 1)),
                             stop_words=stop_words,
+                            **kwargs,
                         )
                     except asyncio.CancelledError:
                         raise
@@ -131,15 +185,36 @@ class AccountSearchJob:
                     title = details.get("title") or details.get("vacancy", {}).get("title") or vacancy_title
                     company = details.get("company") or details.get("vacancy", {}).get("company") or ""
                     if status.startswith("APPLIED"):
-                        created, count = await self.dependencies.record_successful_application(
-                            user_id,
-                            account_id,
-                            vacancy_url,
-                            cover_letter or "",
-                            status,
-                            title,
-                            company,
-                        )
+                        if active_attempt:
+                            await active_attempt.stage("CONFIRMING")
+                        reason = await self._finish_attempt(active_attempt, status)
+                        try:
+                            created, count = await self.dependencies.record_successful_application(
+                                user_id,
+                                account_id,
+                                vacancy_url,
+                                cover_letter or "",
+                                status,
+                                title,
+                                company,
+                                details=reason,
+                                attempt_id=active_attempt.attempt_id if active_attempt else "",
+                            )
+                        except Exception:
+                            # hh.ru has confirmed the response, but a local write
+                            # failure must not fall through to another browser try.
+                            await self._record_terminal(
+                                user_id,
+                                account_id,
+                                vacancy_url,
+                                "ERROR_LOCAL_PERSISTENCE",
+                                title,
+                                company,
+                                tracer=active_attempt,
+                            )
+                            logger.error("Confirmed response could not be persisted for account %d", account_id)
+                            active_attempt = None
+                            continue
                         if created:
                             processed += 1
                             await deliver_safely(
@@ -157,6 +232,27 @@ class AccountSearchJob:
                                 logger=logger,
                             )
                             await asyncio.sleep(random.uniform(self.min_delay, self.max_delay))
+                        elif await self.dependencies.is_account_already_applied(user_id, account_id, vacancy_url):
+                            await self._record_terminal(
+                                user_id,
+                                account_id,
+                                vacancy_url,
+                                "ALREADY_APPLIED",
+                                title,
+                                company,
+                                tracer=active_attempt,
+                            )
+                        else:
+                            await self._record_terminal(
+                                user_id,
+                                account_id,
+                                vacancy_url,
+                                "ERROR_LOCAL_PERSISTENCE",
+                                title,
+                                company,
+                                tracer=active_attempt,
+                            )
+                            logger.error("Confirmed response could not be recorded for account %d", account_id)
                     elif status == "QUESTIONNAIRE_REQUIRED" and details:
                         apply_id = await self.dependencies.save_pending_questionnaire_account(
                             user_id,
@@ -167,6 +263,9 @@ class AccountSearchJob:
                             details.get("questions", []),
                             details.get("ai_payload", {}),
                             source_resume,
+                        )
+                        await self._record_terminal(
+                            user_id, account_id, vacancy_url, status, title, company, tracer=active_attempt
                         )
                         await deliver_safely(
                             self.notifier,
@@ -182,18 +281,28 @@ class AccountSearchJob:
                             logger=logger,
                         )
                     elif status != "ALREADY_APPLIED":
-                        await self.dependencies.record_application_event(
-                            user_id,
-                            account_id,
-                            vacancy_url,
-                            status,
-                            title,
-                            company,
+                        if status == "ERROR_SESSION_EXPIRED":
+                            await self.dependencies.update_account_session(user_id, account_id, b"", "EXPIRED")
+                        await self._record_terminal(
+                            user_id, account_id, vacancy_url, status, title, company, tracer=active_attempt
                         )
+                    else:
+                        await self._record_terminal(
+                            user_id, account_id, vacancy_url, status, title, company, tracer=active_attempt
+                        )
+                    active_attempt = None
 
             return {"status": "SUCCESS", "processed": processed}
         except asyncio.CancelledError:
             logger.info("Account task %d cancelled", account_id)
+            if active_attempt:
+                await self._record_terminal(
+                    user_id,
+                    account_id,
+                    active_attempt.vacancy_hh_id,
+                    "SKIPPED_STOPPED",
+                    tracer=active_attempt,
+                )
             raise
         except Exception as exc:
             logger.error("Account task %d failed: %s", account_id, type(exc).__name__)
@@ -222,6 +331,42 @@ class AccountSearchJob:
                         account_id,
                         type(exc).__name__,
                     )
+
+    async def _finish_attempt(self, tracer: ApplicationAttemptTracer | None, status: str) -> str:
+        return await tracer.finish(status) if tracer else safe_reason_for_status(status)
+
+    def _supports_trace(self, operation: str) -> bool:
+        checker = getattr(self.dependencies, "supports_application_trace", None)
+        return bool(checker and checker(operation))
+
+    async def _record_terminal(
+        self,
+        user_id: int,
+        account_id: int,
+        vacancy_url: str,
+        status: str,
+        vacancy_title: str = "",
+        company: str = "",
+        *,
+        tracer: ApplicationAttemptTracer | None = None,
+    ) -> None:
+        """Persist exactly one user-visible terminal event for an attempt."""
+        if tracer is None:
+            tracer = await ApplicationAttemptTracer.start(
+                self.dependencies, user_id, account_id, vacancy_url, vacancy_title
+            )
+        reason = await self._finish_attempt(tracer, status)
+        await self.dependencies.record_application_event(
+            user_id,
+            account_id,
+            vacancy_url,
+            status,
+            vacancy_title,
+            company,
+            reason,
+            attempt_id=tracer.attempt_id if tracer else "",
+            stage=tracer.current_stage if tracer else "SEARCH",
+        )
 
     async def _resolve_keywords(self, account: dict) -> list[str]:
         configured = [item.strip() for item in account.get("keywords", "").split(",") if item.strip()]
@@ -276,19 +421,22 @@ class AccountSearchJob:
             if "account/login" in page.url:
                 await self.dependencies.update_account_session(user_id, account_id, b"", "EXPIRED")
                 break
-            links = page.locator(
-                '[data-qa="serp-item__title"], [data-qa="vacancy-serp__vacancy-title"], a[data-qa*="vacancy-title"]'
-            )
-            for index in range(await links.count()):
-                link = links.nth(index)
-                href = await link.get_attribute("href")
-                if not href or "/vacancy/" not in href or "/response" in href:
+            read_status, cards = await extract_search_vacancies(page)
+            if read_status == "ERROR_SESSION_EXPIRED":
+                await self.dependencies.update_account_session(user_id, account_id, b"", "EXPIRED")
+                break
+            if read_status != "SUCCESS":
+                # There is no vacancy attempt to record yet.  Keep the concrete
+                # code in the worker log rather than creating a false application
+                # event with a search URL or query parameters.
+                logger.warning("Search results unavailable for account %d: %s", account_id, read_status)
+                if read_status in {"ERROR_CAPTCHA", "ERROR_EXTERNAL"}:
+                    break
+                continue
+            for clean, title in cards:
+                vacancy_id = vacancy_id_from_url(clean)
+                if not vacancy_id or vacancy_id in seen:
                     continue
-                clean = href.split("?", 1)[0]
-                if not clean.startswith("https://"):
-                    clean = "https://hh.ru" + clean
-                if clean in seen:
-                    continue
-                seen.add(clean)
-                found.append((clean, ((await link.text_content()) or "Вакансия").strip()))
+                seen.add(vacancy_id)
+                found.append((clean, title))
         return found

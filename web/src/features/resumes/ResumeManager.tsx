@@ -58,6 +58,6 @@ function ResumeRow({ resume, active, highlighted, onSelect, onDelete }: { resume
         <button aria-label={`Удалить ${resume.title}`} className={`${styles.textButton} ${styles.danger}`} onClick={onDelete}>Удалить</button>
       </div>
     </div>
-    {resume.extracted_text ? <details><summary>Посмотреть текст</summary><p className={styles.meta}>{resume.extracted_text.slice(0, 800)}{resume.extracted_text.length > 800 ? "…" : ""}</p></details> : null}
+    {resume.extracted_text ? <details><summary>Посмотреть текст</summary><p className={`${styles.meta} ${styles.resumeText}`}>{resume.extracted_text.slice(0, 800)}{resume.extracted_text.length > 800 ? "…" : ""}</p></details> : null}
   </article>;
 }

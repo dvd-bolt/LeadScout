@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 from pypdf import PdfReader
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen.canvas import Canvas
 
+import leadscout.documents.pdf_reader as pdf_reader
 import leadscout.integrations.resumes as hh_resume
 from ai_handler import StructuredResume
+from leadscout.services.resumes import ResumeService
 from parsers.hh_resume import PDFValidationError, extract_text_from_pdf, missing_resume_fields
 from utils.pdf_generator import generate_resume_audit_pdf
 
@@ -27,6 +34,66 @@ def test_invalid_pdf_is_rejected(tmp_path):
     path.write_bytes(b"not a pdf but long enough to enter the parser" * 4)
     with pytest.raises(PDFValidationError):
         extract_text_from_pdf(path)
+
+
+def test_pdf_text_layer_preserves_cyrillic_english_entities_and_line_breaks(tmp_path):
+    path = tmp_path / "mixed-language.pdf"
+    pdfmetrics.registerFont(TTFont("LeadScoutArial", r"C:\Windows\Fonts\arial.ttf"))
+    canvas = Canvas(str(path))
+    canvas.setFont("LeadScoutArial", 11)
+    lines = [
+        "Иван Петров — Backend Engineer",
+        "• Python, SQL & R&D <platform>",
+        "Опыт: production systems and API design.",
+    ]
+    for index, line in enumerate(lines):
+        canvas.drawString(50, 800 - index * 20, line)
+    canvas.save()
+
+    text = extract_text_from_pdf(path)
+
+    assert "Иван Петров" in text
+    assert "Backend Engineer" in text
+    assert "Python, SQL & R&D <platform>" in text
+    assert "\n" in text
+
+
+def test_pdf_with_garbled_text_layer_is_rejected_without_reencoding(tmp_path, monkeypatch):
+    path = tmp_path / "garbled.pdf"
+    path.write_bytes(b"%PDF-1.4 placeholder")
+
+    class Page:
+        def extract_text(self):
+            return "\ufffd" * 60
+
+    class Reader:
+        is_encrypted = False
+        pages = [Page()]
+
+    monkeypatch.setattr(pdf_reader, "PdfReader", lambda _: Reader())
+    with pytest.raises(PDFValidationError, match="неподдерживаемый шрифт"):
+        pdf_reader.extract_text_from_pdf(path)
+
+
+@pytest.mark.asyncio
+async def test_pdf_validation_error_is_returned_to_the_import_operation():
+    manager = SimpleNamespace(
+        upload_pdf_resume_to_hh=AsyncMock(
+            side_effect=PDFValidationError("В PDF не найден читаемый текст. Скан без текстового слоя не поддерживается.")
+        )
+    )
+    service = ResumeService(
+        db=SimpleNamespace(get_account_for_user=AsyncMock(return_value={"id": 7})),
+        coordinator=None,
+        resume_manager=manager,
+    )
+
+    result = await service.import_pdf(42, 7, "anonymized.pdf")
+
+    assert result == {
+        "status": "ERROR",
+        "message": "В PDF не найден читаемый текст. Скан без текстового слоя не поддерживается.",
+    }
 
 
 def test_empty_and_too_many_pages_are_rejected(tmp_path, monkeypatch):

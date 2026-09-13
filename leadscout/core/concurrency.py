@@ -52,15 +52,27 @@ def serialize_account(function):
 
 
 def serialize_login(function):
+    signature = inspect.signature(function)
+
     @wraps(function)
     async def wrapped(self, user_id, *args, **kwargs):
+        account_id = signature.bind(self, user_id, *args, **kwargs).arguments.get("account_id")
+
         async def run():
-            async with self.locks.login_locks[user_id]:
-                await checkpoint()
-                return await function(self, user_id, *args, **kwargs)
+            # Login state belongs to an hh.ru account, not to the Telegram
+            # user as a whole.  A user may reconnect two independent accounts
+            # at once, while browser work for either account must still be
+            # mutually exclusive with its search/resume work.
+            async with self.locks.login_locks[(user_id, account_id)]:
+                if account_id is None:
+                    await checkpoint()
+                    return await function(self, user_id, *args, **kwargs)
+                async with self.locks.account_locks[account_id]:
+                    await checkpoint()
+                    return await function(self, user_id, *args, **kwargs)
 
         if getattr(self, "monitor", None):
-            return await self.monitor.perform_login(self, user_id, function.__name__, run)
+            return await self.monitor.perform_login(self, user_id, function.__name__, run, account_id=account_id)
         return await run()
 
     return wrapped

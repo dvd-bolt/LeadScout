@@ -29,10 +29,16 @@ class LoginStart(BaseModel):
 
 class OtpSubmission(BaseModel):
     code: str = Field(pattern=r"^\d{4,8}$")
+    account_id: int | None = Field(default=None, gt=0)
 
 
 class CaptchaSubmission(BaseModel):
     code: str = Field(min_length=1, max_length=32)
+    account_id: int | None = Field(default=None, gt=0)
+
+
+class LoginFlowAccount(BaseModel):
+    account_id: int | None = Field(default=None, gt=0)
 
 
 class ConfirmBody(BaseModel):
@@ -54,6 +60,10 @@ class QuestionnaireUpdate(BaseModel):
 
 class QuestionnaireConfirm(BaseModel):
     expected_revision: int | None = Field(default=None, ge=0)
+
+
+class ApplicationAttemptResolution(BaseModel):
+    applied: bool
 
 
 class AuditRequest(BaseModel):

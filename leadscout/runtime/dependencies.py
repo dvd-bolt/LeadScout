@@ -1,5 +1,6 @@
 """Explicit dependencies consumed by search and questionnaire jobs."""
 
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,8 +14,13 @@ DB_METHODS = frozenset(
         "finish_pending_questionnaire",
         "get_active_resume_snapshot",
         "is_account_already_applied",
+        "has_unresolved_application_attempt",
+        "has_open_questionnaire_for_vacancy",
         "record_application_event",
         "record_successful_application",
+        "create_application_attempt",
+        "update_application_attempt",
+        "get_application_attempt",
         "save_pending_questionnaire_account",
         "update_account_session",
     }
@@ -40,6 +46,17 @@ class RuntimeJobDependencies:
 
     async def submit_approved_questionnaire(self, *args, **kwargs):
         return await self.applications.submit_approved_questionnaire(*args, **kwargs)
+
+    def supports_application_trace(self, operation: str) -> bool:
+        """Inspect the actual injected integration, never retry an external form call."""
+        callback = getattr(self.applications, operation, None)
+        if callback is None:
+            return False
+        try:
+            parameters = inspect.signature(callback).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(parameter.name == "trace" or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
 
     async def extract_search_keywords_from_resume(self, *args, **kwargs):
         return await self.ai.extract_search_keywords_from_resume(*args, **kwargs)

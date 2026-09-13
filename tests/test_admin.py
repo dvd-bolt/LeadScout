@@ -366,7 +366,7 @@ async def test_v6_migration_backup_rollback_and_no_implicit_grants(tmp_path, run
     assert await migrated.admin_store.member(999) is None
     with sqlite3.connect(destination) as copy:
         assert copy.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        assert copy.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert copy.execute("PRAGMA user_version").fetchone()[0] == migrations.SCHEMA_VERSION
         assert copy.execute("SELECT user_id FROM users WHERE user_id=999").fetchone()[0] == 999
     await shutdown(migrated)
     with sqlite3.connect(restore) as copy:

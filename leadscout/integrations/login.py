@@ -415,41 +415,46 @@ class HHLoginManager:
         self.session_factory = HHLoginSession
         self.monitor = None
         self.access = None
-        self._sessions: dict[int, HHLoginSession] = {}
-        self._cleanup_tasks: dict[int, asyncio.Task] = {}
+        self._sessions: dict[tuple[int, int | None], HHLoginSession] = {}
+        self._cleanup_tasks: dict[tuple[int, int | None], asyncio.Task] = {}
 
-    async def _auto_cleanup_session(self, user_id: int, session: HHLoginSession, timeout: float = 600.0) -> None:
+    @staticmethod
+    def _key(user_id: int, account_id: int | None) -> tuple[int, int | None]:
+        return user_id, account_id
+
+    async def _auto_cleanup_session(
+        self, user_id: int, account_id: int | None, session: HHLoginSession, timeout: float = 600.0
+    ) -> None:
         """Автоматическое закрытие брошенной сессии авторизации по таймауту (10 мин)."""
         await asyncio.sleep(timeout)
-        async with self.locks.login_locks[user_id]:
-            current = self._sessions.get(user_id)
+        key = self._key(user_id, account_id)
+        async with self.locks.login_locks[key]:
+            current = self._sessions.get(key)
             if current is session and not session.is_done:
                 logger.info("Closing inactive login session for user %d", user_id)
                 await session.abort()
-                self._sessions.pop(user_id, None)
+                self._sessions.pop(key, None)
                 if self.monitor:
-                    task_id = self.monitor.login_ids.pop(user_id, None)
+                    task_id = self.monitor.login_ids.pop(key, None)
                     if task_id:
                         await self.monitor.store.task_state(task_id, "INTERRUPTED", "INTERRUPTED")
                         self.monitor.live.pop(task_id, None)
-            if self._cleanup_tasks.get(user_id) is asyncio.current_task():
-                self._cleanup_tasks.pop(user_id, None)
+            if self._cleanup_tasks.get(key) is asyncio.current_task():
+                self._cleanup_tasks.pop(key, None)
 
     @serialize_login
     async def start_login(self, user_id: int, phone_or_email: str, account_id: int | None = None) -> dict[str, Any]:
+        key = self._key(user_id, account_id)
         if account_id is not None:
             # A fresh login must not race a worker persisting its older cookies.
             await self.stop_account(user_id, account_id)
-        old_timer = self._cleanup_tasks.pop(user_id, None)
+        old_timer = self._cleanup_tasks.pop(key, None)
         if old_timer:
             old_timer.cancel()
             await asyncio.gather(old_timer, return_exceptions=True)
-        if user_id in self._sessions:
-            previous = self._sessions[user_id]
-            if previous.account_id == account_id:
-                await previous.cleanup()
-            else:
-                await previous.abort()
+        if key in self._sessions:
+            previous = self._sessions[key]
+            await previous.cleanup()
 
         session = self.session_factory(
             user_id,
@@ -459,15 +464,17 @@ class HHLoginManager:
             engine_factory=self.engine_factory,
             security_factory=self.security_factory,
         )
-        self._sessions[user_id] = session
+        self._sessions[key] = session
 
         # Запуск таски автоочистки через 10 минут
-        self._cleanup_tasks[user_id] = asyncio.create_task(self._auto_cleanup_session(user_id, session, timeout=600.0))
+        self._cleanup_tasks[key] = asyncio.create_task(
+            self._auto_cleanup_session(user_id, account_id, session, timeout=600.0)
+        )
 
         result = await session.start_login_flow()
-        if result.get("status") == "ERROR" and self._sessions.get(user_id) is session:
-            self._sessions.pop(user_id, None)
-            timer = self._cleanup_tasks.pop(user_id, None)
+        if result.get("status") == "ERROR" and self._sessions.get(key) is session:
+            self._sessions.pop(key, None)
+            timer = self._cleanup_tasks.pop(key, None)
             if timer:
                 timer.cancel()
                 await asyncio.gather(timer, return_exceptions=True)
@@ -476,66 +483,82 @@ class HHLoginManager:
         return result
 
     @serialize_login
-    async def reload_captcha(self, user_id: int) -> dict[str, Any]:
-        session = self._sessions.get(user_id)
+    async def reload_captcha(self, user_id: int, *, account_id: int | None = None) -> dict[str, Any]:
+        session = self._sessions.get(self._key(user_id, account_id))
         if not session or session.is_done:
             return {"status": "ERROR", "message": "Сессия входа не найдена. Начните процесс авторизации заново."}
         return await session.reload_captcha_flow()
 
     @serialize_login
-    async def toggle_captcha_lang(self, user_id: int) -> dict[str, Any]:
-        session = self._sessions.get(user_id)
+    async def toggle_captcha_lang(self, user_id: int, *, account_id: int | None = None) -> dict[str, Any]:
+        session = self._sessions.get(self._key(user_id, account_id))
         if not session or session.is_done:
             return {"status": "ERROR", "message": "Сессия входа не найдена. Начните процесс авторизации заново."}
         return await session.toggle_captcha_lang_flow()
 
     @serialize_login
-    async def submit_captcha(self, user_id: int, code: str) -> dict[str, Any]:
-        session = self._sessions.get(user_id)
+    async def submit_captcha(self, user_id: int, code: str, *, account_id: int | None = None) -> dict[str, Any]:
+        session = self._sessions.get(self._key(user_id, account_id))
         if not session or session.is_done:
             return {"status": "ERROR", "message": "Сессия входа не найдена. Начните процесс авторизации заново."}
 
         return await session.complete_captcha_flow(code)
 
     @serialize_login
-    async def submit_otp(self, user_id: int, code: str) -> dict[str, Any]:
-        session = self._sessions.get(user_id)
+    async def submit_otp(self, user_id: int, code: str, *, account_id: int | None = None) -> dict[str, Any]:
+        key = self._key(user_id, account_id)
+        session = self._sessions.get(key)
         if not session or session.is_done:
             return {"status": "ERROR", "message": "Сессия входа не найдена. Начните процесс авторизации заново."}
 
         res = await session.complete_login_flow(code)
-        self._sessions.pop(user_id, None)
-        timer = self._cleanup_tasks.pop(user_id, None)
+        self._sessions.pop(key, None)
+        timer = self._cleanup_tasks.pop(key, None)
         if timer:
             timer.cancel()
             await asyncio.gather(timer, return_exceptions=True)
         return res
 
     @serialize_login
-    async def cancel(self, user_id: int) -> None:
-        timer = self._cleanup_tasks.pop(user_id, None)
+    async def cancel(self, user_id: int, *, account_id: int | None = None) -> None:
+        await self._cancel_session(user_id, account_id)
+
+    async def _cancel_session(self, user_id: int, account_id: int | None) -> None:
+        """Release a login session without routing cleanup through the task monitor."""
+
+        key = self._key(user_id, account_id)
+        timer = self._cleanup_tasks.pop(key, None)
         if timer:
             timer.cancel()
             await asyncio.gather(timer, return_exceptions=True)
-        session = self._sessions.pop(user_id, None)
+        session = self._sessions.pop(key, None)
         if session:
             await session.abort()
 
-    def login_account_id(self, user_id: int):
-        session = self._sessions.get(user_id)
+    def login_account_id(self, user_id: int, account_id: int | None = None):
+        session = self._sessions.get(self._key(user_id, account_id))
         return session.account_id if session else None
+
+    async def close_login(self, user_id: int, account_id: int | None = None) -> None:
+        """Close one account's unfinished login without affecting its siblings."""
+
+        key = self._key(user_id, account_id)
+        async with self.locks.login_locks[key]:
+            await self._cancel_session(user_id, account_id)
 
     async def close_user(self, user_id: int) -> None:
         """Administrative cleanup preserves the account and retains failed resources for retry."""
-        async with self.locks.login_locks[user_id]:
-            timer = self._cleanup_tasks.pop(user_id, None)
-            if timer and timer is not asyncio.current_task():
-                timer.cancel()
-                await asyncio.gather(timer, return_exceptions=True)
-            session = self._sessions.get(user_id)
-            if session:
-                await session.cleanup()
-                self._sessions.pop(user_id, None)
+        keys = [key for key in self._sessions if (key[0] if isinstance(key, tuple) else key) == user_id]
+        for key in keys:
+            async with self.locks.login_locks[key]:
+                timer = self._cleanup_tasks.pop(key, None)
+                if timer and timer is not asyncio.current_task():
+                    timer.cancel()
+                    await asyncio.gather(timer, return_exceptions=True)
+                session = self._sessions.get(key)
+                if session:
+                    await session.cleanup()
+                    self._sessions.pop(key, None)
 
     async def shutdown(self) -> None:
         timers = list(self._cleanup_tasks.values())

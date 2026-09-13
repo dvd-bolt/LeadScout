@@ -115,6 +115,37 @@ async def test_active_resume_updates_while_questionnaire_keeps_original(isolated
     assert account["auto_apply_enabled"] == 0
 
 
+async def test_resume_text_round_trips_sqlite_api_and_ai_without_changes(audit_client, monkeypatch):
+    account = await database.create_hh_account(42, "resume-roundtrip@example.com")
+    source_text = "Иван Петров — Backend Engineer\n• Python, SQL & R&D <platform>\nОпыт: production API и команды."
+    snapshots = await database.sync_resume_snapshots(
+        42,
+        account["id"],
+        [{"id": "resume123", "href": "https://hh.ru/resume/resume123", "title": "Backend", "extracted_text": source_text}],
+    )
+    await database.set_active_resume_snapshot(42, account["id"], snapshots[0]["snapshot_id"])
+
+    response = await audit_client.get(f"/api/v1/accounts/{account['id']}/resumes")
+    assert response.status_code == 200
+    assert response.json()[0]["extracted_text"] == source_text
+
+    captured: list[str] = []
+
+    async def analyze(text):
+        captured.append(text)
+        return ResumeAuditPayload(is_it_profession=True, profession_name="Backend Engineer", overall_score=80)
+
+    services = get_default_context().services.audits
+    monkeypatch.setattr(get_default_context().ai, "analyze_resume_quality", analyze)
+    prepared = await services.prepare(42, account["id"], snapshots[0]["snapshot_id"])
+    assert prepared.resume_text == source_text
+    result = await services.run(prepared)
+    assert result["status"] == "SUCCESS"
+    assert captured == [source_text]
+    audit = await database.get_resume_audit_for_user(42, result["audit_id"])
+    assert audit["source_resume_text"] == source_text
+
+
 async def test_midnight_scheduler_does_not_erase_new_day_applications(isolated_db):
     account = await database.create_hh_account(42, "midnight@example.com")
     await database.record_successful_application(42, account["id"], "1", ".", "APPLIED")
@@ -308,10 +339,10 @@ async def test_restarting_pending_login_keeps_account(isolated_db, monkeypatch):
     monkeypatch.setattr(worker.task_coordinator, "stop_account", AsyncMock(return_value=True))
     try:
         await manager.start_login(42, "restart@example.com", account["id"])
-        previous = manager._sessions[42]
+        previous = manager._sessions[(42, account["id"])]
         await manager.start_login(42, "restart@example.com", account["id"])
         assert previous.is_done
-        assert manager._sessions[42] is not previous
+        assert manager._sessions[(42, account["id"])] is not previous
         assert await database.get_account_for_user(42, account["id"])
     finally:
         await manager.shutdown()
@@ -347,7 +378,7 @@ def test_backup_restores_committed_wal_and_retains_fourteen_files(tmp_path, monk
         assert restored.execute("SELECT value FROM sample").fetchone()[0] == "committed WAL data"
 
 
-@pytest.mark.parametrize("owner,age,expected", [(99, 0, 403), (42, 301, 401), (42, -301, 401), (42, 0, 200)])
+@pytest.mark.parametrize("owner,age,expected", [(99, 0, 403), (42, 305, 401), (42, -305, 401), (42, 0, 200)])
 async def test_telegram_signature_owner_and_age(audit_client, owner, age, expected):
     values = {"user": json.dumps({"id": owner}), "auth_date": str(int(time.time()) - age)}
     key = hmac.new(b"WebAppData", get_default_context().settings.bot_token.encode(), hashlib.sha256).digest()

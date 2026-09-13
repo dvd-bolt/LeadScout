@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import { QuestionnaireList } from "../features/questionnaires/QuestionnaireList";
 import { api } from "../shared/http/api";
@@ -8,6 +8,7 @@ import { Message } from "../shared/ui";
 import styles from "../shared/ui/UI.module.css";
 
 export function ApplicationsPage({ dashboard }: { dashboard: Dashboard }) {
+  const queryClient = useQueryClient();
   const accountId = dashboard.active_account_id ?? undefined;
   const [searchParams, setSearchParams] = useSearchParams();
   const directApplyId = Number(searchParams.get("apply_id")) || undefined;
@@ -43,8 +44,19 @@ export function ApplicationsPage({ dashboard }: { dashboard: Dashboard }) {
     queryFn: () => api.applications(accountId),
     enabled: tab === "history" && Boolean(accountId),
   });
+  const resolution = useMutation({
+    mutationFn: ({ attemptId, applied }: { attemptId: string; applied: boolean }) => api.resolveApplication(attemptId, applied),
+    onSuccess: async () => {
+      await Promise.all([
+        history.refetch(),
+        questionnaires.refetch(),
+        directApplyId ? direct.refetch() : Promise.resolve(),
+        queryClient.invalidateQueries({ queryKey: ["dashboard"] }),
+      ]);
+    },
+  });
   const loading = directApplyId ? direct.isPending : Boolean(accountId) && (tab === "review" ? questionnaires.isPending : history.isPending);
-  const error = direct.isError ? direct.error : questionnaires.isError ? questionnaires.error : history.isError ? history.error : null;
+  const error = resolution.isError ? resolution.error : direct.isError ? direct.error : questionnaires.isError ? questionnaires.error : history.isError ? history.error : null;
 
   return <section className={styles.page}>
     <h1 className={styles.pageTitle}>Отклики</h1>
@@ -57,7 +69,10 @@ export function ApplicationsPage({ dashboard }: { dashboard: Dashboard }) {
     {!loading && (directApplyId ? <QuestionnaireList items={direct.data ? [direct.data] : []} showProcessed />
       : tab === "review" ? <QuestionnaireList items={questionnaires.data ?? []} />
         : <section className={styles.card}><h2>История откликов</h2><div className={styles.eventList} style={{ marginTop: 14 }}>
-          {history.data?.history.length ? history.data.history.map((event) => <EventRow key={event.id} event={event} />) : <div className={styles.empty}>Пока пусто.</div>}
+          {history.data?.history.length ? history.data.history.map((event) => <EventRow key={event.id} event={event}
+            resolving={resolution.isPending && resolution.variables?.attemptId === event.attempt_id}
+            onResolve={event.attempt_id ? (applied) => resolution.mutate({ attemptId: event.attempt_id!, applied }) : undefined}
+          />) : <div className={styles.empty}>Пока пусто.</div>}
         </div></section>)}
   </section>;
 }

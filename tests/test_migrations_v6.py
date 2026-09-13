@@ -47,7 +47,7 @@ async def test_v5_backfill_repairs_nonempty_keys_and_is_idempotent(isolated_db, 
     questionnaire = await database.get_pending_questionnaire_for_user(42, qid)
     assert questionnaire["cover_letter"] == "Saved letter" and questionnaire["revision"] == 0
     with sqlite3.connect(isolated_db.path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == database.SCHEMA_VERSION
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     # The independently restorable backup retains the pre-migration schema/data.
     restored = Database(isolated_db.path.with_suffix(".backup"))

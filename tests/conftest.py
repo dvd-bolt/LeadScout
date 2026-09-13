@@ -188,11 +188,13 @@ async def external_submission(runtime_context, monkeypatch):
     engine = SimpleNamespace(create_context=AsyncMock(return_value=browser_context))
     monkeypatch.setattr(runtime_context.browser_pool, "get_engine", AsyncMock(return_value=engine))
 
-    async def submit(*args):
+    async def submit(*args, trace=None):
         state.calls.append(args)
+        if trace:
+            await trace("FILLING")
         state.entered.set()
         await state.release.wait()
-        return state.success, "Submitted" if state.success else "Внешний сервис отклонил анкету"
+        return state.success, "Submitted" if state.success else "Не удалось заполнить все поля анкеты."
 
     monkeypatch.setattr(runtime_context.applications, "submit_approved_questionnaire", submit)
     state.browser_context = browser_context

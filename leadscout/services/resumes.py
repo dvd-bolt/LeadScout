@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from leadscout.documents.pdf_reader import PDFValidationError
+
 from .common import _await, _mapping, _Service
 from .errors import ServiceError
 
@@ -25,16 +27,19 @@ class ResumeService(_Service):
         structured: dict | Any | None = None,
     ) -> dict:
         await self._account(user_id, account_id)
-        result = _mapping(
-            await _await(
-                self.resume_manager.upload_pdf_resume_to_hh(
-                    user_id,
-                    str(path),
-                    account_id=account_id,
-                    structured_override=structured,
+        try:
+            result = _mapping(
+                await _await(
+                    self.resume_manager.upload_pdf_resume_to_hh(
+                        user_id,
+                        str(path),
+                        account_id=account_id,
+                        structured_override=structured,
+                    )
                 )
             )
-        )
+        except PDFValidationError as exc:
+            return {"status": "ERROR", "message": str(exc)}
         # NEEDS_FIELDS is deliberately preserved for an HTTP operation adapter.
         if result.get("status") == "NEEDS_FIELDS":
             result.setdefault("missing_fields", [])

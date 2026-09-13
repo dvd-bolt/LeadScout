@@ -5,6 +5,7 @@ import asyncio
 import pytest
 from patchright.async_api import expect
 
+from leadscout.diagnostics import ApplicationAttemptTracer
 from leadscout.runtime import build_context
 from leadscout.runtime.lifecycle import initialize, shutdown
 
@@ -58,7 +59,7 @@ async def test_direct_link_long_running_submission(mini_app, external_submission
         assert response.status_code == 200
     else:
         external.release.set()
-    expected = {"failure": "Ошибка отправки", "stop": "Нужна проверка"}.get(outcome, "Отправлена")
+    expected = {"failure": "Ошибка отправки", "stop": "Ошибка отправки"}.get(outcome, "Отправлена")
     await expect(page.get_by_text(expected, exact=True)).to_be_visible(timeout=7000)
     assert len(external.calls) == 1
     if outcome in {"success", "lost_response"}:
@@ -114,3 +115,35 @@ async def test_reopen_incomplete_draft_and_recover_interruption(mini_app, extern
         assert not external_submission.calls
     finally:
         await shutdown(restarted)
+
+
+@pytest.mark.parametrize("mini_app", ["real_coordinator"], indirect=True)
+async def test_history_resolves_uncertain_attempt_and_unblocks_retry(mini_app):
+    account = mini_app.account
+    tracer = await ApplicationAttemptTracer.start(
+        mini_app.runtime.db,
+        42,
+        account["id"],
+        "https://hh.ru/vacancy/998",
+        "Uncertain role",
+    )
+    assert tracer is not None
+    await tracer.stage("SUBMITTING")
+    reason = await tracer.finish("ERROR_SUBMIT_UNCONFIRMED")
+    await mini_app.runtime.db.record_application_event(
+        42,
+        account["id"],
+        "998",
+        "ERROR_SUBMIT_UNCONFIRMED",
+        "Uncertain role",
+        details=reason,
+        attempt_id=tracer.attempt_id,
+        stage="SUBMITTING",
+    )
+
+    page = mini_app.page
+    await page.goto("http://leadscout.test/#/applications?tab=history")
+    await page.get_by_role("button", name="Отклика нет", exact=True).click()
+
+    await expect(page.get_by_text("Проверено: отклик не отправлен", exact=True)).to_be_visible()
+    assert not await mini_app.runtime.db.has_unresolved_application_attempt(42, account["id"], "998")

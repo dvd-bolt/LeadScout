@@ -84,3 +84,25 @@ async def test_failed_sync_displays_real_error_and_navigation_works(mini_app):
     await expect(page.get_by_text("Пока пусто.", exact=True)).to_be_visible()
     await page.get_by_role("link", name="Главная", exact=True).click()
     await expect(page.get_by_role("heading", name="Поиск под контролем")).to_be_visible()
+
+
+async def test_resume_preview_keeps_line_breaks_and_literal_text(mini_app):
+    text = "Иван Петров — Backend Engineer\n• Python, SQL & R&D <platform>\nОпыт: production API."
+    await database.sync_resume_snapshots(
+        42,
+        mini_app.account["id"],
+        [
+            {
+                "id": "resume123",
+                "title": "Python developer",
+                "href": "https://hh.ru/resume/resume123",
+                "extracted_text": text,
+            }
+        ],
+    )
+    page = mini_app.page
+    await page.goto("http://leadscout.test/#/resumes")
+    await page.get_by_text("Посмотреть текст", exact=True).click()
+    preview = page.locator("details p").last
+    await expect(preview).to_have_text(text)
+    assert await preview.evaluate("element => getComputedStyle(element).whiteSpace") == "pre-wrap"

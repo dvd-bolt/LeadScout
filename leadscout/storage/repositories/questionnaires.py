@@ -41,6 +41,20 @@ async def count_pending_reviews(database: Database, user_id: int, account_id: in
         return int((await cursor.fetchone())[0])
 
 
+async def has_open_questionnaire_for_vacancy(
+    database: Database, user_id: int, account_id: int, vacancy_url: str
+) -> bool:
+    """Prevent a search cycle from creating another browser flow for one draft."""
+    async with database.connection() as connection:
+        cursor = await connection.execute(
+            """SELECT 1 FROM pending_questionnaires
+               WHERE user_id = ? AND account_id = ? AND vacancy_url = ?
+                 AND status IN ('PENDING', 'SUBMITTING', 'NEEDS_REVIEW') LIMIT 1""",
+            (user_id, account_id, vacancy_url),
+        )
+        return await cursor.fetchone() is not None
+
+
 async def recover_interrupted_questionnaires(database: Database) -> int:
     """Avoid retrying an unconfirmed browser action after a process restart."""
     async with database.connection() as connection:
@@ -151,7 +165,7 @@ async def claim_pending_questionnaire(
         cursor = await connection.execute(
             """UPDATE pending_questionnaires
                SET status = 'SUBMITTING', error_text = '', updated_at = CURRENT_TIMESTAMP
-               WHERE id = ? AND user_id = ? AND status IN ('PENDING', 'FAILED', 'APPROVED', 'NEEDS_REVIEW')
+               WHERE id = ? AND user_id = ? AND status IN ('PENDING', 'FAILED', 'APPROVED')
                  AND (? IS NULL OR revision = ?)""",
             (apply_id, user_id, expected_revision, expected_revision),
         )

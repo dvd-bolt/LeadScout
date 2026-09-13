@@ -164,8 +164,8 @@ async def attach_resume_text(
     async with database.connection() as connection:
         cursor = await connection.execute(
             """UPDATE resume_snapshots SET extracted_text = ?, synced_at = CURRENT_TIMESTAMP
-               WHERE user_id = ? AND account_id = ? AND hh_resume_id = ?""",
-            (extracted_text, user_id, account_id, hh_resume_id),
+               WHERE user_id = ? AND account_id = ? AND hh_resume_id = ? AND ? <> ''""",
+            (extracted_text, user_id, account_id, hh_resume_id, extracted_text),
         )
         await connection.commit()
         return cursor.rowcount == 1

@@ -28,6 +28,8 @@ export type Event = {
   company: string;
   status: string;
   details: string;
+  attempt_id?: string;
+  stage?: string;
   created_at: string;
 };
 

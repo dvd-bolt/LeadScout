@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+import main
 from leadscout.integrations.browser import HHBrowserEngine
 from leadscout.integrations.browser_pool import SharedBrowserPool
 from leadscout.runtime import build_context
@@ -13,6 +15,37 @@ from leadscout.runtime.lifecycle import initialize, shutdown
 from leadscout.runtime.runner import run_application
 from leadscout.runtime.scheduler import start_scheduler
 from leadscout.storage import Database
+
+
+def test_direct_system_python_launch_restarts_in_project_venv(monkeypatch):
+    call: dict[str, object] = {}
+    monkeypatch.setattr(main.sys, "prefix", "C:/Python313")
+    monkeypatch.setattr(main.sys, "base_prefix", "C:/Python313")
+    monkeypatch.setattr(main.sys, "argv", ["main.py", "--example"])
+    monkeypatch.setattr(main.Path, "is_file", lambda _: True)
+    monkeypatch.setattr(
+        main.os,
+        "execv",
+        lambda executable, args: call.update(executable=executable, args=args),
+    )
+
+    main.ensure_project_venv()
+
+    expected = Path(main.__file__).resolve().parent / ".venv" / "Scripts" / "python.exe"
+    assert Path(call["executable"]) == expected
+    assert call["args"] == [str(expected), "main.py", "--example"]
+
+
+def test_venv_launch_does_not_restart(monkeypatch):
+    monkeypatch.setattr(main.sys, "prefix", "C:/project/.venv")
+    monkeypatch.setattr(main.sys, "base_prefix", "C:/Python313")
+    monkeypatch.setattr(
+        main.os,
+        "execv",
+        lambda *args: pytest.fail("venv launch must not restart Python"),
+    )
+
+    main.ensure_project_venv()
 
 
 @pytest.fixture

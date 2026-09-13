@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from leadscout.api import create_app
+from leadscout.integrations.browser_pool import SharedBrowserPool
 from leadscout.models.resumes import SearchKeywordsPayload
 from leadscout.runtime.context import build_context, default_settings
 from leadscout.runtime.lifecycle import initialize, shutdown
@@ -82,7 +83,7 @@ def test_package_has_no_legacy_imports_or_module_registry_lookup():
     }
     violations = []
     for path in root.rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if isinstance(node, ast.Import):
                 imports = [alias.name for alias in node.names]
             elif isinstance(node, ast.ImportFrom) and node.level == 0:
@@ -125,3 +126,50 @@ def test_context_rejects_coordinator_from_a_different_database(tmp_path, runtime
 
     with pytest.raises(ValueError, match="share db"):
         build_context(db=Database(tmp_path / "wrong.db"), coordinator=runtime_context.coordinator)
+
+
+async def test_browser_pool_reuses_only_proxy_processes_not_authorized_contexts():
+    """Equal proxies may share an engine, but every account receives its own context state."""
+
+    created = []
+
+    class Browser:
+        def is_connected(self):
+            return True
+
+    class Engine:
+        def __init__(self, proxy_url):
+            self.proxy_url = proxy_url
+            self.browser = Browser()
+            self.states = []
+            self.closed = False
+
+        async def start(self):
+            return None
+
+        async def create_context(self, *, storage_state=None):
+            self.states.append(storage_state)
+            return SimpleNamespace(storage_state=storage_state)
+
+        async def close(self):
+            self.closed = True
+
+    def factory(*, proxy_url=None):
+        engine = Engine(proxy_url)
+        created.append(engine)
+        return engine
+
+    pool = SharedBrowserPool(factory)
+    same_one = await pool.get_engine("http://proxy.example:8080")
+    same_two = await pool.get_engine("http://proxy.example:8080/")
+    other = await pool.get_engine("http://other.example:8080")
+    assert same_one is same_two and other is not same_one
+    first = await same_one.create_context(storage_state={"cookies": [{"name": "first"}]})
+    second = await same_two.create_context(storage_state={"cookies": [{"name": "second"}]})
+    assert first is not second
+    assert same_one.states == [
+        {"cookies": [{"name": "first"}]},
+        {"cookies": [{"name": "second"}]},
+    ]
+    await pool.shutdown()
+    assert all(engine.closed for engine in created)

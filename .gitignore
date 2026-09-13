@@ -46,6 +46,7 @@ Thumbs.db
 
 # Logs
 *.log
+logs/application_attempts.jsonl*
 
 # Scratch and temporary media
 scratch/

@@ -32,6 +32,7 @@
 .loading { display: grid; min-height: 65dvh; padding: 24px; place-content: center; gap: 16px; color: var(--muted); text-align: center; }
 .badge { display: inline-grid; place-items: center; min-width: 24px; height: 24px; padding: 0 5px; border: 2px solid white; border-radius: 50%; background: var(--text); color: white; font-size: 0.75rem; font-weight: 750; line-height: 1; }
 .meta { margin-top: 5px; color: var(--muted); font-size: 0.8125rem; overflow-wrap: anywhere; }
+.resumeText { white-space: pre-wrap; }
 .eventList, .resumeList, .questionList, .auditList { display: grid; gap: 14px; min-width: 0; }
 .event, .resume, .question, .audit { padding: 14px; border: 2px solid var(--text); border-radius: var(--radius); background: var(--subtle-surface); min-width: 0; }
 .eventTitle, .resumeTitle, .questionTitle { font-weight: 750; overflow-wrap: anywhere; }

@@ -185,11 +185,23 @@ async def _type_characters(
 ) -> None:
     try:
         await locator.focus(timeout=_remaining_ms(deadline, operation))
-        for character in text:
+        # One browser RPC per character makes ordinary cover letters needlessly
+        # slow. Patchright still emits keyboard/input events sequentially inside
+        # each bounded chunk; the focus check between chunks preserves the
+        # safety guarantee when a reactive form moves focus elsewhere.
+        chunk_size = 32
+        for offset in range(0, len(text), chunk_size):
             if not await _is_focused(locator, operation):
                 raise HumanizationError(operation, "focus_lost")
-            await locator.press_sequentially(character, timeout=_remaining_ms(deadline, operation))
-            await asyncio.sleep(random.uniform(*delay_range))
+            chunk = text[offset : offset + chunk_size]
+            delay_ms = max(0.0, random.uniform(*delay_range) * 1_000)
+            await locator.press_sequentially(
+                chunk,
+                delay=delay_ms,
+                timeout=_remaining_ms(deadline, operation),
+            )
+            if not await _is_focused(locator, operation):
+                raise HumanizationError(operation, "focus_lost")
     except asyncio.CancelledError:
         raise
     except HumanizationError:

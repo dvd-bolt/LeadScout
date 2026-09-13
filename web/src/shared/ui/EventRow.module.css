@@ -2,4 +2,7 @@
 .icon { display: grid; place-items: center; background: var(--subtle-surface); width: 44px; height: 44px; border-radius: 12px; flex-shrink: 0; }
 .body { min-width: 0; flex: 1; }.body strong { display: block; font-size: 1rem; font-weight: 750; overflow-wrap: anywhere; line-height: 1.25; }.body small { display: block; color: var(--muted); margin-top: 4px; font-size: 0.8125rem; }
 .time { color: var(--muted); font-size: 0.8125rem; white-space: nowrap; }.event > svg { flex-shrink: 0; }
+.reviewActions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.reviewActions button { min-height: 38px; padding: 7px 10px; border: 1px solid var(--text); border-radius: 10px; color: var(--text); background: var(--surface); font: inherit; font-size: .8125rem; font-weight: 650; cursor: pointer; }
+.reviewActions button:disabled { cursor: wait; opacity: .55; }
 @media(max-width:359px) { .event { gap: 8px; flex-wrap: wrap; }.time { margin-left: 52px; } }

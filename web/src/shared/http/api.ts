@@ -28,11 +28,11 @@ export const api = {
 
   startLogin: (phone_or_email: string, account_name = "") =>
     request<LoginFlowResponse>("/login-flows/start", { method: "POST", body: JSON.stringify({ phone_or_email, account_name }) }),
-  submitOtp: (code: string) => request<LoginFlowResponse>("/login-flows/otp", { method: "POST", body: JSON.stringify({ code }) }),
-  submitCaptcha: (code: string) => request<LoginFlowResponse>("/login-flows/captcha", { method: "POST", body: JSON.stringify({ code }) }),
-  reloadCaptcha: () => request<LoginFlowResponse>("/login-flows/captcha/reload", { method: "POST" }),
-  switchCaptchaLanguage: () => request<LoginFlowResponse>("/login-flows/captcha/language", { method: "POST" }),
-  cancelLogin: () => request<void>("/login-flows/cancel", { method: "POST" }),
+  submitOtp: (code: string, accountId?: number) => request<LoginFlowResponse>("/login-flows/otp", { method: "POST", body: JSON.stringify({ code, account_id: accountId }) }),
+  submitCaptcha: (code: string, accountId?: number) => request<LoginFlowResponse>("/login-flows/captcha", { method: "POST", body: JSON.stringify({ code, account_id: accountId }) }),
+  reloadCaptcha: (accountId?: number) => request<LoginFlowResponse>("/login-flows/captcha/reload", { method: "POST", body: JSON.stringify({ account_id: accountId }) }),
+  switchCaptchaLanguage: (accountId?: number) => request<LoginFlowResponse>("/login-flows/captcha/language", { method: "POST", body: JSON.stringify({ account_id: accountId }) }),
+  cancelLogin: (accountId?: number) => request<void>("/login-flows/cancel", { method: "POST", body: JSON.stringify({ account_id: accountId }) }),
 
   resumes: (accountId: number) => request<Resume[]>(`/accounts/${accountId}/resumes`),
   syncResumes: (accountId: number) => request<OperationStart>(`/accounts/${accountId}/resumes/sync`, { method: "POST" }),
@@ -55,6 +55,9 @@ export const api = {
   }),
   skipQuestionnaire: (id: number) => request<Questionnaire>(`/questionnaires/${id}/skip`, { method: "POST" }),
   applications: (accountId?: number) => request<{ history: Dashboard["recent_events"]; stats: Dashboard["stats"] }>(`/applications${accountId ? `?account_id=${accountId}` : ""}`),
+  resolveApplication: (attemptId: string, applied: boolean) => request<{ attempt_id: string; status: string; resolved: boolean; changed: boolean }>(`/applications/${attemptId}/resolve`, {
+    method: "POST", body: JSON.stringify({ applied }),
+  }),
 
   audits: (accountId?: number) => request<Audit[]>(`/audits${accountId ? `?account_id=${accountId}` : ""}`),
   createAudit: (values: { account_id?: number; resume_snapshot_id?: number; resume_text?: string }) =>
