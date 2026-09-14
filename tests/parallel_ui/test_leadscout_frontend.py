@@ -140,6 +140,9 @@ class ContractApi:
         self.match_count = 0
         self.skip_conflict = False
         self.captcha_version = 0
+        self.login_start_result: dict | None = None
+        self.login_started_account: dict | None = None
+        self.login_otp_result: dict | None = None
 
     def dashboard(self) -> dict:
         pending = sum(item["status"] in {"PENDING", "FAILED", "NEEDS_REVIEW"} for item in self.questionnaires.values())
@@ -210,11 +213,20 @@ class ContractApi:
             await self.json_response(route, {"account_id": target, "status": "STARTED" if running else "STOPPED"}, 202)
             return
         if method == "POST" and path == "/login-flows/start":
+            if self.login_start_result is not None:
+                if self.login_started_account is not None:
+                    self.accounts = [self.login_started_account]
+                    self.active_id = self.login_started_account["id"]
+                await self.json_response(route, self.login_start_result, 202)
+                return
             await self.json_response(
                 route,
                 {"account_id": 1, "status": "WAITING_FOR_CAPTCHA", "captcha_data_uri": self.captcha_uri("ru")},
                 202,
             )
+            return
+        if method == "POST" and path == "/login-flows/otp":
+            await self.json_response(route, self.login_otp_result or {"status": "SUCCESS"}, 202)
             return
         if method == "POST" and path == "/login-flows/captcha":
             await self.json_response(route, {"status": "INVALID_CAPTCHA", "message": "Неверный код с картинки."}, 202)
@@ -461,6 +473,49 @@ async def test_four_pages_mobile_account_isolation_and_captcha_controls(browser_
     await page.get_by_role("button", name="Сменить язык").click()
     await expect(page.get_by_role("status").filter(has_text="Язык капчи изменён")).to_have_text("Язык капчи изменён")
     assert any(request.path == "/login-flows/captcha/language" for request in mock.requests)
+
+
+async def test_first_account_otp_survives_dashboard_refresh_and_targets_created_account(browser_app):
+    page, mock, base_url = browser_app.page, browser_app.mock, browser_app.base_url
+    mock.accounts = []
+    mock.active_id = None
+    await page.goto(f"{base_url}/#/settings", wait_until="networkidle")
+    await expect(page.get_by_label("Телефон или email hh.ru")).to_be_visible()
+
+    pending = account(3, "Первый", ready=False)
+    pending["session_status"] = "AUTH_PENDING"
+    pending["automation_state"] = "NEEDS_LOGIN"
+    mock.login_started_account = pending
+    mock.login_start_result = {
+        "account_id": 3,
+        "status": "WAITING_FOR_OTP",
+        "message": "hh.ru принял запрос кода. Доставка SMS может занять несколько минут.",
+    }
+    await page.get_by_label("Телефон или email hh.ru").fill("user@example.com")
+    await page.get_by_role("button", name="Продолжить").click()
+    await expect(page.get_by_label("Код из SMS или письма")).to_be_visible()
+
+    # The real dashboard query polls every 15 seconds.  A remount keyed by the
+    # active account used to erase the OTP form at this exact point.
+    await page.wait_for_timeout(16_000)
+    await expect(page.get_by_label("Код из SMS или письма")).to_be_visible()
+    await expect(page.get_by_text("Подключение аккаунта не завершено")).to_be_visible()
+    await page.get_by_label("Код из SMS или письма").fill("123456")
+    await page.get_by_role("button", name="Подтвердить").click()
+    await expect(page.get_by_role("status").filter(has_text="Вход выполнен")).to_be_visible()
+    otp_requests = [item for item in mock.requests if item.path == "/login-flows/otp"]
+    assert len(otp_requests) == 1
+    assert json.loads(otp_requests[0].body)["account_id"] == 3
+
+
+async def test_unknown_login_status_never_opens_otp_form(browser_app):
+    page, mock, base_url = browser_app.page, browser_app.mock, browser_app.base_url
+    mock.login_start_result = {"account_id": 1, "status": "UNEXPECTED"}
+    await page.goto(f"{base_url}/#/settings", wait_until="networkidle")
+    await page.get_by_label("Телефон или email hh.ru").fill("user@example.com")
+    await page.get_by_role("button", name="Продолжить").click()
+    await expect(page.get_by_text("Получен неизвестный ответ сервера. Начните вход заново.")).to_be_visible()
+    await expect(page.get_by_label("Код из SMS или письма")).to_have_count(0)
 
 
 async def test_questionnaire_save_confirm_skip_and_conflict_refresh(browser_app):

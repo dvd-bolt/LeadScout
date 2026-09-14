@@ -1,7 +1,10 @@
+"""Interactive, account-scoped hh.ru login flow.
+
+The browser never infers that a code was sent. It returns an OTP state only
+after hh.ru has rendered a visible OTP control.
 """
-LeadScout AI — Модуль интерактивной OTP-авторизации hh.ru (Patchright Stealth).
-Управляет процессами входа через СМС/email для пользователей Telegram.
-"""
+
+from __future__ import annotations
 
 import asyncio
 import logging
@@ -11,14 +14,45 @@ from typing import Any
 from patchright.async_api import BrowserContext, Page
 
 from leadscout.core.concurrency import serialize_login
+from leadscout.core.identity import hh_national_phone, validate_hh_login
 from leadscout.integrations.browser import HHBrowserEngine
 from utils.humanization import HumanizationError, human_click, human_type, human_type_digits
 
 logger = logging.getLogger(__name__)
 
+_CAPTCHA_IMAGE = '[data-qa="account-captcha-picture"], img[src*="/captcha/picture"], img[data-qa="captcha-image"]'
+_CAPTCHA_INPUT = '[data-qa="account-captcha-input"], input[name="captchaText"], input[name="captcha"]'
+_OTP_INPUT = (
+    '[data-qa="otp-code-input"], [data-qa*="otp"] input, '
+    'input[autocomplete="one-time-code"], form input[name="code"], form input[name*="code" i]'
+)
+_AUTH_MARKER = '[data-qa="mainmenu_myResumes"], [data-qa="mainmenu_vacancyResponses"], a[href*="/applicant/resumes"]'
+_PAGE_ERROR = '[data-qa*="error"], [role="alert"], [aria-live="assertive"]'
+_WAITING_STATUSES = {"WAITING_FOR_CAPTCHA", "WAITING_FOR_OTP", "INVALID_CAPTCHA"}
+
+_MESSAGES = {
+    "HH_LOGIN_INPUT_REJECTED": "hh.ru не принял телефон или email. Проверьте введённые данные.",
+    "HH_LOGIN_RATE_LIMITED": "hh.ru временно ограничил отправку кода. Подождите и попробуйте позже.",
+    "HH_LOGIN_FORM_CHANGED": "Форма входа hh.ru изменилась. Попробуйте позже.",
+    "HH_LOGIN_REQUEST_REJECTED": "hh.ru не подтвердил запрос кода. Проверьте данные и попробуйте позже.",
+    "HH_LOGIN_TRANSITION_TIMEOUT": "hh.ru слишком долго отвечает на запрос входа. Попробуйте позже.",
+    "LOGIN_SESSION_EXPIRED": "Сессия входа истекла. Начните подключение заново.",
+    "HH_CAPTCHA_INVALID": "Капча не принята. Введите текст с новой картинки.",
+    "HH_OTP_INVALID": "Код не принят. Начните вход заново.",
+}
+
+
+def login_error(code: str, *, status: str = "ERROR") -> dict[str, Any]:
+    """Build a stable response without exposing raw hh.ru page text."""
+
+    return {"status": status, "code": code, "message": _MESSAGES[code]}
+
 
 class HHLoginSession:
-    """Сессия авторизации hh.ru для конкретного пользователя и аккаунта."""
+    """One owned browser/session for a user and one hh.ru account."""
+
+    transition_timeout = 12.0
+    rejected_after = 2.0
 
     def __init__(
         self, user_id: int, phone_or_email: str, account_id: int | None = None, *, db, engine_factory, security_factory
@@ -32,362 +66,326 @@ class HHLoginSession:
         self.engine: HHBrowserEngine | None = None
         self.context: BrowserContext | None = None
         self.page: Page | None = None
-        self.otp_event = asyncio.Event()
-        self.otp_code: str | None = None
-        self.result: dict[str, Any] = {}
         self.is_done = False
         self.created_at = time.time()
 
-    async def start_login_flow(self) -> dict[str, Any]:
-        """Первая фаза: запуск браузера и ввод номера телефона / email."""
+    async def _visible(self, locator) -> bool:
         try:
+            return await locator.is_visible()
+        except Exception:
+            return False
+
+    def _form(self):
+        return self.page.locator('[data-qa="account-login-form"]').first
+
+    async def _submit_button(self):
+        """Find a submit control locally; never use the page's first button."""
+
+        form = self._form()
+        if await self._visible(form):
+            button = form.locator('[data-qa="submit-button"], [data-qa="account-signup-submit"], button[type="submit"]').first
+            if await self._visible(button):
+                return button
+        fallback = self.page.locator('[data-qa="submit-button"], [data-qa="account-signup-submit"]').first
+        return fallback if await self._visible(fallback) else None
+
+    async def _login_input(self, *, is_email: bool):
+        selectors = (
+            ('[data-qa="account-signup-email"]', 'input[type="email"]', 'input[name="login"]')
+            if is_email
+            else ('[data-qa="magritte-phone-input-national-number-input"]', 'input[type="tel"]', 'input[name="phone"]')
+        )
+        form = self._form()
+        for selector in selectors:
+            locator = (form.locator(selector) if await self._visible(form) else self.page.locator(selector)).first
+            if await self._visible(locator):
+                return locator
+        return None
+
+    async def _captcha_present(self) -> bool:
+        return await self._visible(self.page.locator(_CAPTCHA_IMAGE).first) or await self._visible(
+            self.page.locator(_CAPTCHA_INPUT).first
+        )
+
+    async def _otp_present(self) -> bool:
+        return await self._visible(self.page.locator(_OTP_INPUT).first)
+
+    async def _captcha_bytes(self) -> bytes:
+        image = self.page.locator(_CAPTCHA_IMAGE).first
+        if await self._visible(image):
+            await image.scroll_into_view_if_needed()
+            return await image.screenshot()
+        form = self._form()
+        return await form.screenshot() if await self._visible(form) else await self.page.screenshot()
+
+    async def _get_fresh_captcha_bytes(self, old_src: str | None = None) -> bytes:
+        image = self.page.locator(_CAPTCHA_IMAGE).first
+        if old_src and await self._visible(image):
+            try:
+                await self.page.wait_for_function(
+                    """old => {
+                      const image = document.querySelector('[data-qa="account-captcha-picture"], img[src*="/captcha/picture"], img[data-qa="captcha-image"]');
+                      return image && image.getAttribute('src') !== old;
+                    }""",
+                    arg=old_src,
+                    timeout=4_000,
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(0.4)
+        return await self._captcha_bytes()
+
+    async def _page_error(self) -> dict[str, Any] | None:
+        """Classify known errors without retaining or emitting external text."""
+
+        alerts = self.page.locator(_PAGE_ERROR)
+        try:
+            text = " ".join(await alerts.all_text_contents()).lower()
+        except Exception:
+            return None
+        if not text.strip():
+            return None
+        if any(fragment in text for fragment in ("слишком много", "попробуйте позже", "повторно через", "ограничен")):
+            return login_error("HH_LOGIN_RATE_LIMITED")
+        if any(fragment in text for fragment in ("неверн", "некоррект", "не найден", "не существует")):
+            return login_error("HH_LOGIN_INPUT_REJECTED")
+        return login_error("HH_LOGIN_INPUT_REJECTED")
+
+    async def _credential_step_ready(self) -> bool:
+        return bool(await self._login_input(is_email=False) or await self._login_input(is_email=True))
+
+    async def _wait_for_credential_step(self) -> dict[str, Any] | None:
+        deadline = time.monotonic() + self.transition_timeout
+        while time.monotonic() < deadline:
+            if await self._credential_step_ready():
+                return None
+            if await self._is_authenticated(timeout=100):
+                return await self._finish_authenticated_login()
+            error = await self._page_error()
+            if error:
+                return error
+            await asyncio.sleep(0.2)
+        return login_error("HH_LOGIN_FORM_CHANGED")
+
+    async def _detect_login_state(self, *, after_captcha: bool = False) -> dict[str, Any]:
+        """Return only a state actually visible on the current hh.ru page."""
+
+        deadline = time.monotonic() + self.transition_timeout
+        started = time.monotonic()
+        while time.monotonic() < deadline:
+            if await self._otp_present():
+                return {
+                    "status": "WAITING_FOR_OTP",
+                    "message": "hh.ru принял запрос кода. Доставка SMS может занять несколько минут.",
+                }
+            if await self._captcha_present():
+                if after_captcha:
+                    return {
+                        **login_error("HH_CAPTCHA_INVALID", status="INVALID_CAPTCHA"),
+                        "captcha_bytes": await self._get_fresh_captcha_bytes(),
+                    }
+                return {"status": "WAITING_FOR_CAPTCHA", "captcha_bytes": await self._captcha_bytes()}
+            if await self._is_authenticated(timeout=100):
+                return await self._finish_authenticated_login()
+            error = await self._page_error()
+            if error:
+                return error
+            if time.monotonic() - started >= self.rejected_after and await self._credential_step_ready():
+                return login_error("HH_LOGIN_REQUEST_REJECTED")
+            await asyncio.sleep(0.2)
+        return login_error("HH_LOGIN_TRANSITION_TIMEOUT")
+
+    async def start_login_flow(self) -> dict[str, Any]:
+        """Open hh.ru and submit a validated phone or email exactly once."""
+
+        try:
+            login = validate_hh_login(self.phone_or_email)
             account = await self.db.get_account_for_user(self.user_id, self.account_id) if self.account_id else None
             self.engine = self.engine_factory(proxy_url=(account or {}).get("proxy_url") or None)
             await self.engine.start()
             self.context = await self.engine.create_context()
             self.page = await self.context.new_page()
-            logger.info("Пользователь %d: переход на страницу логина hh.ru...", self.user_id)
+            logger.info("Opening hh.ru login page for user %d", self.user_id)
             await self.page.goto("https://hh.ru/account/login", wait_until="domcontentloaded")
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(0.6)
 
-            # 1. Выбор типа аккаунта (Соискатель), если на первом шаге показана плашка выбора
-            applicant_card = self.page.locator('[data-qa="account-type-card-APPLICANT"]').first
-            if await applicant_card.count() > 0:
-                await human_click(self.page, applicant_card)
-                await asyncio.sleep(0.5)
+            applicant = self.page.locator('[data-qa^="account-type-card-APPLICANT"]').first
+            if await self._visible(applicant):
+                await human_click(self.page, applicant)
+                submit = await self._submit_button()
+                if not submit:
+                    return login_error("HH_LOGIN_FORM_CHANGED")
+                await human_click(self.page, submit)
+                moved = await self._wait_for_credential_step()
+                if moved:
+                    return moved
 
-            # Клик по кнопке продолжить на шаге выбора роли
-            step1_submit = self.page.locator(
-                '[data-qa="submit-button"], button[type="submit"], [data-qa="account-signup-submit"]'
+            is_email = "@" in login
+            tab = self.page.locator('[data-qa^="credential-type-email"]').first if is_email else self.page.locator(
+                '[data-qa^="credential-type-phone"]'
             ).first
-            if await step1_submit.count() > 0 and await step1_submit.is_visible():
-                await human_click(self.page, step1_submit)
-                await asyncio.sleep(2.0)
+            if await self._visible(tab):
+                await human_click(self.page, tab)
+                await asyncio.sleep(0.2)
 
-            # 2. Определение формата (телефон или email)
-            login_str = self.phone_or_email.strip()
-            is_email = "@" in login_str
-
-            if is_email:
-                # Переключение на email если есть таб
-                email_tab = self.page.locator('[data-qa="credential-type-email"]').first
-                if await email_tab.count() > 0:
-                    await human_click(self.page, email_tab)
-                    await asyncio.sleep(0.5)
-                text_to_type = login_str
-            else:
-                # Очистка и форматирование телефона для национального инпута Magritte (10 цифр без +7/8)
-                import re
-
-                digits = re.sub(r"\D", "", login_str)
-                if len(digits) == 11 and digits.startswith(("7", "8")):
-                    text_to_type = digits[1:]
-                else:
-                    text_to_type = digits
-
-                phone_tab = self.page.locator('[data-qa="credential-type-phone"]').first
-                if await phone_tab.count() > 0:
-                    await human_click(self.page, phone_tab)
-                    await asyncio.sleep(0.5)
-
-            # 3. Поиск и ввод логина
-            login_input = self.page.locator(
-                '[data-qa="magritte-phone-input-national-number-input"], '
-                '[data-qa="account-signup-email"], '
-                'input[name="login"], '
-                'input[type="text"], '
-                'input[type="tel"], '
-                'input[type="email"]'
-            ).first
-
-            if await login_input.count() == 0:
-                logger.error("Пользователь %d: не найдено поле ввода логина на hh.ru", self.user_id)
-                await self.abort()
-                return {"status": "ERROR", "message": "Не найдено поле ввода логина. Проверьте адрес входа hh.ru."}
-
+            target = await self._login_input(is_email=is_email)
+            if not target:
+                return login_error("HH_LOGIN_FORM_CHANGED")
             await human_type(
                 self.page,
-                login_input,
-                text_to_type,
+                target,
+                login if is_email else hh_national_phone(login),
                 value_mode="exact" if is_email else "digits",
             )
-            await asyncio.sleep(0.5)
-
-            # 4. Нажатие кнопки продолжить / запросить код
-            submit_btn = self.page.locator(
-                '[data-qa="submit-button"], [data-qa="account-signup-submit"], button[type="submit"]'
-            ).first
-            if await submit_btn.count() > 0 and await submit_btn.is_visible():
-                await human_click(self.page, submit_btn)
-                await asyncio.sleep(2.5)
-
-            # 5. Проверка появления капчи (картинки с кодом)
-            await asyncio.sleep(1.0)
-            captcha_img = self.page.locator(
-                '[data-qa="account-captcha-picture"], img[src*="/captcha/picture"], img[data-qa="captcha-image"]'
-            ).first
-            captcha_input = self.page.locator(
-                '[data-qa="account-captcha-input"], input[name="captchaText"], input[name="captcha"]'
-            ).first
-
-            if await captcha_img.is_visible() or await captcha_input.is_visible():
-                logger.info("Пользователь %d: обнаружена капча hh.ru! Запрос решения через Telegram...", self.user_id)
-                await asyncio.sleep(1.0)
-
-                if await captcha_img.is_visible():
-                    await captcha_img.scroll_into_view_if_needed()
-                    captcha_bytes = await captcha_img.screenshot()
-                else:
-                    form_elem = self.page.locator('form, [data-qa="account-login-form"]').first
-                    if await form_elem.is_visible():
-                        captcha_bytes = await form_elem.screenshot()
-                    else:
-                        captcha_bytes = await self.page.screenshot()
-                return {"status": "WAITING_FOR_CAPTCHA", "captcha_bytes": captcha_bytes}
-
-            logger.info("Пользователь %d: СМС-код запрошен на hh.ru. Ожидание кода из Telegram...", self.user_id)
-            return {"status": "WAITING_FOR_OTP"}
-
-        except Exception as e:
-            logger.error("Пользователь %d: ошибка 1 фазы логина: %s", self.user_id, type(e).__name__)
-            await self.abort()
-            return {"status": "ERROR", "message": "Не удалось открыть форму входа hh.ru."}
-
-    async def _get_fresh_captcha_bytes(self, old_src: str | None = None) -> bytes:
-        """Ожидает загрузки нового URL картинки капчи и снимает точный скриншот."""
-        captcha_img = self.page.locator(
-            '[data-qa="account-captcha-picture"], img[src*="/captcha/picture"], img[data-qa="captcha-image"]'
-        ).first
-
-        if old_src and await captcha_img.count() > 0:
-            try:
-                await self.page.wait_for_function(
-                    'old => { const img = document.querySelector(\'[data-qa="account-captcha-picture"], img[src*="/captcha/picture"], img[data-qa="captcha-image"]\'); return img && img.getAttribute(\'src\') !== old; }',
-                    arg=old_src,
-                    timeout=4000,
-                )
-            except Exception:
-                pass
-
-        await asyncio.sleep(0.8)
-
-        if await captcha_img.is_visible():
-            await captcha_img.scroll_into_view_if_needed()
-            return await captcha_img.screenshot()
-        else:
-            form_elem = self.page.locator('form, [data-qa="account-login-form"]').first
-            if await form_elem.is_visible():
-                return await form_elem.screenshot()
-            else:
-                return await self.page.screenshot()
+            submit = await self._submit_button()
+            if not submit:
+                return login_error("HH_LOGIN_FORM_CHANGED")
+            await human_click(self.page, submit)
+            return await self._detect_login_state()
+        except ValueError:
+            return login_error("HH_LOGIN_INPUT_REJECTED")
+        except Exception as exc:
+            logger.warning("hh.ru login start failed for user %d: %s", self.user_id, type(exc).__name__)
+            return login_error("HH_LOGIN_FORM_CHANGED")
 
     async def complete_captcha_flow(self, captcha_text: str) -> dict[str, Any]:
-        """Ввод текста капчи и отправка формы."""
         if not self.page:
-            return {"status": "ERROR", "message": "Сессия логина не найдена или истекла."}
-
+            return login_error("LOGIN_SESSION_EXPIRED")
         try:
-            logger.info("Пользователь %d: отправка ответа капчи...", self.user_id)
-            captcha_img = self.page.locator(
-                '[data-qa="account-captcha-picture"], img[src*="/captcha/picture"], img[data-qa="captcha-image"]'
-            ).first
-            old_src = await captcha_img.get_attribute("src") if await captcha_img.count() > 0 else None
-
-            captcha_input = self.page.locator(
-                '[data-qa="account-captcha-input"], input[name="captchaText"], input[name="captcha"]'
-            ).first
-            if await captcha_input.count() > 0:
-                await captcha_input.fill(captcha_text)
-                await asyncio.sleep(0.3)
-                await captcha_input.press("Enter")
-                await asyncio.sleep(1.5)
-
-            # Проверка: осталась ли капча или обновилась
-            captcha_input_after = self.page.locator(
-                '[data-qa="account-captcha-input"], input[name="captchaText"], input[name="captcha"]'
-            ).first
-            captcha_img_after = self.page.locator(
-                '[data-qa="account-captcha-picture"], img[src*="/captcha/picture"], img[data-qa="captcha-image"]'
-            ).first
-
-            if await captcha_img_after.is_visible() or await captcha_input_after.is_visible():
-                logger.warning("Пользователь %d: неверный код капчи или новая картинка.", self.user_id)
-                captcha_bytes = await self._get_fresh_captcha_bytes(old_src=old_src)
-                return {
-                    "status": "INVALID_CAPTCHA",
-                    "captcha_bytes": captcha_bytes,
-                    "message": "Неверный код с картинки.",
-                }
-
-            logger.info("Пользователь %d: капча успешно пройдена! Ожидание СМС-кода...", self.user_id)
-            return {"status": "WAITING_FOR_OTP"}
-
-        except Exception as e:
-            logger.error("Пользователь %d: ошибка при вводе капчи: %s", self.user_id, type(e).__name__)
-            await self.abort()
-            return {"status": "ERROR", "message": "Не удалось проверить капчу."}
+            image = self.page.locator(_CAPTCHA_IMAGE).first
+            old_src = await image.get_attribute("src") if await self._visible(image) else None
+            target = self.page.locator(_CAPTCHA_INPUT).first
+            if not await self._visible(target):
+                return login_error("HH_LOGIN_FORM_CHANGED")
+            await target.fill(captcha_text.strip())
+            await target.press("Enter")
+            result = await self._detect_login_state(after_captcha=True)
+            if result.get("status") == "INVALID_CAPTCHA":
+                result["captcha_bytes"] = await self._get_fresh_captcha_bytes(old_src=old_src)
+            return result
+        except Exception as exc:
+            logger.warning("hh.ru captcha step failed for user %d: %s", self.user_id, type(exc).__name__)
+            return login_error("HH_LOGIN_FORM_CHANGED")
 
     async def reload_captcha_flow(self) -> dict[str, Any]:
-        """Клик по кнопке Перегенерировать капчу и получение нового скриншота."""
         if not self.page:
-            return {"status": "ERROR", "message": "Сессия логина не найдена или истекла."}
-
+            return login_error("LOGIN_SESSION_EXPIRED")
         try:
-            logger.info("Пользователь %d: клик по кнопке обновления капчи...", self.user_id)
-            captcha_img = self.page.locator(
-                '[data-qa="account-captcha-picture"], img[src*="/captcha/picture"], img[data-qa="captcha-image"]'
-            ).first
-            old_src = await captcha_img.get_attribute("src") if await captcha_img.count() > 0 else None
-
-            reload_btn = self.page.locator(
+            image = self.page.locator(_CAPTCHA_IMAGE).first
+            old_src = await image.get_attribute("src") if await self._visible(image) else None
+            button = self.page.locator(
                 '[data-qa="account-captcha-reload"], [data-qa="captcha-renew-text"], button:has([data-qa*="reload"])'
             ).first
-            if await reload_btn.count() > 0 and await reload_btn.is_visible():
-                await human_click(self.page, reload_btn)
-
-            captcha_bytes = await self._get_fresh_captcha_bytes(old_src=old_src)
-            return {"status": "WAITING_FOR_CAPTCHA", "captcha_bytes": captcha_bytes}
-
-        except Exception as e:
-            logger.error("Пользователь %d: ошибка при обновлении капчи: %s", self.user_id, type(e).__name__)
-            return {"status": "ERROR", "message": "Не удалось обновить картинку капчи."}
+            if not await self._visible(button):
+                return login_error("HH_LOGIN_FORM_CHANGED")
+            await human_click(self.page, button)
+            return {"status": "WAITING_FOR_CAPTCHA", "captcha_bytes": await self._get_fresh_captcha_bytes(old_src)}
+        except Exception as exc:
+            logger.warning("hh.ru captcha reload failed for user %d: %s", self.user_id, type(exc).__name__)
+            return login_error("HH_LOGIN_FORM_CHANGED")
 
     async def toggle_captcha_lang_flow(self) -> dict[str, Any]:
-        """Клик по кнопке Переключения языка капчи (English / Русский) и получение нового скриншота."""
         if not self.page:
-            return {"status": "ERROR", "message": "Сессия логина не найдена или истекла."}
-
+            return login_error("LOGIN_SESSION_EXPIRED")
         try:
-            logger.info("Пользователь %d: клик по кнопке смены языка капчи...", self.user_id)
-            captcha_img = self.page.locator(
-                '[data-qa="account-captcha-picture"], img[src*="/captcha/picture"], img[data-qa="captcha-image"]'
-            ).first
-            old_src = await captcha_img.get_attribute("src") if await captcha_img.count() > 0 else None
-
-            lang_btn = self.page.locator('[data-qa="account-captcha-lang-switch"], [data-qa="captcha-language"]').first
-            if await lang_btn.count() > 0 and await lang_btn.is_visible():
-                await human_click(self.page, lang_btn)
-
-            captcha_bytes = await self._get_fresh_captcha_bytes(old_src=old_src)
-            return {"status": "WAITING_FOR_CAPTCHA", "captcha_bytes": captcha_bytes}
-
-        except Exception as e:
-            logger.error("Пользователь %d: ошибка при смене языка капчи: %s", self.user_id, type(e).__name__)
-            return {"status": "ERROR", "message": "Не удалось переключить язык капчи."}
+            image = self.page.locator(_CAPTCHA_IMAGE).first
+            old_src = await image.get_attribute("src") if await self._visible(image) else None
+            button = self.page.locator('[data-qa="account-captcha-lang-switch"], [data-qa="captcha-language"]').first
+            if not await self._visible(button):
+                return login_error("HH_LOGIN_FORM_CHANGED")
+            await human_click(self.page, button)
+            return {"status": "WAITING_FOR_CAPTCHA", "captcha_bytes": await self._get_fresh_captcha_bytes(old_src)}
+        except Exception as exc:
+            logger.warning("hh.ru captcha language switch failed for user %d: %s", self.user_id, type(exc).__name__)
+            return login_error("HH_LOGIN_FORM_CHANGED")
 
     async def complete_login_flow(self, code: str) -> dict[str, Any]:
-        """Вторая фаза: человеческий ввод полученного СМС-кода и сохранение сессии."""
+        """Persist cookies only after a positive authenticated marker."""
+
         if not self.page:
-            return {"status": "ERROR", "message": "Сессия логина не найдена или истекла."}
-
+            return login_error("LOGIN_SESSION_EXPIRED")
         try:
-            self.otp_code = code.strip()
-            logger.info("Пользователь %d: ввод полученного СМС-кода...", self.user_id)
-
-            otp_target = self.page.locator(
-                '[data-qa="otp-code-input"], input[name="code"], input[autocomplete="one-time-code"]'
-            )
-            otp_form_input = self.page.locator(
-                '[data-qa*="otp"] input, input[autocomplete="one-time-code"], '
-                'form input[name*="code" i], form input[type="number"]'
-            ).first
+            otp = code.strip()
+            target = self.page.locator(_OTP_INPUT).first
             try:
-                await otp_form_input.wait_for(state="visible", timeout=10_000)
-            except Exception as exc:
-                raise HumanizationError("otp", "target_not_ready") from exc
-            cells = await self._otp_cells(self.otp_code)
+                await target.wait_for(state="visible", timeout=10_000)
+            except Exception:
+                return login_error("HH_LOGIN_FORM_CHANGED")
+            cells = await self._otp_cells(otp)
             try:
                 if cells:
-                    await human_type_digits(self.page, cells, self.otp_code)
-                elif await otp_target.count() == 1:
-                    await human_type_digits(self.page, otp_target.first, self.otp_code)
+                    await human_type_digits(self.page, cells, otp)
+                elif await target.count() == 1:
+                    await human_type_digits(self.page, target, otp)
                 else:
-                    raise HumanizationError("otp", "ambiguous_fields")
+                    return login_error("HH_LOGIN_FORM_CHANGED")
             except HumanizationError:
-                # The last character can trigger a navigation that detaches the
-                # input. It is successful only with a positive auth marker.
                 if not await self._is_authenticated(timeout=2_000):
-                    raise
+                    return login_error("HH_LOGIN_FORM_CHANGED")
 
-            if not await self._is_authenticated(timeout=1_500):
-                confirm_btn = self.page.locator('[data-qa="otp-code-submit"], button[type="submit"]').first
-                if await confirm_btn.count() == 0:
-                    raise HumanizationError("otp", "confirm_not_ready")
-                await human_click(self.page, confirm_btn)
-
+            if not await self._is_authenticated(timeout=1_000):
+                submit = await self._submit_button()
+                if submit:
+                    await human_click(self.page, submit)
             if await self._is_authenticated(timeout=5_000):
                 return await self._finish_authenticated_login()
-
-            logger.warning("Пользователь %d: неверный СМС-код или ошибка подтверждения.", self.user_id)
             await self.abort()
-            return {"status": "INVALID_CODE", "message": "Неверный СМС-код. Попробуйте еще раз через меню авторизации."}
-
-        except Exception as e:
-            logger.error("Пользователь %d: ошибка при вводе СМС-кода: %s", self.user_id, type(e).__name__)
+            return login_error("HH_OTP_INVALID", status="INVALID_CODE")
+        except Exception as exc:
+            logger.warning("hh.ru otp confirmation failed for user %d: %s", self.user_id, type(exc).__name__)
             await self.abort()
-            return {"status": "ERROR", "message": "Не удалось подтвердить код hh.ru."}
+            return login_error("HH_LOGIN_FORM_CHANGED")
 
     async def _otp_cells(self, code: str) -> list:
-        """Return a complete, visible set of one-character OTP inputs only."""
         if not self.page:
             return []
-        candidates = self.page.locator(
-            '[data-qa*="otp"] input, input[autocomplete="one-time-code"], '
-            'form input[name*="code" i], form input[type="number"]'
-        )
+        candidates = self.page.locator(_OTP_INPUT)
         cells = []
         for index in range(await candidates.count()):
             candidate = candidates.nth(index)
-            if not await candidate.is_visible():
-                continue
-            if await candidate.get_attribute("maxlength") == "1":
+            if await self._visible(candidate) and await candidate.get_attribute("maxlength") == "1":
                 cells.append(candidate)
         return cells if len(cells) == len(code) else []
 
     async def _is_authenticated(self, *, timeout: int) -> bool:
         if not self.page:
             return False
-        authenticated = self.page.locator(
-            '[data-qa="mainmenu_myResumes"], [data-qa="mainmenu_vacancyResponses"], a[href*="/applicant/resumes"]'
-        ).first
+        marker = self.page.locator(_AUTH_MARKER).first
         try:
-            await authenticated.wait_for(state="visible", timeout=timeout)
+            await marker.wait_for(state="visible", timeout=timeout)
             return "account/login" not in self.page.url
         except Exception:
             return False
 
     async def _finish_authenticated_login(self) -> dict[str, Any]:
-        """Persist a positively verified hh.ru session exactly once."""
         if not self.context:
-            return {"status": "ERROR", "message": "Контекст браузера уже закрыт."}
-        logger.info("Пользователь %d: успешная авторизация на hh.ru!", self.user_id)
-        storage_state = await self.context.storage_state()
-        encrypted_state = self.security_factory().encrypt_storage_state(storage_state)
-        if self.account_id:
-            updated = await self.db.update_account_session(
-                self.user_id,
-                self.account_id,
-                encrypted_state,
-                status="ACTIVE",
-            )
-            if not updated:
-                await self.cleanup()
-                return {"status": "ERROR", "message": "Аккаунт для сохранения сессии не найден."}
-        else:
-            await self.db.update_user_session(self.user_id, encrypted_state, status="ACTIVE")
-        await self.cleanup()
-        return {"status": "SUCCESS"}
+            return login_error("HH_LOGIN_FORM_CHANGED")
+        try:
+            storage_state = await self.context.storage_state()
+            encrypted_state = self.security_factory().encrypt_storage_state(storage_state)
+            if self.account_id:
+                updated = await self.db.update_account_session(self.user_id, self.account_id, encrypted_state, status="ACTIVE")
+                if not updated:
+                    return login_error("HH_LOGIN_FORM_CHANGED")
+            else:
+                await self.db.update_user_session(self.user_id, encrypted_state, status="ACTIVE")
+            await self.cleanup()
+            logger.info("hh.ru login completed for user %d", self.user_id)
+            return {"status": "SUCCESS"}
+        except Exception as exc:
+            logger.warning("hh.ru session persistence failed for user %d: %s", self.user_id, type(exc).__name__)
+            return login_error("HH_LOGIN_FORM_CHANGED")
 
     async def abort(self) -> None:
-        """Close browser resources and remove an unfinished account row."""
+        """Release resources and delete only a new unfinished account."""
+
         await self.cleanup()
         if self.account_id:
             account = await self.db.get_account_for_user(self.user_id, self.account_id)
             if account and account.get("session_status") == "AUTH_PENDING":
                 await self.db.delete_hh_account_for_user(self.user_id, self.account_id)
 
-    async def cleanup(self):
-        """Close each owned resource, even if closing another one fails."""
+    async def cleanup(self) -> None:
         self.is_done = True
         self.page = None
         errors = []
@@ -404,7 +402,7 @@ class HHLoginSession:
 
 
 class HHLoginManager:
-    """Менеджер сессий входа, принадлежащий одному AppContext."""
+    """Own concurrent login sessions without crossing account boundaries."""
 
     def __init__(self, *, db, engine_factory, security_factory, locks, stop_account):
         self.db = db
@@ -422,16 +420,19 @@ class HHLoginManager:
     def _key(user_id: int, account_id: int | None) -> tuple[int, int | None]:
         return user_id, account_id
 
+    @staticmethod
+    def _session_expired() -> dict[str, Any]:
+        return login_error("LOGIN_SESSION_EXPIRED")
+
     async def _auto_cleanup_session(
         self, user_id: int, account_id: int | None, session: HHLoginSession, timeout: float = 600.0
     ) -> None:
-        """Автоматическое закрытие брошенной сессии авторизации по таймауту (10 мин)."""
         await asyncio.sleep(timeout)
         key = self._key(user_id, account_id)
         async with self.locks.login_locks[key]:
             current = self._sessions.get(key)
             if current is session and not session.is_done:
-                logger.info("Closing inactive login session for user %d", user_id)
+                logger.info("Closing expired hh.ru login for user %d", user_id)
                 await session.abort()
                 self._sessions.pop(key, None)
                 if self.monitor:
@@ -442,19 +443,33 @@ class HHLoginManager:
             if self._cleanup_tasks.get(key) is asyncio.current_task():
                 self._cleanup_tasks.pop(key, None)
 
+    async def _release_terminal(self, key: tuple[int, int | None], session: HHLoginSession) -> None:
+        if self._sessions.get(key) is not session:
+            return
+        self._sessions.pop(key, None)
+        timer = self._cleanup_tasks.pop(key, None)
+        if timer:
+            timer.cancel()
+            await asyncio.gather(timer, return_exceptions=True)
+        if not session.is_done:
+            await session.abort()
+
+    async def _finish_step(self, key: tuple[int, int | None], session: HHLoginSession, result: dict[str, Any]) -> dict[str, Any]:
+        if result.get("status") not in _WAITING_STATUSES:
+            await self._release_terminal(key, session)
+        return result
+
     @serialize_login
     async def start_login(self, user_id: int, phone_or_email: str, account_id: int | None = None) -> dict[str, Any]:
         key = self._key(user_id, account_id)
         if account_id is not None:
-            # A fresh login must not race a worker persisting its older cookies.
             await self.stop_account(user_id, account_id)
         old_timer = self._cleanup_tasks.pop(key, None)
         if old_timer:
             old_timer.cancel()
             await asyncio.gather(old_timer, return_exceptions=True)
         if key in self._sessions:
-            previous = self._sessions[key]
-            await previous.cleanup()
+            await self._sessions[key].cleanup()
 
         session = self.session_factory(
             user_id,
@@ -465,67 +480,46 @@ class HHLoginManager:
             security_factory=self.security_factory,
         )
         self._sessions[key] = session
-
-        # Запуск таски автоочистки через 10 минут
-        self._cleanup_tasks[key] = asyncio.create_task(
-            self._auto_cleanup_session(user_id, account_id, session, timeout=600.0)
-        )
-
-        result = await session.start_login_flow()
-        if result.get("status") == "ERROR" and self._sessions.get(key) is session:
-            self._sessions.pop(key, None)
-            timer = self._cleanup_tasks.pop(key, None)
-            if timer:
-                timer.cancel()
-                await asyncio.gather(timer, return_exceptions=True)
-            if not session.is_done:
-                await session.abort()
-        return result
+        self._cleanup_tasks[key] = asyncio.create_task(self._auto_cleanup_session(user_id, account_id, session, timeout=600.0))
+        return await self._finish_step(key, session, await session.start_login_flow())
 
     @serialize_login
     async def reload_captcha(self, user_id: int, *, account_id: int | None = None) -> dict[str, Any]:
-        session = self._sessions.get(self._key(user_id, account_id))
+        key = self._key(user_id, account_id)
+        session = self._sessions.get(key)
         if not session or session.is_done:
-            return {"status": "ERROR", "message": "Сессия входа не найдена. Начните процесс авторизации заново."}
-        return await session.reload_captcha_flow()
+            return self._session_expired()
+        return await self._finish_step(key, session, await session.reload_captcha_flow())
 
     @serialize_login
     async def toggle_captcha_lang(self, user_id: int, *, account_id: int | None = None) -> dict[str, Any]:
-        session = self._sessions.get(self._key(user_id, account_id))
+        key = self._key(user_id, account_id)
+        session = self._sessions.get(key)
         if not session or session.is_done:
-            return {"status": "ERROR", "message": "Сессия входа не найдена. Начните процесс авторизации заново."}
-        return await session.toggle_captcha_lang_flow()
+            return self._session_expired()
+        return await self._finish_step(key, session, await session.toggle_captcha_lang_flow())
 
     @serialize_login
     async def submit_captcha(self, user_id: int, code: str, *, account_id: int | None = None) -> dict[str, Any]:
-        session = self._sessions.get(self._key(user_id, account_id))
+        key = self._key(user_id, account_id)
+        session = self._sessions.get(key)
         if not session or session.is_done:
-            return {"status": "ERROR", "message": "Сессия входа не найдена. Начните процесс авторизации заново."}
-
-        return await session.complete_captcha_flow(code)
+            return self._session_expired()
+        return await self._finish_step(key, session, await session.complete_captcha_flow(code))
 
     @serialize_login
     async def submit_otp(self, user_id: int, code: str, *, account_id: int | None = None) -> dict[str, Any]:
         key = self._key(user_id, account_id)
         session = self._sessions.get(key)
         if not session or session.is_done:
-            return {"status": "ERROR", "message": "Сессия входа не найдена. Начните процесс авторизации заново."}
-
-        res = await session.complete_login_flow(code)
-        self._sessions.pop(key, None)
-        timer = self._cleanup_tasks.pop(key, None)
-        if timer:
-            timer.cancel()
-            await asyncio.gather(timer, return_exceptions=True)
-        return res
+            return self._session_expired()
+        return await self._finish_step(key, session, await session.complete_login_flow(code))
 
     @serialize_login
     async def cancel(self, user_id: int, *, account_id: int | None = None) -> None:
         await self._cancel_session(user_id, account_id)
 
     async def _cancel_session(self, user_id: int, account_id: int | None) -> None:
-        """Release a login session without routing cleanup through the task monitor."""
-
         key = self._key(user_id, account_id)
         timer = self._cleanup_tasks.pop(key, None)
         if timer:
@@ -540,14 +534,12 @@ class HHLoginManager:
         return session.account_id if session else None
 
     async def close_login(self, user_id: int, account_id: int | None = None) -> None:
-        """Close one account's unfinished login without affecting its siblings."""
-
-        key = self._key(user_id, account_id)
-        async with self.locks.login_locks[key]:
+        async with self.locks.login_locks[self._key(user_id, account_id)]:
             await self._cancel_session(user_id, account_id)
 
     async def close_user(self, user_id: int) -> None:
-        """Administrative cleanup preserves the account and retains failed resources for retry."""
+        """Administrative cleanup keeps account data and supports legacy keys."""
+
         keys = [key for key in self._sessions if (key[0] if isinstance(key, tuple) else key) == user_id]
         for key in keys:
             async with self.locks.login_locks[key]:
@@ -575,4 +567,4 @@ class HHLoginManager:
             raise ExceptionGroup("Login manager cleanup failures", errors)
 
 
-__all__ = ["HHLoginManager", "HHLoginSession"]
+__all__ = ["HHLoginManager", "HHLoginSession", "login_error"]

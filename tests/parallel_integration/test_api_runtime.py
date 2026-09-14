@@ -211,6 +211,7 @@ async def test_captcha_language_has_public_data_uri(client):
 
 async def test_import_needs_input_and_removes_temporary_pdf(client, api_context):
     account = await database.create_hh_account(42, "import@example.com")
+    await database.update_account_session(42, account["id"], b"test-session", "ACTIVE")
     response = await client.post(
         f"/api/v1/accounts/{account['id']}/resumes/import",
         files={"file": ("resume.pdf", b"%PDF-1.4 offline", "application/pdf")},

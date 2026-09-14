@@ -15,7 +15,10 @@ async def start_all(
     session: dict = Depends(require_csrf),
     context: AppContext = Depends(get_context),
 ) -> dict:
-    return await context.services.automation.start_all(int(session["user_id"]))
+    try:
+        return await context.services.automation.start_all(int(session["user_id"]))
+    except ServiceError as exc:
+        raise service_http_error(exc) from exc
 
 
 @router.post("/stop-all")

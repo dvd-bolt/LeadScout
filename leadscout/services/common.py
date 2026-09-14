@@ -71,3 +71,16 @@ class _Service:
         if not account:
             raise ServiceError("NOT_FOUND", "Аккаунт не найден.")
         return account
+
+    async def _external_account(self, user_id: int, account_id: int) -> dict:
+        """Require an account whose hh.ru login has been completed.
+
+        This check is deliberately made before a route creates a tracked task,
+        so an unfinished connection cannot consume a browser slot or leave a
+        misleading task in the journal.
+        """
+
+        account = await self._account(user_id, account_id)
+        if account.get("session_status") == "AUTH_PENDING":
+            raise ServiceError("LOGIN_IN_PROGRESS", "Сначала завершите подключение аккаунта.")
+        return account

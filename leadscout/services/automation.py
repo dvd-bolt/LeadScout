@@ -11,6 +11,8 @@ from .errors import ServiceError
 class AutomationService(_Service):
     @staticmethod
     def _validate(account: dict) -> None:
+        if account.get("session_status") == "AUTH_PENDING":
+            raise ServiceError("LOGIN_IN_PROGRESS", "Сначала завершите подключение аккаунта.")
         if account.get("session_status") != "ACTIVE":
             raise ServiceError("CONFLICT", "Сначала войдите в аккаунт hh.ru.")
         if "encrypted_storage_state" in account and not account.get("encrypted_storage_state"):
@@ -26,7 +28,7 @@ class AutomationService(_Service):
     async def start(self, user_id: int, account_id: int) -> dict:
         if getattr(self, "access", None):
             self.access.check_account_start(account_id)
-        account = await self._account(user_id, account_id)
+        account = await self._external_account(user_id, account_id)
         self._validate(account)
         enabled = await _await(self.db.update_account_settings_for_user(user_id, account_id, auto_apply_enabled=1))
         if not enabled:
@@ -40,6 +42,8 @@ class AutomationService(_Service):
 
     async def start_all(self, user_id: int) -> dict:
         accounts = await _await(self.db.get_user_accounts(user_id))
+        if any(account.get("session_status") == "AUTH_PENDING" for account in accounts):
+            raise ServiceError("LOGIN_IN_PROGRESS", "Сначала завершите подключение аккаунта.")
         results: list[dict] = []
         for account in accounts:
             account_id = int(account["id"])

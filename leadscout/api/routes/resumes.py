@@ -46,8 +46,10 @@ async def sync_resumes(
     context: AppContext = Depends(get_context),
 ) -> dict:
     user_id = int(session["user_id"])
-    if not await context.db.get_account_for_user(user_id, account_id):
-        raise service_http_error(ServiceError("NOT_FOUND", "Аккаунт не найден"))
+    try:
+        await context.services.resumes._external_account(user_id, account_id)
+    except ServiceError as exc:
+        raise service_http_error(exc) from exc
     return await context.operations.schedule(
         user_id,
         "resume-sync",
@@ -79,8 +81,10 @@ async def import_resume(
     structured_json: str = Form(default=""),
 ) -> dict:
     user_id = int(session["user_id"])
-    if not await context.db.get_account_for_user(user_id, account_id):
-        raise service_http_error(ServiceError("NOT_FOUND", "Аккаунт не найден"))
+    try:
+        await context.services.resumes._external_account(user_id, account_id)
+    except ServiceError as exc:
+        raise service_http_error(exc) from exc
     contents = await _read_pdf(file, context.settings.pdf_max_bytes)
     try:
         structured = json.loads(structured_json) if structured_json else None
@@ -115,6 +119,10 @@ async def delete_resume(
     if not payload.confirm:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Подтвердите удаление резюме")
     user_id = int(session["user_id"])
+    try:
+        await context.services.resumes._external_account(user_id, account_id)
+    except ServiceError as exc:
+        raise service_http_error(exc) from exc
 
     async def job() -> dict:
         result = await context.services.resumes.delete(user_id, account_id, snapshot_id)

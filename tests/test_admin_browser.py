@@ -149,7 +149,7 @@ async def test_admin_mono_layout_screenshots_and_revision_conflict(mini_app, tmp
     await page.get_by_role("button", name="Подтвердить", exact=True).click()
     await expect(page.get_by_text("Concurrent edit", exact=True)).to_be_visible()
     assert (await c.admin_store.member(9223372036854775807))["role"] == "USER"
-    assert await page.get_by_role("group", name="Подтверждение изменения доступа").count() == 0
+    await expect(page.get_by_role("group", name="Подтверждение изменения доступа")).to_have_count(0)
 
 
 async def test_invitation_copy_handles_unavailable_clipboard(mini_app, monkeypatch):

@@ -215,6 +215,28 @@ async def test_api_scopes_accounts_and_requires_a_usable_resume(audit_client, mo
     start.assert_not_called()
 
 
+async def test_pending_account_cannot_schedule_hh_operations(audit_client, monkeypatch):
+    account = await database.create_hh_account(42, "pending@example.com")
+    context = get_default_context()
+    schedule = AsyncMock()
+    start = AsyncMock()
+    monkeypatch.setattr(context.operations, "schedule", schedule)
+    monkeypatch.setattr(context.coordinator, "start_account", start)
+
+    sync = await audit_client.post(f"/api/v1/accounts/{account['id']}/resumes/sync")
+    upload = await audit_client.post(
+        f"/api/v1/accounts/{account['id']}/resumes/import",
+        files={"file": ("resume.pdf", b"%PDF-1.4", "application/pdf")},
+    )
+    automation = await audit_client.post(f"/api/v1/automation/{account['id']}/start")
+
+    for response in (sync, upload, automation):
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Сначала завершите подключение аккаунта."
+    schedule.assert_not_called()
+    start.assert_not_called()
+
+
 async def test_invalid_login_and_nonascii_hash_do_not_crash_api(audit_client):
     assert (
         await audit_client.post("/api/v1/login-flows/start", json={"phone_or_email": "not-a-login"})

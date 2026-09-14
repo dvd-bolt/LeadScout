@@ -77,13 +77,14 @@ class TaskRegistry:
                 "ALREADY_RUNNING",
                 "CANCELLED",
             } or status.startswith("SKIPPED")
+            failure_code = str(result.get("code") or "TASK_FAILED") if isinstance(result, dict) else "TASK_FAILED"
             await self.store.task_state(
                 task_id,
                 "WAITING_INPUT" if waiting else "SUCCEEDED" if success else "FAILED",
-                "" if waiting or success else "TASK_FAILED",
+                "" if waiting or success else failure_code,
             )
             if not waiting and not success:
-                await self.store.error("task", "TASK_FAILED", task_id=task_id, user_id=live.user_id)
+                await self.store.error("task", failure_code, task_id=task_id, user_id=live.user_id)
             finished = not waiting
             return result
         except AccessError:

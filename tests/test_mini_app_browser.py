@@ -18,6 +18,7 @@ async def test_settings_save_persists_and_account_switch_is_isolated(mini_app):
     await expect(page.get_by_role("status")).to_have_text("Настройки сохранены")
     saved = await database.get_account_for_user(42, mini_app.account["id"])
     assert (saved["keywords"], saved["daily_limit"]) == ("Python, SQL", 17)
+    await database.update_account_session(42, mini_app.other["id"], b"ui-other-session", "ACTIVE")
     await page.get_by_label("Активный аккаунт").select_option(str(mini_app.other["id"]))
     await expect(page.get_by_label("Название аккаунта", exact=True)).to_have_value("Второй аккаунт")
     await expect(page.get_by_label("Ключевые слова", exact=True)).to_have_value("")

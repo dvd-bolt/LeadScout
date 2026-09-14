@@ -165,7 +165,7 @@ function Root() {
       <Route path="/applications" element={<ApplicationsPage dashboard={dashboard.data} key={`applications:${accountKey}`} />} />
       <Route path="/resumes" element={<ResumesPage dashboard={dashboard.data} key={`resumes:${accountKey}`} />} />
       <Route path="/admin" element={<AdminPage dashboard={dashboard.data} />} />
-      <Route path="/settings" element={<SettingsPage dashboard={dashboard.data} key={`settings:${accountKey}`} />} />
+      <Route path="/settings" element={<SettingsPage dashboard={dashboard.data} />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   </AppLayout>;

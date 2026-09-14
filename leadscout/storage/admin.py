@@ -15,6 +15,14 @@ ERROR_MESSAGES = {
     "SCHEDULER_FAILED": "Не удалось выполнить цикл планировщика.",
     "INTERRUPTED": "Работа прервана перезапуском. Проверьте внешний результат.",
     "CANCELLED": "Работа остановлена. Проверьте внешний результат перед повтором.",
+    "HH_LOGIN_INPUT_REJECTED": "hh.ru не принял телефон или email.",
+    "HH_LOGIN_RATE_LIMITED": "hh.ru временно ограничил запросы входа.",
+    "HH_LOGIN_FORM_CHANGED": "Форма входа hh.ru изменилась.",
+    "HH_LOGIN_REQUEST_REJECTED": "hh.ru не подтвердил запрос кода.",
+    "HH_LOGIN_TRANSITION_TIMEOUT": "hh.ru не ответил на запрос входа вовремя.",
+    "LOGIN_SESSION_EXPIRED": "Сессия входа истекла.",
+    "HH_CAPTCHA_INVALID": "Капча hh.ru не принята.",
+    "HH_OTP_INVALID": "Код hh.ru не принят.",
 }
 
 

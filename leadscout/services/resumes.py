@@ -16,7 +16,7 @@ class ResumeService(_Service):
         self.resume_manager = resume_manager
 
     async def sync(self, user_id: int, account_id: int) -> dict:
-        await self._account(user_id, account_id)
+        await self._external_account(user_id, account_id)
         return _mapping(await _await(self.resume_manager.fetch_user_resumes(user_id, account_id)))
 
     async def import_pdf(
@@ -26,7 +26,7 @@ class ResumeService(_Service):
         path: str,
         structured: dict | Any | None = None,
     ) -> dict:
-        await self._account(user_id, account_id)
+        await self._external_account(user_id, account_id)
         try:
             result = _mapping(
                 await _await(
@@ -47,7 +47,7 @@ class ResumeService(_Service):
         return result
 
     async def delete(self, user_id: int, account_id: int, snapshot_id: int) -> dict:
-        await self._account(user_id, account_id)
+        await self._external_account(user_id, account_id)
         snapshot = await _await(self.db.get_resume_snapshot_for_user(user_id, snapshot_id))
         if not snapshot or int(snapshot.get("account_id", -1)) != int(account_id):
             raise ServiceError("NOT_FOUND", "Резюме не найдено.")

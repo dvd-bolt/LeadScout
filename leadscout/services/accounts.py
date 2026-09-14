@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from leadscout.core.identity import validate_hh_login
 from utils.validation import normalize_proxy_url
 
 from .common import _ACCOUNT_SETTINGS, _await, _mapping, _Service, _translate_storage_error
@@ -16,9 +17,12 @@ class AccountService(_Service):
         self.login_manager = login_manager
 
     async def start_login(self, user_id: int, login: str, account_name: str = "") -> dict:
-        login = str(login or "").strip()
+        try:
+            login = validate_hh_login(login)
+        except ValueError as exc:
+            raise ServiceError("INVALID_INPUT", str(exc)) from exc
         account_name = str(account_name or "").strip()
-        if not 5 <= len(login) <= 254 or len(account_name) > 120:
+        if len(account_name) > 120:
             raise ServiceError("INVALID_INPUT", "Введите корректный логин hh.ru.")
 
         account = await _await(self.db.get_account_by_login(user_id, login))

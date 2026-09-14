@@ -90,6 +90,9 @@ async def mini_app(isolated_db, monkeypatch, runtime_context, request):
     runtime_context.settings = replace(runtime_context.settings, web_app_origins=("http://leadscout.test",))
     account = await database.create_hh_account(42, "ui@example.com", "Первый аккаунт")
     other = await database.create_hh_account(42, "ui-other@example.com", "Второй аккаунт")
+    # This fixture exercises settings/resume UI, not the login flow.  Mark its
+    # active account as authenticated explicitly so AUTH_PENDING remains protected.
+    await database.update_account_session(42, account["id"], b"ui-session", "ACTIVE")
     await database.set_active_account(42, account["id"])
     snapshots = await database.sync_resume_snapshots(
         42,

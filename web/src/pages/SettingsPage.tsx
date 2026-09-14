@@ -9,7 +9,10 @@ export function SettingsPage({ dashboard }: { dashboard: Dashboard }) {
   const active = dashboard.accounts.find((item) => item.id === dashboard.active_account_id);
   return <section className={styles.page}>
     <h1 className={styles.pageTitle}>Настройки</h1>
-    {active ? <AccountSettings account={active} key={active.id} /> : null}
+    {active?.session_status === "AUTH_PENDING" ? <Card>
+      <h2>Подключение аккаунта не завершено</h2>
+      <p>Завершите ввод кода ниже или отмените подключение. Синхронизация и автоматизация будут доступны после входа.</p>
+    </Card> : active ? <AccountSettings account={active} key={active.id} /> : null}
     {dashboard.role === "ROOT" || dashboard.role === "ADMIN" ? <Card><h2>Администрирование</h2><p>Доступ, состояние системы и задания</p><Link className={styles.button} to="/admin">Открыть</Link></Card> : null}
     <LoginPanel />
   </section>;

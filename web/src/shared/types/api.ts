@@ -119,5 +119,19 @@ export type Operation = {
 
 export type OperationStart = { operation_id: string; status?: string };
 export type AutomationStartResult = { account_id: number; status: string; message?: string };
-export type LoginFlowResponse = { account_id?: number; status: string; captcha_data_uri?: string; message?: string };
+export type LoginFlowStatus =
+  | "WAITING_FOR_CAPTCHA"
+  | "WAITING_FOR_OTP"
+  | "SUCCESS"
+  | "INVALID_CAPTCHA"
+  | "INVALID_CODE"
+  | "ERROR";
+
+export type LoginFlowResponse = {
+  account_id?: number;
+  status: LoginFlowStatus | string;
+  code?: string;
+  captcha_data_uri?: string;
+  message?: string;
+};
 export type VacancyMatchInput = { vacancy_text: string } | { vacancy_url: string };

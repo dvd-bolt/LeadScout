@@ -50,6 +50,7 @@ logs/application_attempts.jsonl*
 
 # Scratch and temporary media
 scratch/
+backups/
 *.png
 
 # Versioned design references and verification screenshots
