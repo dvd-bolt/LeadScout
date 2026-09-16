@@ -7,7 +7,7 @@ import pytest
 
 import database
 from leadscout.storage import Database, init_db
-from leadscout.storage.repositories import accounts, users
+from leadscout.storage.repositories import accounts, resumes, users
 
 
 @pytest.mark.asyncio
@@ -176,6 +176,46 @@ async def test_v8_database_is_migrated_to_resume_drafts_v9(tmp_path):
         "resume_publish_attempts",
         "resume_publish_events",
     }
+
+
+@pytest.mark.asyncio
+async def test_v7_database_migrates_to_v9_without_losing_accounts_or_resumes(tmp_path):
+    db = Database(tmp_path / "v7.db")
+    await init_db(db)
+    await users.get_or_create_user(db, 71)
+    account = await accounts.create_hh_account(db, 71, "migration@example.com")
+    await resumes.sync_resume_snapshots(
+        db,
+        71,
+        account["id"],
+        [{"id": "resume-v7", "title": "Старое резюме", "href": "https://hh.ru/resume/resume-v7"}],
+    )
+    async with db.connection() as connection:
+        await connection.execute("DROP TABLE resume_publish_events")
+        await connection.execute("DROP TABLE resume_publish_attempts")
+        await connection.execute("DROP TABLE resume_drafts")
+        await connection.execute("DROP TABLE application_attempts")
+        await connection.execute("PRAGMA user_version=7")
+        await connection.commit()
+
+    await init_db(db)
+
+    async with db.connection() as connection:
+        version = (await (await connection.execute("PRAGMA user_version")).fetchone())[0]
+        tables = {
+            row[0]
+            for row in await (
+                await connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            ).fetchall()
+        }
+    restored_account = await accounts.get_account_for_user(db, 71, account["id"])
+    snapshots = await resumes.list_resume_snapshots(db, 71, account["id"])
+    assert version == 9
+    assert {"resume_drafts", "resume_publish_attempts", "resume_publish_events"} <= tables
+    assert restored_account["phone_or_email"] == "migration@example.com"
+    assert [(item["hh_resume_id"], item["title"]) for item in snapshots] == [
+        ("resume-v7", "Старое резюме")
+    ]
 
 
 @pytest.mark.asyncio

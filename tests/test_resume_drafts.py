@@ -7,7 +7,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 import database
-from leadscout.models.resume_drafts import empty_resume_draft
+from leadscout.integrations.ai.client import AIServiceError
+from leadscout.models.resume_drafts import ResumeDraftData, empty_resume_draft
 from leadscout.services.errors import ServiceError
 from leadscout.services.resume_drafts import ResumeDraftService
 from leadscout.storage.repositories.resume_drafts import DraftRevisionConflict
@@ -135,6 +136,86 @@ async def test_editing_data_invalidates_preflight(runtime_context):
     assert updated["preflight_revision"] is None
     assert updated["preflight_fingerprint"] == ""
     assert updated["status"] == "DRAFT"
+
+
+async def test_pdf_extract_fills_an_empty_draft_and_preserves_manual_values(
+    runtime_context, monkeypatch
+):
+    account = await _account(42, "pdf-prefill@example.com")
+    extracted = ResumeDraftData.model_validate(
+        {
+            "profession": {"title": "AI title"},
+            "personal": {"city": "Москва"},
+            "experiences": [
+                {
+                    "company": "ООО Тест",
+                    "position": "Разработчик",
+                    "start_month": "1",
+                    "start_year": "2024",
+                    "is_current": True,
+                    "description": "Описание",
+                }
+            ],
+        }
+    )
+    ai = SimpleNamespace(extract_resume_draft=AsyncMock(return_value=extracted))
+    service = ResumeDraftService(
+        db=runtime_context.db, coordinator=None, resume_manager=SimpleNamespace(), ai=ai
+    )
+    monkeypatch.setattr("leadscout.services.resume_drafts.extract_text_from_pdf", lambda _path: "resume text")
+
+    empty = await service.create(42, account["id"], "PDF")
+    first = await service.extract_pdf(42, account["id"], empty["id"], "ignored.pdf")
+    filled = await service.get(42, account["id"], empty["id"])
+    assert first["code"] == "PDF_PARSED"
+    assert filled["data"]["personal"]["city"] == "Москва"
+    assert filled["data"]["experiences"][0]["is_current"] is True
+
+    manual_data = empty_resume_draft()
+    manual_data["profession"]["title"] = "Ручное название"
+    manual = await service.create(42, account["id"], "PDF", manual_data)
+    await service.extract_pdf(42, account["id"], manual["id"], "ignored.pdf")
+    merged = await service.get(42, account["id"], manual["id"])
+    assert merged["data"]["profession"]["title"] == "Ручное название"
+    assert merged["data"]["personal"]["city"] == "Москва"
+
+
+async def test_pdf_ai_failure_persists_safe_parse_error_without_changing_data(
+    runtime_context, monkeypatch
+):
+    account = await _account(42, "pdf-error@example.com")
+    data = empty_resume_draft()
+    data["profession"]["title"] = "Сохранённое название"
+    ai = SimpleNamespace(
+        extract_resume_draft=AsyncMock(
+            side_effect=AIServiceError(
+                "Лимит Gemini исчерпан.",
+                code="AI_QUOTA_EXCEEDED",
+                retryable=True,
+                provider_status=429,
+            )
+        )
+    )
+    service = ResumeDraftService(
+        db=runtime_context.db, coordinator=None, resume_manager=SimpleNamespace(), ai=ai
+    )
+    monkeypatch.setattr("leadscout.services.resume_drafts.extract_text_from_pdf", lambda _path: "resume text")
+    draft = await service.create(42, account["id"], "PDF", data)
+
+    result = await service.extract_pdf(42, account["id"], draft["id"], "ignored.pdf")
+    stored = await service.get(42, account["id"], draft["id"])
+
+    assert result["status"] == "NEEDS_INPUT"
+    assert result["code"] == "AI_QUOTA_EXCEEDED"
+    assert stored["status"] == "NEEDS_INPUT"
+    assert stored["data"] == data
+    assert stored["validation"]["parse_error"] == {
+        "code": "AI_QUOTA_EXCEEDED",
+        "stage": "PARSE",
+        "message": "Лимит Gemini исчерпан.",
+        "retryable": True,
+        "required_action": "UPDATE_API_KEY_OR_RETRY_LATER",
+    }
 
 
 async def test_restart_requires_reconciliation_instead_of_a_second_resume(runtime_context):

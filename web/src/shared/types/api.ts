@@ -151,6 +151,14 @@ export type NamedResumeDetail = { name: string; organization: string; year: stri
 
 export type ResumeFieldError = { path: string; code: string; message: string };
 
+export type ResumeParseError = {
+  code: string;
+  stage: "EXTRACT" | "PARSE" | string;
+  message: string;
+  retryable: boolean;
+  required_action: string;
+};
+
 export type ResumeDraft = {
   id: number;
   account_id: number;
@@ -160,7 +168,7 @@ export type ResumeDraft = {
   current_step: string;
   status: "DRAFT" | "PARSING" | "READY" | "PUBLISHING" | "COMPLETED" | "NEEDS_INPUT" | "NEEDS_REVIEW" | "FAILED";
   data: ResumeDraftData;
-  validation: { valid?: boolean; field_errors?: ResumeFieldError[] };
+  validation: { valid?: boolean; field_errors?: ResumeFieldError[]; parse_error?: ResumeParseError };
   preflight: {
     conflicts?: Array<{ path: string; draft_value: string; profile_value: string }>;
     profile_changes?: Array<{ path: string; draft_value: string; profile_value: string }>;
@@ -185,7 +193,10 @@ export type Operation = {
   id: string;
   kind: string;
   status: "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "NEEDS_INPUT";
-  result: Record<string, unknown> | NeedsFieldsResult;
+  result: (Record<string, unknown> & {
+    status?: string; code?: string; stage?: string; message?: string;
+    retryable?: boolean; required_action?: string; draft_id?: number;
+  }) | NeedsFieldsResult;
   error_text: string;
 };
 

@@ -158,6 +158,7 @@ class ContractApi:
         self.login_start_result: dict | None = None
         self.login_started_account: dict | None = None
         self.login_otp_result: dict | None = None
+        self.draft_extract_error: dict | None = None
 
     def dashboard(self) -> dict:
         pending = sum(item["status"] in {"PENDING", "FAILED", "NEEDS_REVIEW"} for item in self.questionnaires.values())
@@ -319,14 +320,32 @@ class ContractApi:
                 return
             if method == "POST" and parts[-1] == "extract-pdf":
                 self.import_count += 1
+                operation_id = f"draft-extract-{self.import_count}"
+                if self.draft_extract_error:
+                    parse_error = dict(self.draft_extract_error)
+                    draft.update(
+                        status="NEEDS_INPUT",
+                        validation={"valid": False, "field_errors": [], "parse_error": parse_error},
+                    )
+                    self.operations[operation_id] = {
+                        "id": operation_id,
+                        "kind": "resume-draft-extract",
+                        "status": "NEEDS_INPUT",
+                        "result": {"status": "NEEDS_INPUT", **parse_error},
+                        "error_text": "",
+                    }
+                    await self.json_response(route, {"operation_id": operation_id, "status": "PENDING"}, 202)
+                    return
                 draft["data"]["profession"].update(title="Python-разработчик", hh_profession="Программист, разработчик")
                 draft["data"]["skills"] = [{"name": "Python", "level": ""}]
                 draft["data"]["about"]["text"] = "Сохранённое описание"
-                draft.update(status="NEEDS_INPUT", revision=draft["revision"] + 1)
-                operation_id = f"draft-extract-{self.import_count}"
+                draft.update(status="NEEDS_INPUT", revision=draft["revision"] + 1, validation={})
                 self.operations[operation_id] = {
                     "id": operation_id, "kind": "resume-draft-extract", "status": "SUCCEEDED",
-                    "result": {"status": "SUCCESS", "message": "PDF распознан. Проверьте заполненные данные."},
+                    "result": {
+                        "status": "SUCCESS", "code": "PDF_PARSED", "draft_id": draft["id"],
+                        "message": "PDF распознан. Проверьте заполненные данные.",
+                    },
                     "error_text": "",
                 }
                 await self.json_response(route, {"operation_id": operation_id, "status": "PENDING"}, 202)
@@ -649,6 +668,33 @@ async def test_pdf_prefill_creates_a_durable_draft_without_direct_hh_import(brow
     await page.get_by_role("button", name="Закрыть").click()
     await page.get_by_role("button", name="Продолжить").click()
     await expect(page.get_by_label("О себе")).to_have_value("Сохранённое описание")
+
+
+async def test_pdf_failure_stays_on_list_and_retry_reuses_the_draft(browser_app, tmp_path):
+    page, mock, base_url = browser_app.page, browser_app.mock, browser_app.base_url
+    pdf = tmp_path / "resume.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nmock resume")
+    mock.draft_extract_error = {
+        "code": "AI_QUOTA_EXCEEDED",
+        "stage": "PARSE",
+        "message": "Лимит Gemini исчерпан. Обновите ключ.",
+        "retryable": True,
+        "required_action": "UPDATE_API_KEY_OR_RETRY_LATER",
+    }
+
+    await page.goto(f"{base_url}/#/resumes", wait_until="networkidle")
+    await page.get_by_label("Заполнить из PDF", exact=False).set_input_files(str(pdf))
+    await expect(page.get_by_role("heading", name="Сохранённые черновики")).to_be_visible()
+    await expect(page.get_by_text("Лимит Gemini исчерпан. Обновите ключ.", exact=True).first).to_be_visible()
+    await expect(page.get_by_role("button", name="Заполнить вручную")).to_be_visible()
+    await expect(page.get_by_role("button", name="Удалить черновик")).to_be_visible()
+    assert len(mock.resume_drafts[1]) == 1
+
+    mock.draft_extract_error = None
+    await page.get_by_label("Повторить загрузку PDF для черновика 1").set_input_files(str(pdf))
+    await expect(page.get_by_role("heading", name="Python-разработчик")).to_be_visible()
+    assert len(mock.resume_drafts[1]) == 1
+    assert mock.import_count == 2
 
 
 async def test_independent_audit_details_and_text_or_url_match_payload(browser_app):

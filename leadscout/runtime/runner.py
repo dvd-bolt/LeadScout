@@ -6,7 +6,7 @@ import asyncio
 import logging
 
 import uvicorn
-from aiogram import Bot, Dispatcher
+from aiogram import Bot
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from leadscout.api import create_app
@@ -15,6 +15,7 @@ from leadscout.bot.router import create_router
 from .context import AppContext
 from .lifecycle import initialize, shutdown
 from .scheduler import persist_next_search_time, start_scheduler
+from .telegram_polling import ConflictAwareDispatcher
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ async def run_application(
     *,
     with_api: bool,
     bot_factory=Bot,
-    dispatcher_factory=Dispatcher,
+    dispatcher_factory=ConflictAwareDispatcher,
     scheduler_factory=start_scheduler,
     server_factory=None,
 ) -> None:

@@ -40,6 +40,40 @@ def _merge_missing(current: Any, extracted: Any) -> Any:
     return extracted if extracted is not None else current
 
 
+def _parse_error(
+    code: str,
+    message: str,
+    *,
+    stage: str,
+    retryable: bool,
+    required_action: str,
+) -> dict:
+    return {
+        "code": code,
+        "stage": stage,
+        "message": message,
+        "retryable": retryable,
+        "required_action": required_action,
+    }
+
+
+def _ai_parse_error(exc: AIServiceError) -> dict:
+    actions = {
+        "AI_AUTH_FAILED": "UPDATE_API_KEY",
+        "AI_QUOTA_EXCEEDED": "UPDATE_API_KEY_OR_RETRY_LATER",
+        "AI_SCHEMA_INVALID": "UPDATE_APPLICATION",
+        "AI_RESPONSE_INVALID": "RETRY_OR_FILL_MANUALLY",
+        "AI_UNAVAILABLE": "RETRY_OR_FILL_MANUALLY",
+    }
+    return _parse_error(
+        exc.code,
+        str(exc),
+        stage="PARSE",
+        retryable=exc.retryable,
+        required_action=actions.get(exc.code, "RETRY_OR_FILL_MANUALLY"),
+    )
+
+
 def structured_to_draft(structured: StructuredResume) -> dict:
     skills = [{"name": skill, "level": ""} for skill in structured.skills]
     return ResumeDraftData.model_validate(
@@ -224,7 +258,9 @@ class ResumeDraftService(_Service):
             else:
                 structured = await self.ai.extract_full_structured_resume(text, strict=True)
                 extracted = structured_to_draft(structured)
-            merged = ResumeDraftData.model_validate(_merge_missing(draft["data"], extracted))
+            current_data = draft["data"]
+            combined = extracted if current_data == empty_resume_draft() else _merge_missing(current_data, extracted)
+            merged = ResumeDraftData.model_validate(combined)
             validation = validate_draft(merged)
             status = "READY" if validation["valid"] else "NEEDS_INPUT"
             updated = await _await(
@@ -249,28 +285,54 @@ class ResumeDraftService(_Service):
                 "field_errors": validation["field_errors"],
             }
         except PDFValidationError as exc:
-            await _await(self.db.set_resume_draft_status(user_id, account_id, draft_id, "FAILED"))
-            return {"status": "ERROR", "code": "PDF_INVALID", "stage": "EXTRACT", "message": str(exc), "retryable": False}
-        except AIServiceError:
-            await _await(self.db.set_resume_draft_status(user_id, account_id, draft_id, "NEEDS_INPUT"))
-            return {
-                "status": "NEEDS_INPUT",
-                "code": "AI_UNAVAILABLE",
-                "stage": "PARSE",
-                "message": "ИИ сейчас недоступен. Повторите распознавание или заполните черновик вручную.",
-                "required_action": "RETRY_OR_FILL_MANUALLY",
-                "retryable": True,
-            }
+            error = _parse_error(
+                "PDF_INVALID",
+                str(exc),
+                stage="EXTRACT",
+                retryable=False,
+                required_action="CHOOSE_ANOTHER_PDF",
+            )
+            await _await(
+                self.db.set_resume_draft_status(
+                    user_id,
+                    account_id,
+                    draft_id,
+                    "FAILED",
+                    validation={"valid": False, "field_errors": [], "parse_error": error},
+                )
+            )
+            return {"status": "ERROR", **error}
+        except AIServiceError as exc:
+            error = _ai_parse_error(exc)
+            draft_status = "FAILED" if exc.code in {"AI_SCHEMA_INVALID", "AI_RESPONSE_INVALID"} else "NEEDS_INPUT"
+            await _await(
+                self.db.set_resume_draft_status(
+                    user_id,
+                    account_id,
+                    draft_id,
+                    draft_status,
+                    validation={"valid": False, "field_errors": [], "parse_error": error},
+                )
+            )
+            return {"status": "NEEDS_INPUT", **error}
         except (ValidationError, TypeError, ValueError):
-            await _await(self.db.set_resume_draft_status(user_id, account_id, draft_id, "NEEDS_INPUT"))
-            return {
-                "status": "NEEDS_INPUT",
-                "code": "AI_RESPONSE_INVALID",
-                "stage": "PARSE",
-                "message": "Распознанные данные имеют неверный формат. Заполните черновик вручную или повторите позже.",
-                "required_action": "RETRY_OR_FILL_MANUALLY",
-                "retryable": True,
-            }
+            error = _parse_error(
+                "AI_RESPONSE_INVALID",
+                "Распознанные данные имеют неверный формат. Заполните черновик вручную или повторите позже.",
+                stage="PARSE",
+                retryable=False,
+                required_action="RETRY_OR_FILL_MANUALLY",
+            )
+            await _await(
+                self.db.set_resume_draft_status(
+                    user_id,
+                    account_id,
+                    draft_id,
+                    "FAILED",
+                    validation={"valid": False, "field_errors": [], "parse_error": error},
+                )
+            )
+            return {"status": "NEEDS_INPUT", **error}
 
     async def validate(self, user_id: int, account_id: int, draft_id: int) -> dict:
         draft = await self._draft(user_id, account_id, draft_id)

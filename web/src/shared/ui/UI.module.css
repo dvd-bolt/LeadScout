@@ -68,6 +68,9 @@
 .startChoice strong { font-size: 1.0625rem; }
 .startChoice span { color: var(--muted); font-size: .875rem; line-height: 1.45; }
 .startChoice input[type="file"] { width: 100%; margin-top: auto; }
+.fileAction { position: relative; overflow: hidden; }
+.fileAction[aria-disabled="true"] { color: var(--disabled-text); background: var(--disabled-background); border-color: var(--disabled-border); cursor: not-allowed; }
+.fileAction input[type="file"] { position: absolute; width: 1px; height: 1px; margin: -1px; clip: rect(0 0 0 0); clip-path: inset(50%); overflow: hidden; white-space: nowrap; }
 .draftList { display: grid; gap: 12px; }
 @media (max-width: 380px) { .card { padding: 14px; } .cardHeader { align-items: flex-start; } .directHeader, .resultRow { align-items: flex-start; flex-direction: column; } .resultRow span { text-align: left; } }
 @media (max-width: 620px) { .fieldGrid, .startChoices { grid-template-columns: 1fr; } .inlineFields { grid-template-columns: 1fr; } .wizardPanel { padding: 13px; } }

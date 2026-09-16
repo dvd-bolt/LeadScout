@@ -11,6 +11,7 @@ import styles from "../../shared/ui/UI.module.css";
 export function ResumeImport({ accountId }: { accountId: number }) {
   const client = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
+  const autoOpenedAccount = useRef<number | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [operationId, setOperationId] = useState<string | null>(null);
   const [pendingDraftId, setPendingDraftId] = useState<number | null>(null);
@@ -22,10 +23,19 @@ export function ResumeImport({ accountId }: { accountId: number }) {
   const selected = drafts.data?.find((item) => item.id === selectedId) ?? null;
 
   useEffect(() => {
-    if (selectedId !== null || pendingDraftId !== null || !drafts.data?.length) return;
+    autoOpenedAccount.current = null;
+    setSelectedId(null);
+    setPendingDraftId(null);
+    setOperationId(null);
+    setNotice(null);
+  }, [accountId]);
+
+  useEffect(() => {
+    if (autoOpenedAccount.current === accountId || selectedId !== null || pendingDraftId !== null || !drafts.data?.length) return;
     const resumable = drafts.data.find((item) => item.status !== "COMPLETED") ?? drafts.data[0];
+    autoOpenedAccount.current = accountId;
     setSelectedId(resumable.id);
-  }, [drafts.data, pendingDraftId, selectedId]);
+  }, [accountId, drafts.data, pendingDraftId, selectedId]);
 
   const create = useMutation({
     mutationFn: (source: "MANUAL" | "PDF") => api.createResumeDraft(accountId, source),
@@ -50,15 +60,18 @@ export function ResumeImport({ accountId }: { accountId: number }) {
       current?.map((item) => item.id === updated.id ? updated : item) ?? [updated]);
   }, [accountId, client]);
 
-  const startPdf = async (file: File) => {
+  const startPdf = async (file: File, existingDraftId?: number) => {
     try {
-      const draft = await api.createResumeDraft(accountId, "PDF");
-      setPendingDraftId(draft.id);
+      autoOpenedAccount.current = accountId;
+      const draftId = existingDraftId ?? (await api.createResumeDraft(accountId, "PDF")).id;
+      setSelectedId(null);
+      setPendingDraftId(draftId);
       await refresh();
-      const result = await api.extractResumePdf(accountId, draft.id, file);
+      const result = await api.extractResumePdf(accountId, draftId, file);
       setOperationId(result.operation_id);
       setNotice({ text: "PDF принят. Распознаю данные в локальный черновик.", tone: "info" });
     } catch (error) {
+      setPendingDraftId(null);
       setNotice({ text: errorMessage(error), error: true });
     } finally {
       if (fileRef.current) fileRef.current.value = "";
@@ -67,10 +80,12 @@ export function ResumeImport({ accountId }: { accountId: number }) {
 
   const terminal = async (operation: Operation) => {
     await refresh();
-    if (pendingDraftId !== null) setSelectedId(pendingDraftId);
+    const parsed = operation.status === "SUCCEEDED" && "code" in operation.result && operation.result.code === "PDF_PARSED";
+    if (parsed && pendingDraftId !== null) setSelectedId(pendingDraftId);
     setPendingDraftId(null);
+    setOperationId(null);
     const message = typeof operation.result.message === "string" ? operation.result.message : operation.error_text;
-    setNotice(message ? { text: message, error: operation.status === "FAILED", tone: operation.status === "SUCCEEDED" ? "success" : "warning" } : null);
+    setNotice(message ? { text: message, error: !parsed, tone: parsed ? "success" : "warning" } : null);
   };
 
   if (selected) {
@@ -103,14 +118,35 @@ export function ResumeImport({ accountId }: { accountId: number }) {
     </div>
     {drafts.data?.length ? <div className={styles.draftList}>
       <h3>Сохранённые черновики</h3>
-      {drafts.data.map((draft: ResumeDraft) => <article className={styles.resume} key={draft.id}>
+      {drafts.data.map((draft: ResumeDraft) => {
+        const parseError = draft.validation.parse_error;
+        const needsPdfUpload = Boolean(parseError) || (draft.source === "PDF" && draft.status === "DRAFT" && draft.revision === 1);
+        const parsing = pendingDraftId === draft.id || draft.status === "PARSING";
+        return <article className={styles.resume} key={draft.id}>
         <div className={styles.row}>
           <div><div className={styles.resumeTitle}>{draft.data.profession.title || `Черновик №${draft.id}`}</div>
             <div className={styles.meta}>{draft.status} · шаг «{draft.current_step}» · {formatDate(draft.updated_at)}</div>
           </div>
-          <Button className={styles.secondary} onClick={() => setSelectedId(draft.id)}>{draft.status === "COMPLETED" ? "Посмотреть" : "Продолжить"}</Button>
+          {!needsPdfUpload ? <Button className={styles.secondary} disabled={parsing} onClick={() => setSelectedId(draft.id)}>{draft.status === "COMPLETED" ? "Посмотреть" : parsing ? "Распознавание…" : "Продолжить"}</Button> : null}
         </div>
-      </article>)}
+        {needsPdfUpload ? <>
+          <div className={`${styles.notice} ${styles.error}`} role="alert">{parseError?.message || "PDF ещё не распознан. Повторите загрузку или заполните черновик вручную."}</div>
+          <div className={styles.actionRow}>
+            <label aria-disabled={parsing} className={`${styles.button} ${styles.secondary} ${styles.fileAction}`}>
+              {parsing ? "Распознавание…" : "Повторить загрузку PDF"}
+              <input disabled={parsing} aria-label={`Повторить загрузку PDF для черновика ${draft.id}`} type="file" accept="application/pdf" onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) void startPdf(file, draft.id);
+                event.target.value = "";
+              }} />
+            </label>
+            <Button className={styles.secondary} disabled={parsing} onClick={() => setSelectedId(draft.id)}>Заполнить вручную</Button>
+            <Button className={styles.dangerButton} disabled={parsing || remove.isPending} onClick={() => {
+              if (window.confirm("Удалить пустой локальный черновик?")) remove.mutate(draft.id);
+            }}>Удалить черновик</Button>
+          </div>
+        </> : null}
+      </article>})}
     </div> : <div className={styles.empty}>Черновиков пока нет. Начните вручную или из PDF.</div>}
   </div>;
 }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import random
 from typing import TypeVar
@@ -20,6 +21,46 @@ T = TypeVar("T", bound=BaseModel)
 class AIServiceError(RuntimeError):
     """A stable, user-safe AI service failure."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "AI_UNAVAILABLE",
+        retryable: bool = False,
+        provider_status: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+        self.provider_status = provider_status
+
+
+class _CapabilityProbe(BaseModel):
+    ok: bool
+
+
+def gemini_response_json_schema(schema: type[BaseModel]) -> dict:
+    """Build the Gemini transport schema without weakening local validation.
+
+    Gemini Developer API rejects Pydantic's ``additionalProperties`` and the
+    large ``maxItems`` constraints used by resume models.  They are transport
+    hints only: the original Pydantic model still validates the response.
+    """
+    result = copy.deepcopy(schema.model_json_schema())
+
+    def clean(value) -> None:
+        if isinstance(value, dict):
+            value.pop("additionalProperties", None)
+            value.pop("maxItems", None)
+            for nested in value.values():
+                clean(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                clean(nested)
+
+    clean(result)
+    return result
+
 
 class GeminiService:
     """Own the lazily-created async Gemini client for this process."""
@@ -35,7 +76,10 @@ class GeminiService:
 
     async def _get_client(self) -> genai.Client:
         if not self.api_key:
-            raise AIServiceError("ИИ-сервис не настроен. Проверьте GEMINI_API_KEY.")
+            raise AIServiceError(
+                "ИИ-сервис не настроен. Проверьте GEMINI_API_KEY.",
+                code="AI_AUTH_FAILED",
+            )
         async with self._lock:
             if self._client is None:
                 self._client = genai.Client(
@@ -66,11 +110,14 @@ class GeminiService:
 
     async def _check_capability(self) -> bool:
         try:
-            client = await self._get_client()
-            await client.aio.models.get(model=self.model)
-            return True
-        except Exception as exc:
-            logger.warning("Gemini capability check failed: %s", _error_label(exc))
+            result = await self._generate(
+                "Верните JSON с единственным полем ok=true.",
+                _CapabilityProbe,
+                attempts=1,
+            )
+            return result.ok is True
+        except AIServiceError as exc:
+            logger.warning("Gemini structured capability check failed: %s", exc.code)
             return False
 
     async def generate(self, contents, schema, **kwargs):
@@ -90,7 +137,7 @@ class GeminiService:
         attempts = max(1, min(int(attempts), 3))
         generation_config = types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=schema,
+            response_json_schema=gemini_response_json_schema(schema),
             system_instruction=system_instruction,
         )
         from leadscout.core.task_scope import checkpoint
@@ -113,8 +160,14 @@ class GeminiService:
                     if isinstance(parsed, dict):
                         return schema.model_validate(parsed)
                 except (TypeError, ValueError, ValidationError) as exc:
-                    raise AIServiceError("ИИ-сервис вернул пустой или некорректный ответ.") from exc
-                raise AIServiceError("ИИ-сервис вернул пустой или некорректный ответ.")
+                    raise AIServiceError(
+                        "ИИ-сервис вернул пустой или некорректный ответ.",
+                        code="AI_RESPONSE_INVALID",
+                    ) from exc
+                raise AIServiceError(
+                    "ИИ-сервис вернул пустой или некорректный ответ.",
+                    code="AI_RESPONSE_INVALID",
+                )
             except asyncio.CancelledError:
                 # Stopping an account must interrupt its AI wait immediately;
                 # cancellation is never converted into a retry or a provider error.
@@ -124,11 +177,15 @@ class GeminiService:
                     logger.error("Gemini request failed: %s", _error_label(exc))
                     if isinstance(exc, AIServiceError):
                         raise
-                    raise AIServiceError(_safe_error_message(exc)) from exc
+                    raise _service_error(exc) from exc
                 delay = (2**attempt) + random.uniform(0.0, 0.5)
                 logger.warning("Transient Gemini failure (%s), retrying in %.1fs", _error_label(exc), delay)
                 await asyncio.sleep(delay)
-        raise AIServiceError("ИИ-сервис временно недоступен.")
+        raise AIServiceError(
+            "ИИ-сервис временно недоступен.",
+            code="AI_UNAVAILABLE",
+            retryable=True,
+        )
 
     async def close(self) -> None:
         async with self._lock:
@@ -150,15 +207,43 @@ def _api_error_code(exc: errors.APIError) -> int | None:
         return None
 
 
-def _safe_error_message(exc: Exception) -> str:
-    if isinstance(exc, errors.APIError) and _api_error_code(exc) in {401, 403}:
-        return "ИИ-сервис отклонил настроенный ключ. Проверьте GEMINI_API_KEY."
+def _service_error(exc: Exception) -> AIServiceError:
     if isinstance(exc, AIServiceError):
-        return str(exc)
-    return "ИИ-сервис временно недоступен. Повторите попытку позже."
+        return exc
+    status = _api_error_code(exc) if isinstance(exc, errors.APIError) else None
+    if status in {401, 403}:
+        return AIServiceError(
+            "ИИ-сервис отклонил настроенный ключ. Проверьте GEMINI_API_KEY.",
+            code="AI_AUTH_FAILED",
+            provider_status=status,
+        )
+    if status == 429:
+        return AIServiceError(
+            "Лимит Gemini исчерпан. Обновите ключ или повторите после восстановления квоты.",
+            code="AI_QUOTA_EXCEEDED",
+            retryable=True,
+            provider_status=status,
+        )
+    if status is not None and 400 <= status < 500:
+        return AIServiceError(
+            "Gemini отклонил структуру запроса. Требуется обновление приложения.",
+            code="AI_SCHEMA_INVALID",
+            provider_status=status,
+        )
+    return AIServiceError(
+        "ИИ-сервис временно недоступен. Повторите попытку позже.",
+        code="AI_UNAVAILABLE",
+        retryable=True,
+        provider_status=status,
+    )
 
 
 def _error_label(exc: Exception) -> str:
+    if isinstance(exc, AIServiceError):
+        return exc.code
     if isinstance(exc, errors.APIError):
         return f"APIError {_api_error_code(exc) or ''} {exc.status or ''}".strip()
     return type(exc).__name__
+
+
+__all__ = ["AIServiceError", "GeminiService", "gemini_response_json_schema"]

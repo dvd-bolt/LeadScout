@@ -6,6 +6,8 @@ import asyncio
 import inspect
 import logging
 
+from leadscout.storage import SCHEMA_VERSION
+
 from .context import AppContext
 
 logger = logging.getLogger(__name__)
@@ -19,6 +21,7 @@ async def initialize(context: AppContext) -> tuple[int, int]:
             return 0, 0
         await context.db.init_db()
         context.storage_ready = True
+        logger.info("DB_SCHEMA_READY version=%s", SCHEMA_VERSION)
         await context.admin_store.bootstrap(context.settings.root_admin_telegram_id, context.settings.allowed_owner_ids)
         operations = await context.db.recover_interrupted_operations()
         await context.db.recover_interrupted_resume_publishes()

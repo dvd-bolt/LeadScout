@@ -193,6 +193,16 @@ async def test_migration_failure_still_closes_resources(tmp_path, monkeypatch):
     recover.assert_not_awaited()
 
 
+async def test_initialize_logs_ready_schema_version(tmp_path, caplog):
+    context = build_context(db=Database(tmp_path / "ready.db"))
+    caplog.set_level("INFO", logger="leadscout.runtime.lifecycle")
+    try:
+        await initialize(context)
+        assert "DB_SCHEMA_READY version=9" in caplog.text
+    finally:
+        await shutdown(context)
+
+
 async def test_scheduler_uses_moscow_single_instance_jobs(runtime_context):
     scheduler = start_scheduler(runtime_context.coordinator, db=runtime_context.db)
     runtime_context.scheduler = scheduler
