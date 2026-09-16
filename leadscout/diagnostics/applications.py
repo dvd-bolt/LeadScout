@@ -48,7 +48,7 @@ _SAFE_REASONS = {
     "ERROR_FORM": "Не удалось заполнить все обязательные поля анкеты.",
     "ERROR_SUBMIT_BUTTON": "Кнопка отправки формы недоступна.",
     "QUESTIONNAIRE_REQUIRED": "Нужна проверка и подтверждение анкеты.",
-    "ALREADY_APPLIED": "Отклик уже подтверждён на hh.ru.",
+    "ALREADY_APPLIED": "На hh.ru уже есть ваш отклик.",
     "APPLIED_DIRECT": "Отправка подтверждена hh.ru.",
     "APPLIED_WITH_LETTER": "Отправка подтверждена hh.ru.",
     "APPLIED_WITH_QUESTIONNAIRE": "Отправка анкеты подтверждена hh.ru.",

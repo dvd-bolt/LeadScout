@@ -14,7 +14,7 @@ import { Button, Message, type Notice } from "../shared/ui";
 import { AppLayout } from "./AppLayout";
 import styles from "../shared/ui/UI.module.css";
 
-type LaunchTarget = "questionnaire" | "applications" | "resume" | "audit" | "accounts" | "settings";
+type LaunchTarget = "questionnaire" | "applications" | "resume" | "audit" | "accounts" | "settings" | "captcha";
 type LaunchParams = { target?: string; accountId?: number; applyId?: number; snapshotId?: number; invalid?: string };
 
 function parseId(params: URLSearchParams, name: string) {
@@ -56,7 +56,7 @@ function DirectLinkController({ dashboard }: { dashboard: Dashboard }) {
         await Promise.resolve();
         if (cancelled) return;
         if (launch.invalid) throw new Error(launch.invalid);
-        const supported: LaunchTarget[] = ["questionnaire", "applications", "resume", "audit", "accounts", "settings"];
+        const supported: LaunchTarget[] = ["questionnaire", "applications", "resume", "audit", "accounts", "settings", "captcha"];
         if (!supported.includes(launch.target as LaunchTarget)) throw new Error("Неизвестный раздел в ссылке из Telegram.");
         const target = launch.target as LaunchTarget;
         let accountId = launch.accountId;
@@ -91,7 +91,8 @@ function DirectLinkController({ dashboard }: { dashboard: Dashboard }) {
         }
         if (cancelled) return;
         setNotice(null);
-        if (target === "questionnaire" || (target === "applications" && launch.applyId)) navigate(`/applications?apply_id=${launch.applyId}`, { replace: true });
+        if (target === "captcha") navigate("/", { replace: true });
+        else if (target === "questionnaire" || (target === "applications" && launch.applyId)) navigate(`/applications?apply_id=${launch.applyId}`, { replace: true });
         else if (target === "applications") navigate("/applications", { replace: true });
         else if (target === "resume") navigate(`/resumes${snapshotId ? `?snapshot_id=${snapshotId}` : ""}`, { replace: true });
         else if (target === "audit") navigate(`/resumes?focus=audit${snapshotId ? `&snapshot_id=${snapshotId}` : ""}`, { replace: true });

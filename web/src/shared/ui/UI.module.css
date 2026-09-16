@@ -9,19 +9,19 @@
 .actionRow { flex-wrap: wrap; } .actionRow > * { min-width: 0; max-width: 100%; }
 .status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 0.8125rem; }
 .good { color: var(--text); font-weight: 650; } .warning { color: var(--text); text-decoration: underline dotted; text-underline-offset: 4px; } .danger { color: var(--text); font-weight: 800; }
-.button { display: inline-flex; justify-content: center; align-items: center; gap: 10px; min-height: 48px; max-width: 100%; padding: 12px 16px; border: 2px solid var(--text); border-radius: var(--radius); color: white; font: inherit; font-weight: 750; background: var(--accent); text-decoration: none; cursor: pointer; transition: transform 120ms; }
+.button { display: inline-flex; justify-content: center; align-items: center; gap: 10px; min-height: 48px; max-width: 100%; padding: 12px 16px; border: 2px solid var(--text); border-radius: var(--radius); color: var(--accent-contrast); font: inherit; font-weight: 750; background: var(--accent); text-decoration: none; cursor: pointer; transition: transform 120ms; }
 .button:not(:disabled):active { transform: translateY(1px); }
-.button:disabled { color: #666; background: #e5e5e5; border-color: #aaa; cursor: not-allowed; }
+.button:disabled { color: var(--disabled-text); background: var(--disabled-background); border-color: var(--disabled-border); cursor: not-allowed; }
 .secondary { color: var(--text); background: var(--surface); }
 .dangerButton { color: var(--text); background: var(--surface); border-style: dashed; }
 .textButton { min-height: 44px; padding: 8px 4px; color: var(--text); background: transparent; border: 0; text-decoration: underline; text-underline-offset: 4px; font-weight: 650; }
 .notice { display: flex; align-items: flex-start; gap: 10px; padding: 14px; border: 1px solid var(--text); border-left-width: 4px; border-radius: var(--radius); color: var(--text); background: var(--subtle-surface); overflow-wrap: anywhere; }
-.notice svg { flex-shrink: 0; margin-top: 2px; } .error { border: 2px dashed var(--text); background: white; font-weight: 600; }
+.notice svg { flex-shrink: 0; margin-top: 2px; } .error { border: 2px dashed var(--text); background: var(--surface); font-weight: 600; }
 .warningNotice { border: 2px dotted var(--text); }
 .successNotice { border: 2px solid var(--text); border-left-width: 6px; }
 .tabs { display: flex; gap: 8px; overflow-x: auto; padding: 4px 4px 6px; margin: -4px; }
-.tab { flex: 0 0 auto; min-height: 44px; padding: 9px 14px; border: 2px solid var(--text); border-radius: var(--radius); color: var(--text); background: white; font: inherit; font-weight: 650; }
-.tabActive { color: white; background: var(--accent); }
+.tab { flex: 0 0 auto; min-height: 44px; padding: 9px 14px; border: 2px solid var(--text); border-radius: var(--radius); color: var(--text); background: var(--surface); font: inherit; font-weight: 650; }
+.tabActive { color: var(--accent-contrast); background: var(--accent); }
 .card > .form + .button { margin-top: 18px; }
 .form { display: grid; gap: 16px; min-width: 0; }
 .field { display: grid; gap: 8px; color: var(--muted); font-size: 0.875rem; min-width: 0; }
@@ -30,7 +30,7 @@
 .switch { display: flex; align-items: center; min-height: 44px; gap: 10px; color: var(--text); font-size: 0.9375rem; }
 .empty { padding: 28px 18px; color: var(--muted); text-align: center; }
 .loading { display: grid; min-height: 65dvh; padding: 24px; place-content: center; gap: 16px; color: var(--muted); text-align: center; }
-.badge { display: inline-grid; place-items: center; min-width: 24px; height: 24px; padding: 0 5px; border: 2px solid white; border-radius: 50%; background: var(--text); color: white; font-size: 0.75rem; font-weight: 750; line-height: 1; }
+.badge { display: inline-grid; place-items: center; min-width: 24px; height: 24px; padding: 0 5px; border: 2px solid var(--nav-background); border-radius: 50%; background: var(--accent); color: var(--accent-contrast); font-size: 0.75rem; font-weight: 750; line-height: 1; }
 .meta { margin-top: 5px; color: var(--muted); font-size: 0.8125rem; overflow-wrap: anywhere; }
 .resumeText { white-space: pre-wrap; }
 .eventList, .resumeList, .questionList, .auditList { display: grid; gap: 14px; min-width: 0; }

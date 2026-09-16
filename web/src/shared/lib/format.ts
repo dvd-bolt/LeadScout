@@ -8,6 +8,9 @@ export function formatDate(value?: string) {
 }
 
 export function accountStatusLabel(account: Account) {
+  if (account.automation_state === "WAITING_FOR_CAPTCHA" || account.pending_captcha_data_uri) {
+    return { text: "Требуется ввод капчи", tone: "warning" as const };
+  }
   if (account.automation_state === "SEARCHING") return { text: "Идёт поиск", tone: "good" as const };
   if (account.automation_state === "ERROR") return { text: "Ошибка", tone: "danger" as const };
   if (account.session_status !== "ACTIVE") return { text: "Нужен вход", tone: "warning" as const };
@@ -42,11 +45,11 @@ export function reviewCountLabel(count: number) {
 }
 
 export function eventStatusLabel(status: string) {
+  if (status === "ALREADY_APPLIED") return "Откликались ранее";
   if (status.startsWith("APPLIED")) return "Отклик отправлен";
   if (status.startsWith("ERROR")) return "Ошибка отклика";
   if (status.startsWith("SKIPPED")) return "Вакансия пропущена";
   if (status === "QUESTIONNAIRE_REQUIRED") return "Нужны ответы";
-  if (status === "ALREADY_APPLIED") return "Отклик уже отправлен";
   if (status === "REVIEWED_NOT_APPLIED") return "Проверено: отклик не отправлен";
   return status;
 }

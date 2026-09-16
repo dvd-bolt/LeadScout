@@ -18,6 +18,22 @@ export type Account = {
   last_synced_at: string;
   next_scheduled_search_at: string;
   resume_ready: boolean;
+  pending_captcha_data_uri?: string;
+  pending_captcha_created_at?: string;
+};
+
+export type ActiveCaptcha = {
+  account_id: number;
+  captcha_data_uri: string;
+  page_url?: string;
+  created_at?: string;
+};
+
+export type CaptchaSubmitResult = {
+  status: "SUCCESS" | "INVALID_CAPTCHA" | "ERROR" | string;
+  account_id: number;
+  captcha_data_uri?: string;
+  message?: string;
 };
 
 export type Event = {
@@ -40,6 +56,7 @@ export type Dashboard = {
   csrf_token: string;
   accounts: Account[];
   active_account_id: number | null;
+  active_captcha?: ActiveCaptcha | null;
   stats: { applied: number; processed: number; errors: number; skipped: number };
   pending_review_count: number;
   active_pending_review_count: number;

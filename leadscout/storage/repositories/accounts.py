@@ -191,7 +191,48 @@ ACCOUNT_SETTINGS = {
     "resumes_json",
     "last_synced_at",
     "next_scheduled_search_at",
+    "pending_captcha_data_uri",
+    "pending_captcha_page_url",
+    "pending_captcha_created_at",
 }
+
+
+async def set_account_pending_captcha(
+    database: Database,
+    user_id: int,
+    account_id: int,
+    captcha_data_uri: str,
+    page_url: str = "",
+) -> bool:
+    async with database.connection() as connection:
+        cursor = await connection.execute(
+            """UPDATE hh_accounts
+               SET pending_captcha_data_uri = ?,
+                   pending_captcha_page_url = ?,
+                   pending_captcha_created_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND user_id = ?""",
+            (captcha_data_uri, page_url, account_id, user_id),
+        )
+        await connection.commit()
+        return cursor.rowcount == 1
+
+
+async def clear_account_pending_captcha(
+    database: Database,
+    user_id: int,
+    account_id: int,
+) -> bool:
+    async with database.connection() as connection:
+        cursor = await connection.execute(
+            """UPDATE hh_accounts
+               SET pending_captcha_data_uri = '',
+                   pending_captcha_page_url = '',
+                   pending_captcha_created_at = ''
+               WHERE id = ? AND user_id = ?""",
+            (account_id, user_id),
+        )
+        await connection.commit()
+        return cursor.rowcount == 1
 
 
 async def update_account(database: Database, user_id: int, account_id: int, values: dict) -> bool:

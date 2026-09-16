@@ -32,9 +32,22 @@ async def run_application(
     try:
         await initialize(context)
         async with context.lifecycle_lock:
+            # Shutdown can start after initialize() releases its lock.  Do not
+            # acquire new resources after teardown has already completed.
             if context.closing:
                 return
-            context.bot = bot_factory(token=context.settings.bot_token)
+            bot_kwargs = {}
+            if context.settings.telegram_proxy_url:
+                try:
+                    from aiogram.client.session.aiohttp import AiohttpSession
+
+                    bot_kwargs["session"] = AiohttpSession(proxy=context.settings.telegram_proxy_url)
+                except Exception as exc:
+                    logger.warning("Could not initialize Telegram proxy session: %s", exc)
+            try:
+                context.bot = bot_factory(token=context.settings.bot_token, **bot_kwargs)
+            except TypeError:
+                context.bot = bot_factory(token=context.settings.bot_token)
             context.dispatcher = dispatcher_factory(storage=MemoryStorage())
             context.dispatcher["app_context"] = context
             context.dispatcher.include_router(create_router(owner_ids=context.settings.allowed_owner_ids))

@@ -279,6 +279,51 @@ async def test_unknown_result_blocks_search_retry_without_opening_external_form(
 
 
 @pytest.mark.asyncio
+async def test_search_captures_challenge_before_closing_vacancy_page(runtime_context, monkeypatch):
+    await database.get_or_create_user(10)
+    account = await database.create_hh_account(10, "captcha-search@example.test")
+    await database.update_account_settings_for_user(
+        10,
+        account["id"],
+        active_resume_hh_id="resume-1",
+        resume_text="resume",
+        auto_apply_enabled=1,
+        keywords="Python",
+    )
+    await database.update_account_session(10, account["id"], b"offline", "ACTIVE")
+
+    search_page = SimpleNamespace(close=AsyncMock())
+    vacancy_page = SimpleNamespace(url="https://hh.ru/account/captcha?backurl=/vacancy/993", close=AsyncMock())
+    browser_context = SimpleNamespace(
+        new_page=AsyncMock(side_effect=[search_page, vacancy_page]),
+        storage_state=AsyncMock(return_value={}),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        runtime_context.browser_pool,
+        "get_engine",
+        AsyncMock(return_value=SimpleNamespace(create_context=AsyncMock(return_value=browser_context))),
+    )
+    runtime_context.coordinator._dependencies.security_factory = lambda: SimpleNamespace(
+        decrypt_storage_state=lambda _value: {}, encrypt_storage_state=lambda _value: b"offline"
+    )
+    job = AccountSearchJob(runtime_context.coordinator._dependencies, NullNotifier(), min_delay=0, max_delay=0)
+    monkeypatch.setattr(job, "_collect_vacancies", AsyncMock(return_value=[("https://hh.ru/vacancy/993", "Role")]))
+    monkeypatch.setattr(runtime_context.applications, "apply_to_hh_vacancy", AsyncMock(return_value=("ERROR_CAPTCHA", None, {})))
+    capture = AsyncMock(return_value="data:image/png;base64,captcha")
+    monkeypatch.setattr("leadscout.integrations.captcha.extract_captcha_data_uri", capture)
+
+    result = await job.run(10, account["id"])
+
+    assert result == {"status": "WAITING_FOR_CAPTCHA"}
+    capture.assert_awaited_once_with(vacancy_page)
+    vacancy_page.close.assert_awaited_once()
+    saved = await database.get_account_for_user(10, account["id"])
+    assert saved["pending_captcha_data_uri"] == "data:image/png;base64,captcha"
+    assert saved["pending_captcha_page_url"] == vacancy_page.url
+
+
+@pytest.mark.asyncio
 async def test_pre_submit_browser_error_does_not_permanently_block_vacancy(runtime_context):
     await database.get_or_create_user(10)
     account = await database.create_hh_account(10, "pre-submit@example.test")

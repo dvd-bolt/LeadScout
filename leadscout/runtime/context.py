@@ -42,6 +42,7 @@ class RuntimeSettings:
     pdf_max_bytes: int
     web_dist_dir: Path
     app_url: str = ""
+    telegram_proxy_url: str = ""
     owner_telegram_ids: tuple[int, ...] = ()
     root_admin_telegram_id: int | None = None
 
@@ -93,6 +94,7 @@ def default_settings() -> RuntimeSettings:
         pdf_max_bytes=config.PDF_MAX_BYTES,
         web_dist_dir=WEB_DIST_DIR,
         app_url=config.APP_URL,
+        telegram_proxy_url=config.TELEGRAM_PROXY_URL,
     )
 
 

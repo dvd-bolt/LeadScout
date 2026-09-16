@@ -5,7 +5,11 @@ Jobs only choose an event; presentation and Telegram keyboards live here.
 
 from __future__ import annotations
 
-from leadscout.bot.keyboards import get_mini_app_keyboard, get_questionnaire_confirmation_keyboard
+from leadscout.bot.keyboards import (
+    get_captcha_keyboard,
+    get_mini_app_keyboard,
+    get_questionnaire_confirmation_keyboard,
+)
 from utils.validation import escape_html
 
 from .base import Notification
@@ -101,5 +105,31 @@ def questionnaire_submitted(vacancy_url: str, vacancy_title: str) -> Notificatio
             "<b>Отклик с анкетой подтвержден на hh.ru.</b>\n"
             f'<a href="{escape_html(vacancy_url)}">'
             f"{escape_html(vacancy_title or 'Вакансия')}</a>"
+        )
+    )
+
+
+def captcha_required(
+    account_name: str,
+    account_id: int,
+    *,
+    app_url: str = "",
+) -> Notification:
+    return Notification(
+        text=(
+            "⚠️ <b>hh.ru запросил ввод капчи!</b>\n\n"
+            f"Для продолжения поиска и откликов по аккаунту <code>{escape_html(account_name)}</code> "
+            "требуется подтвердить, что вы не робот.\n\n"
+            "Пожалуйста, откройте LeadScout и введите текст с картинки."
+        ),
+        reply_markup=get_captcha_keyboard(account_id, app_url=app_url),
+    )
+
+
+def captcha_resolved(account_name: str) -> Notification:
+    return Notification(
+        text=(
+            "✅ <b>Капча успешно пройдена!</b>\n\n"
+            f"Автоматический поиск и отклики по аккаунту <code>{escape_html(account_name)}</code> возобновлены."
         )
     )

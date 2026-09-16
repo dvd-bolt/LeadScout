@@ -70,6 +70,9 @@ async def init_db(database: Database) -> None:
         if version > SCHEMA_VERSION:
             raise RuntimeError(f"Unsupported database schema v{version}; expected <= {SCHEMA_VERSION}")
         if version == SCHEMA_VERSION:
+            await add_missing_column(connection, "hh_accounts", "pending_captcha_data_uri TEXT NOT NULL DEFAULT ''")
+            await add_missing_column(connection, "hh_accounts", "pending_captcha_page_url TEXT NOT NULL DEFAULT ''")
+            await add_missing_column(connection, "hh_accounts", "pending_captcha_created_at TEXT NOT NULL DEFAULT ''")
             await connection.commit()
             return
         if version in {6, 7}:
@@ -77,6 +80,9 @@ async def init_db(database: Database) -> None:
                 await execute_statements(connection, ADMIN_SCHEMA)
             await add_missing_column(connection, "application_events", "attempt_id TEXT NOT NULL DEFAULT ''")
             await add_missing_column(connection, "application_events", "stage TEXT NOT NULL DEFAULT ''")
+            await add_missing_column(connection, "hh_accounts", "pending_captcha_data_uri TEXT NOT NULL DEFAULT ''")
+            await add_missing_column(connection, "hh_accounts", "pending_captcha_page_url TEXT NOT NULL DEFAULT ''")
+            await add_missing_column(connection, "hh_accounts", "pending_captcha_created_at TEXT NOT NULL DEFAULT ''")
             await execute_statements(
                 connection,
                 """
@@ -155,6 +161,9 @@ async def init_db(database: Database) -> None:
                 resumes_json TEXT NOT NULL DEFAULT '[]',
                 last_synced_at TEXT NOT NULL DEFAULT '',
                 next_scheduled_search_at TEXT NOT NULL DEFAULT '',
+                pending_captcha_data_uri TEXT NOT NULL DEFAULT '',
+                pending_captcha_page_url TEXT NOT NULL DEFAULT '',
+                pending_captcha_created_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
             );

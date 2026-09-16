@@ -34,6 +34,11 @@ export const api = {
   switchCaptchaLanguage: (accountId?: number) => request<LoginFlowResponse>("/login-flows/captcha/language", { method: "POST", body: JSON.stringify({ account_id: accountId }) }),
   cancelLogin: (accountId?: number) => request<void>("/login-flows/cancel", { method: "POST", body: JSON.stringify({ account_id: accountId }) }),
 
+  submitAutomationCaptcha: (accountId: number, code: string) =>
+    request<import("../types/api").CaptchaSubmitResult>("/captcha/submit", { method: "POST", body: JSON.stringify({ account_id: accountId, code }) }),
+  reloadAutomationCaptcha: (accountId: number) =>
+    request<import("../types/api").CaptchaSubmitResult>("/captcha/reload", { method: "POST", body: JSON.stringify({ account_id: accountId }) }),
+
   resumes: (accountId: number) => request<Resume[]>(`/accounts/${accountId}/resumes`),
   syncResumes: (accountId: number) => request<OperationStart>(`/accounts/${accountId}/resumes/sync`, { method: "POST" }),
   activateResume: (accountId: number, snapshotId: number) => request<Resume>(`/accounts/${accountId}/resumes/${snapshotId}/activate`, { method: "POST" }),

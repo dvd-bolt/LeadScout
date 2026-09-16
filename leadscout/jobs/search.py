@@ -14,6 +14,7 @@ from leadscout.integrations.vacancies import extract_search_vacancies, vacancy_i
 from leadscout.notifications import Notifier
 from leadscout.notifications.formatters import (
     automation_stopped_no_resume,
+    captcha_required,
     expired_session,
     questionnaire_required,
     successful_application,
@@ -49,6 +50,9 @@ class AccountSearchJob:
         if account.get("session_status") != "ACTIVE":
             await self._record_terminal(user_id, account_id, "", "SKIPPED_NOT_AUTHORIZED")
             return {"status": "SKIPPED_NOT_AUTHORIZED"}
+        if account.get("pending_captcha_data_uri"):
+            await self._record_terminal(user_id, account_id, "", "WAITING_FOR_CAPTCHA")
+            return {"status": "WAITING_FOR_CAPTCHA"}
         if not account.get("auto_apply_enabled"):
             await self._record_terminal(user_id, account_id, "", "SKIPPED_STOPPED")
             return {"status": "SKIPPED_STOPPED"}
@@ -152,6 +156,9 @@ class AccountSearchJob:
                         "title": current["active_resume_title"],
                         "extracted_text": current["resume_text"],
                     }
+                    captcha_uri = ""
+                    captcha_page_url = ""
+                    status, cover_letter, extra = "ERROR_BROWSER", None, None
                     try:
                         apply = self.dependencies.apply_to_hh_vacancy
                         kwargs = (
@@ -179,6 +186,14 @@ class AccountSearchJob:
                         )
                         status, cover_letter, extra = "ERROR_BROWSER", None, None
                     finally:
+                        if status == "ERROR_CAPTCHA":
+                            # Capture the challenge while its page is still open.  A
+                            # closed page cannot yield a captcha image, and falling
+                            # back to the search page would store the wrong screen.
+                            from leadscout.integrations.captcha import extract_captcha_data_uri
+
+                            captcha_uri = await extract_captcha_data_uri(page) or ""
+                            captcha_page_url = page.url or vacancy_url
                         await page.close()
 
                     details = extra if isinstance(extra, dict) else {}
@@ -280,6 +295,26 @@ class AccountSearchJob:
                             ),
                             logger=logger,
                         )
+                    elif status == "ERROR_CAPTCHA":
+                        if captcha_uri:
+                            await self.dependencies.set_account_pending_captcha(
+                                user_id, account_id, captcha_uri, captcha_page_url
+                            )
+                        await self._record_terminal(
+                            user_id, account_id, vacancy_url, status, title, company, tracer=active_attempt
+                        )
+                        if not captcha_uri:
+                            logger.error("Could not capture captcha image for account %d", account_id)
+                            active_attempt = None
+                            return {"status": "ERROR_CAPTCHA"}
+                        await deliver_safely(
+                            self.notifier,
+                            user_id,
+                            captcha_required(name, account_id, app_url=self.dependencies.app_url),
+                            logger=logger,
+                        )
+                        active_attempt = None
+                        return {"status": "WAITING_FOR_CAPTCHA"}
                     elif status != "ALREADY_APPLIED":
                         if status == "ERROR_SESSION_EXPIRED":
                             await self.dependencies.update_account_session(user_id, account_id, b"", "EXPIRED")
@@ -388,6 +423,7 @@ class AccountSearchJob:
             account
             and account.get("auto_apply_enabled")
             and account.get("session_status") == "ACTIVE"
+            and not account.get("pending_captcha_data_uri")
             and account.get("applied_today", 0) < account.get("daily_limit", 50)
         )
 
@@ -418,10 +454,14 @@ class AccountSearchJob:
             except Exception:
                 logger.warning("Search navigation failed for account %d", account_id)
                 continue
-            if "account/login" in page.url:
+            if "/account/captcha" in (page.url or "").lower():
+                read_status = "ERROR_CAPTCHA"
+                cards = []
+            elif "account/login" in (page.url or "").lower():
                 await self.dependencies.update_account_session(user_id, account_id, b"", "EXPIRED")
                 break
-            read_status, cards = await extract_search_vacancies(page)
+            else:
+                read_status, cards = await extract_search_vacancies(page)
             if read_status == "ERROR_SESSION_EXPIRED":
                 await self.dependencies.update_account_session(user_id, account_id, b"", "EXPIRED")
                 break
@@ -430,7 +470,23 @@ class AccountSearchJob:
                 # code in the worker log rather than creating a false application
                 # event with a search URL or query parameters.
                 logger.warning("Search results unavailable for account %d: %s", account_id, read_status)
-                if read_status in {"ERROR_CAPTCHA", "ERROR_EXTERNAL"}:
+                if read_status == "ERROR_CAPTCHA":
+                    from leadscout.integrations.captcha import extract_captcha_data_uri
+
+                    captcha_uri = await extract_captcha_data_uri(page)
+                    if captcha_uri:
+                        await self.dependencies.set_account_pending_captcha(
+                            user_id, account_id, captcha_uri, page.url or url
+                        )
+                    name = account.get("account_name") or account.get("phone_or_email") or f"ID {account_id}"
+                    await deliver_safely(
+                        self.notifier,
+                        user_id,
+                        captcha_required(name, account_id, app_url=self.dependencies.app_url),
+                        logger=logger,
+                    )
+                    break
+                if read_status == "ERROR_EXTERNAL":
                     break
                 continue
             for clean, title in cards:

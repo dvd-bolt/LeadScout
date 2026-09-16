@@ -1,5 +1,6 @@
 import { Link } from "react-router-dom";
 import { AutomationControls } from "../features/automation/AutomationControls";
+import { CaptchaCard } from "../features/captcha/CaptchaCard";
 import { accountStatusLabel, formatMoscowTime, reviewCountLabel } from "../shared/lib/format";
 import type { Dashboard } from "../shared/types/api";
 import { EmptyState } from "../shared/ui";
@@ -23,6 +24,7 @@ export function HomePage({ dashboard }: { dashboard: Dashboard }) {
   const status = accountStatusLabel(active);
   return <section className={styles.page}>
     <h1 className={styles.title}>Поиск под<br />контролем</h1>
+    {dashboard.active_captcha ? <CaptchaCard key={dashboard.active_captcha.account_id} captcha={dashboard.active_captcha} /> : null}
     <div className={styles.metrics}>
       <section className={`${styles.metric} ${styles.progressMetric}`} aria-label="Дневной лимит откликов">
         <div className={styles.numbers}>{validCount ? active.applied_today : "—"}<span>/ {validLimit ? active.daily_limit : "—"}</span></div>

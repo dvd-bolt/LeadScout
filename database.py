@@ -93,6 +93,8 @@ create_hh_account = _using_default(accounts.create_hh_account)
 _update_account = _using_default(accounts.update_account)
 update_account_settings_for_user = _using_default(accounts.update_account_settings_for_user)
 update_account_session = _using_default(accounts.update_account_session)
+set_account_pending_captcha = _using_default(accounts.set_account_pending_captcha)
+clear_account_pending_captcha = _using_default(accounts.clear_account_pending_captcha)
 delete_hh_account_for_user = _using_default(accounts.delete_hh_account_for_user)
 reset_all_account_daily_limits = _using_default(accounts.reset_all_account_daily_limits)
 
@@ -198,6 +200,8 @@ __all__ = [
     "save_pending_questionnaire",
     "save_pending_questionnaire_account",
     "save_resume_audit",
+    "set_account_pending_captcha",
+    "clear_account_pending_captcha",
     "set_operation_needs_input",
     "set_active_account",
     "set_active_resume_snapshot",

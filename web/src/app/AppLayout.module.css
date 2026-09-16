@@ -5,9 +5,9 @@
 .account { display: flex; align-items: center; position: relative; max-width: 50%; min-width: 0; }
 .account svg { position: absolute; left: 10px; pointer-events: none; }
 .accountSelect { width: 100%; padding: 10px 22px 10px 37px; font-size: 0.8125rem; font-weight: 650; text-overflow: ellipsis; }
-.bottomNav { position: fixed; z-index: 4; right: 0; bottom: 0; left: 0; display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 5px; max-width: 760px; margin: 0 auto; padding: 8px calc(12px + var(--safe-right)) calc(8px + var(--safe-bottom)) calc(12px + var(--safe-left)); border-top: 2px solid var(--text); background: white; }
+.bottomNav { position: fixed; z-index: 4; right: 0; bottom: 0; left: 0; display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 5px; max-width: 760px; margin: 0 auto; padding: 8px calc(12px + var(--safe-right)) calc(8px + var(--safe-bottom)) calc(12px + var(--safe-left)); border-top: 2px solid var(--text); background: var(--nav-background); }
 .navLink { overflow-wrap: anywhere; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 6px; min-height: 74px; padding: 9px 1px; color: var(--text); font-size: 0.8125rem; line-height: 1.25; text-align: center; text-decoration: none; border-radius: 4px; }
-.navLinkActive { color: white; background: var(--text); font-weight: 750; }
+.navLinkActive { color: var(--accent-contrast); background: var(--accent); font-weight: 750; }
 .navIcon { position: relative; display: flex; } .navIcon > span { position: absolute; top: -9px; left: 20px; }
 @media(max-width:359px) { .header { align-items: flex-start; flex-direction: column; gap: 8px; margin-bottom: 20px; } .account { max-width: 100%; width: 100%; } .navLink { overflow-wrap: anywhere; font-size: 0.6875rem; } }
 

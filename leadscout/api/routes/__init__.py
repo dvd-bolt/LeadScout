@@ -6,6 +6,7 @@ from .applications import router as applications_router
 from .audits import router as audits_router
 from .auth import router as auth_router
 from .automation import router as automation_router
+from .captcha import router as captcha_router
 from .login import router as login_router
 from .operations import router as operations_router
 from .questionnaires import router as questionnaires_router
@@ -19,6 +20,7 @@ ROUTERS = (
     resumes_router,
     questionnaires_router,
     automation_router,
+    captcha_router,
     applications_router,
     audits_router,
     operations_router,

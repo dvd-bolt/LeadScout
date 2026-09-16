@@ -9,7 +9,9 @@ from leadscout.runtime.scheduler import next_search_time
 
 def public_account(account: dict, coordinator, scheduler=None) -> dict:
     session_status = str(account.get("session_status") or "")
-    if session_status in {"ERROR", "FAILED"}:
+    if account.get("pending_captcha_data_uri"):
+        automation_state = "WAITING_FOR_CAPTCHA"
+    elif session_status in {"ERROR", "FAILED"}:
         automation_state = "ERROR"
     elif session_status != "ACTIVE":
         automation_state = "NEEDS_LOGIN"
@@ -31,6 +33,8 @@ def public_account(account: dict, coordinator, scheduler=None) -> dict:
         "applied_date": account.get("applied_date", ""),
         "auto_apply_enabled": enabled,
         "automation_state": automation_state,
+        "pending_captcha_data_uri": account.get("pending_captcha_data_uri", ""),
+        "pending_captcha_created_at": account.get("pending_captcha_created_at", ""),
         "only_remote": bool(account.get("only_remote")),
         "send_cover_letter": bool(account.get("send_cover_letter")),
         "min_salary": account.get("min_salary", 0),

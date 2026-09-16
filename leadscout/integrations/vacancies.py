@@ -45,7 +45,13 @@ _ARCHIVED_MARKERS = (
     "вакансия больше не доступна",
 )
 _LOGIN_MARKERS = ("войти в аккаунт", "войдите в аккаунт", "вход на hh.ru")
-_NO_RESULTS_MARKERS = ("по вашему запросу ничего не найдено", "вакансии не найдены")
+_NO_RESULTS_MARKERS = (
+    "по вашему запросу ничего не найдено",
+    "вакансии не найдены",
+    "ничего не найдено",
+    "ничего не нашлось",
+    "попробуйте изменить запрос",
+)
 _SECTION_MARKERS = re.compile(
     r"^(обязанности|требования|мы ожидаем|что предстоит делать|условия|мы предлагаем)\s*:?$",
     re.IGNORECASE,
@@ -112,6 +118,8 @@ async def vacancy_page_status(page: Page, expected_vacancy_id: str | None = None
     """Classify only observable terminal page states; unknown pages stay unknown."""
     url = page.url or ""
     lowered_url = url.lower()
+    if "/account/captcha" in lowered_url:
+        return "ERROR_CAPTCHA"
     if "account/login" in lowered_url:
         return "ERROR_SESSION_EXPIRED"
     if url and not _is_hh_url(url):
@@ -125,7 +133,7 @@ async def vacancy_page_status(page: Page, expected_vacancy_id: str | None = None
     except Exception:
         captcha_visible = False
     if captcha_visible or re.search(
-        r"(?:пройдите|введите|решите)\s+(?:captcha|капчу)|подтвердите,?\s*что\s+вы\s+не\s+робот",
+        r"(?:пройдите|введите|решите)\s+(?:captcha|капчу)|подтвердите,?\s*что\s+вы\s+(?:не\s+робот|человек)|проверка\s+безопасности",
         body,
         re.IGNORECASE,
     ):
@@ -289,7 +297,7 @@ async def extract_search_vacancies(page: Page, *, timeout_ms: int = 7_000) -> tu
     try:
         await links.first.wait_for(state="visible", timeout=timeout_ms)
     except Exception:
-        body = await _body_text(page)
+        body = re.sub(r"\s+", " ", await _body_text(page)).lower()
         if any(marker in body for marker in _NO_RESULTS_MARKERS):
             return "SUCCESS", []
         return await vacancy_page_status(page) or "ERROR_INCOMPLETE", []

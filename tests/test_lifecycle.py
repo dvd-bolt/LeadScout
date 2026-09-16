@@ -109,6 +109,26 @@ async def test_bot_runner_closes_every_resource_once(runtime_context, runner_fak
     runner_fakes.scheduler.shutdown.assert_called_once_with(wait=False)
 
 
+async def test_runner_does_not_create_resources_after_shutdown_started(runtime_context, runner_fakes, monkeypatch):
+    async def shutdown_started(_context):
+        runtime_context.storage_ready = True
+        runtime_context.initialized = True
+        runtime_context.closing = True
+
+    bot_factory = Mock()
+    monkeypatch.setattr("leadscout.runtime.runner.initialize", shutdown_started)
+
+    await run_application(
+        runtime_context,
+        with_api=False,
+        bot_factory=bot_factory,
+        dispatcher_factory=runner_fakes.kwargs["dispatcher_factory"],
+        scheduler_factory=runner_fakes.kwargs["scheduler_factory"],
+    )
+
+    bot_factory.assert_not_called()
+
+
 async def test_api_failure_cancels_polling_and_recovers_work(runtime_context, runner_fakes):
     await runtime_context.db.get_or_create_user(42)
     await runtime_context.db.create_operation("interrupted", 42, "resume-sync")

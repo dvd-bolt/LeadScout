@@ -11,11 +11,14 @@ import sys
 import time
 from pathlib import Path
 
+import shutil
+import threading
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 ENV_FILE = BASE_DIR / ".env"
-CLOUDFLARED_PATH = r"C:\Program Files (x86)\cloudflared\cloudflared.exe"
+CLOUDFLARED_PATH = shutil.which("cloudflared") or r"C:\Program Files (x86)\cloudflared\cloudflared.exe"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [Launcher]: %(message)s")
 logger = logging.getLogger("launcher")
@@ -69,15 +72,31 @@ async def main_async() -> None:
     domain = app_url.replace("https://", "").rstrip("/")
     logger.info("Detected public tunnel URL: %s", app_url)
 
+    # Start background thread to drain cloudflared stdout so pipe doesn't block
+    def _drain_tunnel_stdout(proc):
+        try:
+            for out_line in iter(proc.stdout.readline, ""):
+                if not out_line:
+                    break
+        except Exception:
+            pass
+
+    threading.Thread(target=_drain_tunnel_stdout, args=(tunnel_proc,), daemon=True).start()
+
+    origins_str = f"{app_url},http://127.0.0.1:8000,http://localhost:8000"
     update_env({
         "APP_URL": app_url,
         "DOMAIN": domain,
-        "WEB_APP_ORIGINS": f"{app_url},http://127.0.0.1:8000,http://localhost:8000",
+        "WEB_APP_ORIGINS": origins_str,
     })
 
     os.environ["APP_URL"] = app_url
     os.environ["DOMAIN"] = domain
-    os.environ["WEB_APP_ORIGINS"] = f"{app_url},http://127.0.0.1:8000,http://localhost:8000"
+    os.environ["WEB_APP_ORIGINS"] = origins_str
+
+    import leadscout.core.config as config
+    config.APP_URL = app_url
+    config.WEB_APP_ORIGINS = tuple(origin.strip().rstrip("/") for origin in origins_str.split(",") if origin.strip())
 
     logger.info("Configuring Telegram bot Mini App menu button...")
     try:

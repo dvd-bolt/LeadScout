@@ -1,0 +1,52 @@
+.captchaCard {
+  border: 1px solid var(--border-warning, #f59e0b);
+  background: var(--surface-warning-subtle, rgba(245, 158, 11, 0.05));
+  margin-bottom: 20px;
+}
+
+.header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.titleRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-warning, #f59e0b);
+}
+
+.titleRow h2 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+
+.imageContainer {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: #ffffff;
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border, #e5e7eb);
+  margin-bottom: 12px;
+}
+
+.captchaImg {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  display: block;
+}
+
+.staleHint {
+  font-size: 0.85rem;
+  color: var(--text-secondary, #6b7280);
+  background: var(--surface-subtle, rgba(0, 0, 0, 0.04));
+  padding: 8px 12px;
+  border-radius: 8px;
+  margin: 0 0 12px 0;
+  line-height: 1.4;
+}

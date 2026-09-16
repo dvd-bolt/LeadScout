@@ -18,7 +18,12 @@ from leadscout.core import config
 async def configure_menu() -> None:
     config.validate_web_runtime_config()
     button = MenuButtonWebApp(text="Открыть LeadScout", web_app=WebAppInfo(url=config.APP_URL))
-    async with Bot(config.BOT_TOKEN) as bot:
+    session = None
+    if config.TELEGRAM_PROXY_URL:
+        from aiogram.client.session.aiohttp import AiohttpSession
+
+        session = AiohttpSession(proxy=config.TELEGRAM_PROXY_URL)
+    async with Bot(config.BOT_TOKEN, session=session) as bot:
         await bot.set_chat_menu_button(menu_button=button, request_timeout=20)
         current = await bot.get_chat_menu_button(request_timeout=20)
         if current.type != "web_app" or current.web_app.url.rstrip("/") != config.APP_URL:

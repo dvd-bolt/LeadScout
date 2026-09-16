@@ -23,6 +23,8 @@ DB_METHODS = frozenset(
         "get_application_attempt",
         "save_pending_questionnaire_account",
         "update_account_session",
+        "set_account_pending_captcha",
+        "clear_account_pending_captcha",
     }
 )
 

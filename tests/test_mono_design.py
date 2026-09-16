@@ -76,6 +76,36 @@ async def test_mono_layout_theme_navigation_and_screenshots(mini_app):
     await expect(page.get_by_role("progressbar")).to_have_attribute("aria-valuenow", "48")
     await expect(page.get_by_text("Готов к запуску", exact=True)).to_be_visible()
     assert await page.evaluate("getComputedStyle(document.body).backgroundColor") == "rgb(255, 255, 255)"
+    await page.get_by_role("link", name="Настройки", exact=True).click()
+    await expect(page.get_by_text("Тема оформления", exact=True)).to_be_visible()
+    for theme, label, background in (
+        ("dark", "Тёмная тема", "rgb(13, 15, 16)"),
+        ("green", "Зелёная тема", "rgb(248, 248, 241)"),
+        ("pink", "Розовая тема", "rgb(255, 243, 248)"),
+        ("light", "Светлая тема", "rgb(255, 255, 255)"),
+    ):
+        await page.get_by_role("radio", name=label, exact=True).check()
+        assert await page.evaluate("document.documentElement.dataset.theme") == theme
+        assert await page.evaluate("getComputedStyle(document.body).backgroundColor") == background
+        assert await page.evaluate("localStorage.getItem('leadscout-theme')") == theme
+    await page.get_by_role("radio", name="Тёмная тема", exact=True).check()
+    await page.reload()
+    await expect(page.get_by_role("radio", name="Тёмная тема", exact=True)).to_be_checked()
+    assert await page.evaluate("document.documentElement.dataset.theme") == "dark"
+    theme_output = Path("scratch/theme-verification")
+    theme_output.mkdir(parents=True, exist_ok=True)
+    await page.set_viewport_size({"width": 390, "height": 920})
+    for theme, label in (
+        ("dark", "Тёмная тема"),
+        ("green", "Зелёная тема"),
+        ("pink", "Розовая тема"),
+        ("light", "Светлая тема"),
+    ):
+        await page.goto("http://leadscout.test/#/settings")
+        await page.get_by_role("radio", name=label, exact=True).check()
+        await page.get_by_role("link", name="Главная", exact=True).click()
+        await expect(page.get_by_role("heading", name="Поиск под контролем")).to_be_visible()
+        await page.screenshot(path=str(theme_output / f"home-{theme}.png"), full_page=True)
     await page.evaluate("document.dispatchEvent(new Event('mono:light'))")
     assert await page.evaluate("getComputedStyle(document.body).backgroundColor") == "rgb(255, 255, 255)"
     assert set(

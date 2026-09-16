@@ -23,6 +23,14 @@ async def me(
     active = await context.db.get_active_account(user_id)
     pending = await context.db.list_pending_questionnaires(user_id, limit=100)
     account_id = active["id"] if active else None
+    active_captcha = None
+    if active and active.get("pending_captcha_data_uri"):
+        active_captcha = {
+            "account_id": active["id"],
+            "captcha_data_uri": active["pending_captcha_data_uri"],
+            "page_url": active.get("pending_captcha_page_url", ""),
+            "created_at": active.get("pending_captcha_created_at", ""),
+        }
     return {
         "user_id": user_id,
         "role": session["role"],
@@ -30,6 +38,7 @@ async def me(
         "csrf_token": session["csrf"],
         "accounts": [public_account(item, context.coordinator, context.scheduler) for item in accounts],
         "active_account_id": account_id,
+        "active_captcha": active_captcha,
         "stats": await context.db.get_application_stats(user_id, account_id),
         "active_pending_review_count": await context.db.count_pending_reviews(user_id, account_id) if account_id else 0,
         "pending_review_count": sum(item["status"] in {"PENDING", "FAILED", "NEEDS_REVIEW"} for item in pending),

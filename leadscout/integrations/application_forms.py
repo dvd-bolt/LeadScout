@@ -452,7 +452,7 @@ async def submit_approved_questionnaire(
         if vacancy.get("status", "SUCCESS") != "SUCCESS":
             return False, _safe_submit_message(_application_page_status(str(vacancy.get("status"))))
         if await verify_hh_application_success(page):
-            return True, "Отклик уже подтвержден на hh.ru."
+            return True, "На hh.ru уже есть ваш отклик."
         response_button = page.locator(DATA_QA["response"]).first
         if not await _is_visible(response_button):
             return False, "Кнопка отклика не найдена."

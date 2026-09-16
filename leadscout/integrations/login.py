@@ -23,10 +23,13 @@ logger = logging.getLogger(__name__)
 _CAPTCHA_IMAGE = '[data-qa="account-captcha-picture"], img[src*="/captcha/picture"], img[data-qa="captcha-image"]'
 _CAPTCHA_INPUT = '[data-qa="account-captcha-input"], input[name="captchaText"], input[name="captcha"]'
 _OTP_INPUT = (
-    '[data-qa="otp-code-input"], [data-qa*="otp"] input, '
+    '[data-qa="otp-code-input"], [data-qa*="otp"] input, input[data-qa*="pincode"], [data-qa*="pincode"] input, '
     'input[autocomplete="one-time-code"], form input[name="code"], form input[name*="code" i]'
 )
-_AUTH_MARKER = '[data-qa="mainmenu_myResumes"], [data-qa="mainmenu_vacancyResponses"], a[href*="/applicant/resumes"]'
+_AUTH_MARKER = (
+    '[data-qa="mainmenu_myResumes"], [data-qa="mainmenu_vacancyResponses"], '
+    'a[href*="/applicant/resumes"], [data-qa*="applicant_profile"], [data-qa*="mainmenu_profile"]'
+)
 _PAGE_ERROR = '[data-qa*="error"], [role="alert"], [aria-live="assertive"]'
 _WAITING_STATUSES = {"WAITING_FOR_CAPTCHA", "WAITING_FOR_OTP", "INVALID_CAPTCHA"}
 
@@ -52,7 +55,7 @@ class HHLoginSession:
     """One owned browser/session for a user and one hh.ru account."""
 
     transition_timeout = 12.0
-    rejected_after = 2.0
+    rejected_after = 6.0
 
     def __init__(
         self, user_id: int, phone_or_email: str, account_id: int | None = None, *, db, engine_factory, security_factory
@@ -76,7 +79,7 @@ class HHLoginSession:
             return False
 
     def _form(self):
-        return self.page.locator('[data-qa="account-login-form"]').first
+        return self.page.locator('[data-qa="account-login-form"], form').first
 
     async def _submit_button(self):
         """Find a submit control locally; never use the page's first button."""
@@ -209,23 +212,47 @@ class HHLoginSession:
             await self.page.goto("https://hh.ru/account/login", wait_until="domcontentloaded")
             await asyncio.sleep(0.6)
 
-            applicant = self.page.locator('[data-qa^="account-type-card-APPLICANT"]').first
-            if await self._visible(applicant):
-                await human_click(self.page, applicant)
-                submit = await self._submit_button()
-                if not submit:
-                    return login_error("HH_LOGIN_FORM_CHANGED")
-                await human_click(self.page, submit)
-                moved = await self._wait_for_credential_step()
-                if moved:
-                    return moved
+            if not await self._credential_step_ready():
+                applicant_input = self.page.locator('input[data-qa*="account-type-card-APPLICANT"]').first
+                applicant_card = self.page.locator(
+                    'label:has(input[data-qa*="account-type-card-APPLICANT"]), [data-qa*="account-type-card-APPLICANT"]'
+                ).first
+                if await self._visible(applicant_input) or await self._visible(applicant_card):
+                    is_checked = False
+                    if await self._visible(applicant_input):
+                        try:
+                            is_checked = await applicant_input.is_checked()
+                        except Exception:
+                            pass
+                    if not is_checked and await self._visible(applicant_card):
+                        await human_click(self.page, applicant_card)
+                    submit = await self._submit_button()
+                    if not submit:
+                        return login_error("HH_LOGIN_FORM_CHANGED")
+                    await human_click(self.page, submit)
+                    moved = await self._wait_for_credential_step()
+                    if moved:
+                        return moved
 
             is_email = "@" in login
-            tab = self.page.locator('[data-qa^="credential-type-email"]').first if is_email else self.page.locator(
-                '[data-qa^="credential-type-phone"]'
-            ).first
-            if await self._visible(tab):
-                await human_click(self.page, tab)
+            tab_input = (
+                self.page.locator('input[data-qa*="credential-type-email"]').first
+                if is_email
+                else self.page.locator('input[data-qa*="credential-type-phone"]').first
+            )
+            tab_label = (
+                self.page.locator('label:has(input[data-qa*="credential-type-email"]), [data-qa*="credential-type-email"]').first
+                if is_email
+                else self.page.locator('label:has(input[data-qa*="credential-type-phone"]), [data-qa*="credential-type-phone"]').first
+            )
+            tab_checked = False
+            if await self._visible(tab_input):
+                try:
+                    tab_checked = await tab_input.is_checked()
+                except Exception:
+                    pass
+            if not tab_checked and await self._visible(tab_label):
+                await human_click(self.page, tab_label)
                 await asyncio.sleep(0.2)
 
             target = await self._login_input(is_email=is_email)
@@ -320,8 +347,13 @@ class HHLoginSession:
                 else:
                     return login_error("HH_LOGIN_FORM_CHANGED")
             except HumanizationError:
-                if not await self._is_authenticated(timeout=2_000):
-                    return login_error("HH_LOGIN_FORM_CHANGED")
+                if not await self._is_authenticated(timeout=3_000):
+                    error = await self._page_error()
+                    if error:
+                        await self.abort()
+                        return error
+                    await self.abort()
+                    return login_error("HH_OTP_INVALID", status="INVALID_CODE")
 
             if not await self._is_authenticated(timeout=1_000):
                 submit = await self._submit_button()
@@ -329,6 +361,10 @@ class HHLoginSession:
                     await human_click(self.page, submit)
             if await self._is_authenticated(timeout=5_000):
                 return await self._finish_authenticated_login()
+            error = await self._page_error()
+            if error:
+                await self.abort()
+                return error
             await self.abort()
             return login_error("HH_OTP_INVALID", status="INVALID_CODE")
         except Exception as exc:
@@ -528,6 +564,10 @@ class HHLoginManager:
         session = self._sessions.pop(key, None)
         if session:
             await session.abort()
+        elif account_id:
+            account = await self.db.get_account_for_user(user_id, account_id)
+            if account and account.get("session_status") == "AUTH_PENDING":
+                await self.db.delete_hh_account_for_user(user_id, account_id)
 
     def login_account_id(self, user_id: int, account_id: int | None = None):
         session = self._sessions.get(self._key(user_id, account_id))

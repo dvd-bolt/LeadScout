@@ -85,12 +85,12 @@ export function LoginPanel() {
     <Message notice={notice} />
     {!step ? <form className={styles.form} onSubmit={(event) => { event.preventDefault(); setNotice(null); start.mutate(); }}>
       <label className={styles.field}>Телефон или email hh.ru<input required value={login} onChange={(event) => setLogin(event.target.value)} /></label>
-      <Button disabled={formBusy} type="submit">Продолжить</Button>
+      <Button disabled={formBusy} type="submit">{start.isPending ? "Связываемся с hh.ru…" : "Продолжить"}</Button>
     </form> : <form className={styles.form} onSubmit={(event) => { event.preventDefault(); setNotice(null); submit.mutate(); }}>
       {step.captcha ? <img alt="Капча hh.ru" src={step.captcha} style={{ maxWidth: "100%", borderRadius: 12 }} /> : null}
       <label className={styles.field}>{waitingForCaptcha ? "Текст с картинки" : "Код из SMS или письма"}<input required value={code} inputMode={waitingForCaptcha ? "text" : "numeric"} autoComplete={waitingForCaptcha ? "off" : "one-time-code"} minLength={waitingForCaptcha ? 1 : 4} maxLength={waitingForCaptcha ? 32 : 8} pattern={waitingForCaptcha ? undefined : "[0-9]{4,8}"} onChange={(event) => setCode(event.target.value)} /></label>
       <div className={styles.actionRow}>
-        <Button disabled={formBusy} type="submit">Подтвердить</Button>
+        <Button disabled={formBusy} type="submit">{submit.isPending ? "Проверяем…" : "Подтвердить"}</Button>
         {waitingForCaptcha ? <>
           <Button className={styles.secondary} disabled={formBusy} type="button" onClick={() => reload.mutate()}>Обновить капчу</Button>
           <Button className={styles.secondary} disabled={formBusy} type="button" onClick={() => language.mutate()}>Сменить язык</Button>

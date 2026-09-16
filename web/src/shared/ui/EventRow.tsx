@@ -22,7 +22,7 @@ export function EventRow({
     ALWAYS_REVIEWABLE.has(event.status)
     || (POST_SUBMIT_REVIEWABLE.has(event.status) && ["SUBMITTING", "CONFIRMING"].includes(event.stage ?? ""))
   );
-  const contents = <><span className={styles.icon}><Icon name={event.status.startsWith("APPLIED") ? "send" : event.status.startsWith("ERROR") ? "alert" : "chat"} size={25} /></span>
+  const contents = <><span className={styles.icon}><Icon name={event.status === "ALREADY_APPLIED" ? "check" : event.status.startsWith("APPLIED") ? "send" : event.status.startsWith("ERROR") ? "alert" : "chat"} size={25} /></span>
     <span className={styles.body}><strong>{event.vacancy_title || "Вакансия"}</strong><small>{eventStatusLabel(event.status)}</small>{event.stage ? <small>Этап: {applicationStageLabel(event.stage)}</small> : null}{event.details ? <small>{event.details}</small> : null}{event.company ? <small>{event.company}</small> : null}
       {reviewable && onResolve ? <span className={styles.reviewActions}>
         <button disabled={resolving} onClick={() => onResolve(true)}>Отклик есть на hh.ru</button>

@@ -23,12 +23,25 @@ def mini_app_url(target: str = "", *, app_url: str = APP_URL, **identifiers: int
     return urlunsplit((split.scheme, split.netloc, split.path or "/", urlencode(query), split.fragment or "/"))
 
 
-def get_mini_app_keyboard(target: str = "", *, app_url: str = APP_URL, **identifiers) -> InlineKeyboardMarkup | None:
+def get_mini_app_keyboard(
+    target: str = "", *, app_url: str = APP_URL, button_text: str = "Открыть LeadScout", **identifiers
+) -> InlineKeyboardMarkup | None:
     url = mini_app_url(target, app_url=app_url, **identifiers)
     if not url:
         return None
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="Открыть LeadScout", web_app=WebAppInfo(url=url))]]
+        inline_keyboard=[[InlineKeyboardButton(text=button_text, web_app=WebAppInfo(url=url))]]
+    )
+
+
+def get_captcha_keyboard(
+    account_id: int, *, app_url: str = APP_URL
+) -> InlineKeyboardMarkup | None:
+    return get_mini_app_keyboard(
+        "captcha",
+        app_url=app_url,
+        button_text="🧩 Ввести капчу в LeadScout",
+        account_id=account_id,
     )
 
 
@@ -70,6 +83,7 @@ def get_stop_keyboard(accounts: list[dict], *, app_url: str = APP_URL) -> Inline
 
 
 __all__ = [
+    "get_captcha_keyboard",
     "get_entry_keyboard",
     "get_mini_app_keyboard",
     "get_questionnaire_confirmation_keyboard",

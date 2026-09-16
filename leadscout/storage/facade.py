@@ -22,6 +22,8 @@ REPOSITORY_FUNCTIONS = {
     "_update_account": accounts.update_account,
     "update_account_settings_for_user": accounts.update_account_settings_for_user,
     "update_account_session": accounts.update_account_session,
+    "set_account_pending_captcha": accounts.set_account_pending_captcha,
+    "clear_account_pending_captcha": accounts.clear_account_pending_captcha,
     "delete_hh_account_for_user": accounts.delete_hh_account_for_user,
     "reset_all_account_daily_limits": accounts.reset_all_account_daily_limits,
     "is_account_already_applied": applications.is_account_already_applied,
