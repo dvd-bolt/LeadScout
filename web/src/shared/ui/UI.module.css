@@ -48,4 +48,26 @@
 .insightList { display: grid; gap: 10px; margin: 8px 0; }
 .insight { padding: 12px; border-left: 3px solid var(--text); background: var(--surface); }
 .insight p { margin: 4px 0 0; }
+.wizard { display: grid; gap: 16px; min-width: 0; }
+.stepTabs { display: flex; gap: 8px; padding: 2px 2px 8px; overflow-x: auto; scroll-snap-type: x proximity; }
+.stepTab { flex: 0 0 auto; min-height: 40px; padding: 8px 11px; border: 1px solid var(--text); border-radius: var(--radius); color: var(--text); background: var(--surface); font: inherit; font-size: .8125rem; font-weight: 650; scroll-snap-align: start; }
+.stepTabActive { color: var(--accent-contrast); background: var(--accent); border-width: 2px; }
+.saveStatus { min-height: 20px; color: var(--muted); font-size: .8125rem; }
+.wizardPanel { display: grid; gap: 16px; padding: 16px; border: 2px solid var(--text); border-radius: var(--radius); background: var(--subtle-surface); }
+.wizardFooter { display: flex; justify-content: space-between; gap: 12px; }
+.fieldGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.inlineFields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: end; gap: 12px; }
+.fieldError { color: var(--text); font-size: .8125rem; font-weight: 750; }
+.field input[aria-invalid="true"] { border-style: dashed; }
+.repeatCard { display: grid; gap: 14px; padding: 14px; border: 1px solid var(--text); border-radius: var(--radius); background: var(--surface); }
+.repeatCard .cardHeader { margin-bottom: 0; }
+.reviewGrid { display: grid; gap: 10px; padding: 14px; border: 1px solid var(--text); border-radius: var(--radius); background: var(--surface); }
+.dangerZone { padding-top: 6px; border-top: 1px dashed var(--border); }
+.startChoices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.startChoice { display: grid; gap: 8px; min-height: 140px; padding: 18px; border: 2px solid var(--text); border-radius: var(--radius); color: var(--text); background: var(--surface); font: inherit; text-align: left; cursor: pointer; }
+.startChoice strong { font-size: 1.0625rem; }
+.startChoice span { color: var(--muted); font-size: .875rem; line-height: 1.45; }
+.startChoice input[type="file"] { width: 100%; margin-top: auto; }
+.draftList { display: grid; gap: 12px; }
 @media (max-width: 380px) { .card { padding: 14px; } .cardHeader { align-items: flex-start; } .directHeader, .resultRow { align-items: flex-start; flex-direction: column; } .resultRow span { text-align: left; } }
+@media (max-width: 620px) { .fieldGrid, .startChoices { grid-template-columns: 1fr; } .inlineFields { grid-template-columns: 1fr; } .wizardPanel { padding: 13px; } }

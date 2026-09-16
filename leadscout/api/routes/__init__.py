@@ -10,6 +10,7 @@ from .captcha import router as captcha_router
 from .login import router as login_router
 from .operations import router as operations_router
 from .questionnaires import router as questionnaires_router
+from .resume_drafts import router as resume_drafts_router
 from .resumes import router as resumes_router
 
 ROUTERS = (
@@ -18,6 +19,7 @@ ROUTERS = (
     accounts_router,
     login_router,
     resumes_router,
+    resume_drafts_router,
     questionnaires_router,
     automation_router,
     captcha_router,

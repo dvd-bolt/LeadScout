@@ -67,13 +67,16 @@ class OperationManager:
             )
         else:
             result_status = str(result.get("status") or "SUCCESS")
-            if result_status == "NEEDS_FIELDS":
-                needs_input = {
-                    "status": "NEEDS_FIELDS",
-                    "missing_fields": list(result.get("missing_fields") or []),
-                    "structured": dict(result.get("structured") or {}),
-                    "message": result.get("message") or "Дополните обязательные поля резюме.",
-                }
+            if result_status in {
+                "NEEDS_FIELDS",
+                "NEEDS_INPUT",
+                "NEEDS_REVIEW",
+                "NEEDS_ACTION",
+                "PARTIAL",
+                "UNCERTAIN",
+            }:
+                needs_input = dict(result)
+                needs_input.setdefault("message", "Для продолжения требуется действие пользователя.")
                 await self.db.set_operation_needs_input(operation_id, user_id, needs_input)
             elif result_status in {"SUCCESS", "SUCCEEDED", "STARTED", "ALREADY_RUNNING"}:
                 await self.db.complete_operation(operation_id, user_id, result=result)

@@ -150,6 +150,7 @@ async def submit_captcha(
     try:
         success, new_uri = await active_session.enter_code(payload.code)
         if success:
+            captcha_page_url = str(account.get("pending_captcha_page_url") or "")
             security = context.security_factory()
             new_state = await active_session.browser_context.storage_state()
             await context.db.update_account_session(
@@ -177,7 +178,37 @@ async def submit_captcha(
                     logger=logger,
                 )
 
-            # Automatically resume search automation
+            resume_attempt = await context.db.get_account_pending_resume_attempt(
+                user_id, payload.account_id
+            )
+            if resume_attempt:
+                draft_id = int(resume_attempt["draft_id"])
+                operation = await context.operations.schedule(
+                    user_id,
+                    "resume-draft-resume",
+                    lambda: context.services.resume_drafts.resume(
+                        user_id, payload.account_id, draft_id
+                    ),
+                    resource=str(draft_id),
+                    account_id=payload.account_id,
+                )
+                return {
+                    "status": "SUCCESS",
+                    "account_id": payload.account_id,
+                    "resume_draft_id": draft_id,
+                    **operation,
+                }
+
+            if "/resume" in captcha_page_url or "/profile/" in captcha_page_url:
+                return {
+                    "status": "SUCCESS",
+                    "account_id": payload.account_id,
+                    "required_action": "RETRY_RESUME_CHECK",
+                    "message": "Проверка пройдена. Повторите проверку черновика резюме.",
+                }
+
+            # Captchas raised by vacancy automation keep their historical
+            # behavior; a resume captcha never starts a vacancy search.
             try:
                 await context.services.automation.start(user_id, payload.account_id)
             except Exception as exc:

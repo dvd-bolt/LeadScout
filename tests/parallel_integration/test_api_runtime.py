@@ -209,7 +209,7 @@ async def test_captcha_language_has_public_data_uri(client):
     }
 
 
-async def test_import_needs_input_and_removes_temporary_pdf(client, api_context):
+async def test_legacy_import_requires_the_new_draft_client(client):
     account = await database.create_hh_account(42, "import@example.com")
     await database.update_account_session(42, account["id"], b"test-session", "ACTIVE")
     response = await client.post(
@@ -217,12 +217,48 @@ async def test_import_needs_input_and_removes_temporary_pdf(client, api_context)
         files={"file": ("resume.pdf", b"%PDF-1.4 offline", "application/pdf")},
         data={"structured_json": '{"title":"Backend"}'},
     )
-    assert response.status_code == 202
-    await wait_operations(api_context)
-    operation = await database.get_operation_for_user(42, response.json()["operation_id"])
-    assert operation["status"] == "NEEDS_INPUT"
-    assert operation["result"]["structured"] == {"title": "Backend"}
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "CLIENT_UPDATE_REQUIRED"
     assert all(not path.exists() for path in FakeResumeManager.seen_paths)
+
+
+async def test_resume_draft_api_restores_steps_and_rejects_stale_tabs(client):
+    account = await database.create_hh_account(42, "draft-api@example.com")
+    created = await client.post(
+        f"/api/v1/accounts/{account['id']}/resume-drafts",
+        json={"source": "MANUAL"},
+    )
+    assert created.status_code == 201
+    draft = created.json()
+    draft["data"]["profession"]["title"] = "Разработчик 1С"
+
+    updated = await client.patch(
+        f"/api/v1/accounts/{account['id']}/resume-drafts/{draft['id']}",
+        json={
+            "expected_revision": draft["revision"],
+            "current_step": "personal",
+            "data": draft["data"],
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["revision"] == draft["revision"] + 1
+    assert updated.json()["current_step"] == "personal"
+
+    stale = await client.patch(
+        f"/api/v1/accounts/{account['id']}/resume-drafts/{draft['id']}",
+        json={
+            "expected_revision": draft["revision"],
+            "current_step": "skills",
+            "data": draft["data"],
+        },
+    )
+    assert stale.status_code == 409
+
+    restored = await client.get(
+        f"/api/v1/accounts/{account['id']}/resume-drafts/{draft['id']}"
+    )
+    assert restored.json()["current_step"] == "personal"
+    assert restored.json()["data"]["profession"]["title"] == "Разработчик 1С"
 
 
 async def test_audit_match_url_uses_frozen_source(client, api_context):

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 from pypdf import PdfReader
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfgen.canvas import Canvas
 
 import leadscout.documents.pdf_reader as pdf_reader
@@ -38,9 +38,10 @@ def test_invalid_pdf_is_rejected(tmp_path):
 
 def test_pdf_text_layer_preserves_cyrillic_english_entities_and_line_breaks(tmp_path):
     path = tmp_path / "mixed-language.pdf"
-    pdfmetrics.registerFont(TTFont("LeadScoutArial", r"C:\Windows\Fonts\arial.ttf"))
+    # Bundled by ReportLab on Linux, macOS, and Windows; no host font path.
+    pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
     canvas = Canvas(str(path))
-    canvas.setFont("LeadScoutArial", 11)
+    canvas.setFont("STSong-Light", 11)
     lines = [
         "Иван Петров — Backend Engineer",
         "• Python, SQL & R&D <platform>",

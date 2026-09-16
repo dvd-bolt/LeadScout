@@ -4,7 +4,7 @@ from functools import partial
 
 from .connection import Database
 from .migrations import init_db
-from .repositories import accounts, applications, audits, operations, questionnaires, resumes, users
+from .repositories import accounts, applications, audits, operations, questionnaires, resume_drafts, resumes, users
 
 REPOSITORY_FUNCTIONS = {
     "get_or_create_user": users.get_or_create_user,
@@ -61,6 +61,23 @@ REPOSITORY_FUNCTIONS = {
     "set_active_resume_snapshot": resumes.set_active_resume_snapshot,
     "delete_resume_snapshot": resumes.delete_resume_snapshot,
     "get_user_resumes_json": resumes.get_user_resumes_json,
+    "create_resume_draft": resume_drafts.create_resume_draft,
+    "list_resume_drafts": resume_drafts.list_resume_drafts,
+    "get_resume_draft": resume_drafts.get_resume_draft,
+    "update_resume_draft": resume_drafts.update_resume_draft,
+    "replace_resume_draft_data": resume_drafts.replace_resume_draft_data,
+    "set_resume_draft_status": resume_drafts.set_resume_draft_status,
+    "save_resume_preflight": resume_drafts.save_resume_preflight,
+    "delete_resume_draft": resume_drafts.delete_resume_draft,
+    "create_resume_publish_attempt": resume_drafts.create_resume_publish_attempt,
+    "get_resume_publish_attempt": resume_drafts.get_resume_publish_attempt,
+    "get_latest_resume_publish_attempt": resume_drafts.get_latest_resume_publish_attempt,
+    "get_account_pending_resume_attempt": resume_drafts.get_account_pending_resume_attempt,
+    "has_active_resume_publish": resume_drafts.has_active_resume_publish,
+    "update_resume_publish_attempt": resume_drafts.update_resume_publish_attempt,
+    "record_resume_publish_event": resume_drafts.record_resume_publish_event,
+    "set_resume_attempt_operation_id": resume_drafts.set_resume_attempt_operation_id,
+    "recover_interrupted_resume_publishes": resume_drafts.recover_interrupted_resume_publishes,
     "save_resume_audit": audits.save_resume_audit,
     "get_user_latest_audit": audits.get_user_latest_audit,
     "list_resume_audits": audits.list_resume_audits,

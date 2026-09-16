@@ -10,6 +10,7 @@ from leadscout.storage.repositories import (
     audits,
     operations,
     questionnaires,
+    resume_drafts,
     resumes,
     users,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "audits",
     "operations",
     "questionnaires",
+    "resume_drafts",
     "resumes",
     "users",
 ]

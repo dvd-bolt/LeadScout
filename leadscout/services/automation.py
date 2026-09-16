@@ -30,6 +30,12 @@ class AutomationService(_Service):
             self.access.check_account_start(account_id)
         account = await self._external_account(user_id, account_id)
         self._validate(account)
+        checker = getattr(self.db, "has_active_resume_publish", None)
+        if checker and await _await(checker(user_id, account_id)):
+            raise ServiceError(
+                "CONFLICT",
+                "Сначала завершите или сверьте незавершённую публикацию резюме.",
+            )
         enabled = await _await(self.db.update_account_settings_for_user(user_id, account_id, auto_apply_enabled=1))
         if not enabled:
             raise ServiceError("NOT_FOUND", "Аккаунт не найден.")

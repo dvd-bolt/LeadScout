@@ -230,9 +230,11 @@ async def test_pending_account_cannot_schedule_hh_operations(audit_client, monke
     )
     automation = await audit_client.post(f"/api/v1/automation/{account['id']}/start")
 
-    for response in (sync, upload, automation):
+    for response in (sync, automation):
         assert response.status_code == 409
         assert response.json()["detail"] == "Сначала завершите подключение аккаунта."
+    assert upload.status_code == 409
+    assert upload.json()["detail"]["code"] == "CLIENT_UPDATE_REQUIRED"
     schedule.assert_not_called()
     start.assert_not_called()
 

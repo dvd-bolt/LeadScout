@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import json
-import tempfile
-from pathlib import Path
-
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 
 from leadscout.runtime import AppContext
 from leadscout.services import ServiceError
@@ -77,35 +73,17 @@ async def import_resume(
     account_id: int,
     session: dict = Depends(require_csrf),
     context: AppContext = Depends(get_context),
-    file: UploadFile = File(...),
-    structured_json: str = Form(default=""),
+    file: UploadFile | None = File(default=None),
 ) -> dict:
-    user_id = int(session["user_id"])
-    try:
-        await context.services.resumes._external_account(user_id, account_id)
-    except ServiceError as exc:
-        raise service_http_error(exc) from exc
-    contents = await _read_pdf(file, context.settings.pdf_max_bytes)
-    try:
-        structured = json.loads(structured_json) if structured_json else None
-    except json.JSONDecodeError as exc:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "Структура резюме содержит некорректный JSON",
-        ) from exc
-    if structured is not None and not isinstance(structured, dict):
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "Структура резюме должна быть JSON-объектом",
-        )
-
-    async def job() -> dict:
-        with tempfile.TemporaryDirectory(prefix="leadscout-import-") as directory:
-            path = Path(directory) / "resume.pdf"
-            path.write_bytes(contents)
-            return await context.services.resumes.import_pdf(user_id, account_id, str(path), structured)
-
-    return await context.operations.schedule(user_id, "resume-import", job, account_id=account_id)
+    if file is not None:
+        await file.close()
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        {
+            "code": "CLIENT_UPDATE_REQUIRED",
+            "message": "Прямой импорт отключён. Обновите Mini App и используйте мастер резюме.",
+        },
+    )
 
 
 @router.delete("/{snapshot_id}", status_code=status.HTTP_202_ACCEPTED)

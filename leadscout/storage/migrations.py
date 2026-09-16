@@ -11,7 +11,73 @@ from leadscout.storage.admin_schema import SCHEMA as ADMIN_SCHEMA
 from leadscout.storage.connection import Database
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
+
+
+RESUME_DRAFT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS resume_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    source TEXT NOT NULL DEFAULT 'MANUAL',
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    revision INTEGER NOT NULL DEFAULT 1,
+    current_step TEXT NOT NULL DEFAULT 'profession',
+    status TEXT NOT NULL DEFAULT 'DRAFT',
+    data_json TEXT NOT NULL DEFAULT '{}',
+    validation_json TEXT NOT NULL DEFAULT '{}',
+    preflight_json TEXT NOT NULL DEFAULT '{}',
+    preflight_revision INTEGER,
+    preflight_fingerprint TEXT NOT NULL DEFAULT '',
+    hh_resume_id TEXT NOT NULL DEFAULT '',
+    hh_resume_url TEXT NOT NULL DEFAULT '',
+    hh_status TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (account_id) REFERENCES hh_accounts(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS resume_publish_attempts (
+    id TEXT PRIMARY KEY,
+    draft_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    draft_revision INTEGER NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    confirmed_fingerprint TEXT NOT NULL DEFAULT '',
+    operation_id TEXT NOT NULL DEFAULT '',
+    stage TEXT NOT NULL DEFAULT 'REGISTERED',
+    status TEXT NOT NULL DEFAULT 'PENDING',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    hh_resume_id TEXT NOT NULL DEFAULT '',
+    hh_resume_url TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (draft_id) REFERENCES resume_drafts(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    FOREIGN KEY (account_id) REFERENCES hh_accounts(id) ON DELETE CASCADE,
+    UNIQUE(draft_id, idempotency_key)
+);
+CREATE TABLE IF NOT EXISTS resume_publish_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    attempt_id TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    code TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    duration_ms INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (attempt_id) REFERENCES resume_publish_attempts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_resume_drafts_owner
+    ON resume_drafts(user_id, account_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_resume_attempts_draft
+    ON resume_publish_attempts(draft_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_resume_events_attempt
+    ON resume_publish_events(attempt_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_resume_active_attempt
+    ON resume_publish_attempts(draft_id)
+    WHERE status IN ('PENDING', 'PUBLISHING', 'NEEDS_ACTION', 'UNCERTAIN');
+"""
 
 
 async def table_columns(connection: aiosqlite.Connection, table: str) -> set[str]:
@@ -60,7 +126,7 @@ async def normalized_accounts(connection: aiosqlite.Connection) -> list[tuple[st
 
 
 async def init_db(database: Database) -> None:
-    """Create or transactionally migrate a database to schema v8."""
+    """Create or transactionally migrate a database to schema v9."""
     async with database.connection() as connection:
         await connection.execute("PRAGMA synchronous=NORMAL")
         await connection.execute("PRAGMA temp_store=MEMORY")
@@ -74,6 +140,12 @@ async def init_db(database: Database) -> None:
             await add_missing_column(connection, "hh_accounts", "pending_captcha_page_url TEXT NOT NULL DEFAULT ''")
             await add_missing_column(connection, "hh_accounts", "pending_captcha_created_at TEXT NOT NULL DEFAULT ''")
             await connection.commit()
+            return
+        if version == 8:
+            await execute_statements(connection, RESUME_DRAFT_SCHEMA)
+            await connection.execute("PRAGMA user_version=9")
+            await connection.commit()
+            await connection.execute("PRAGMA journal_mode=WAL")
             return
         if version in {6, 7}:
             if version == 6:
@@ -106,6 +178,8 @@ async def init_db(database: Database) -> None:
                 PRAGMA user_version=8;
                 """,
             )
+            await execute_statements(connection, RESUME_DRAFT_SCHEMA)
+            await connection.execute("PRAGMA user_version=9")
             await connection.commit()
             await connection.execute("PRAGMA journal_mode=WAL")
             return
@@ -388,6 +462,8 @@ async def init_db(database: Database) -> None:
             PRAGMA user_version=8;
             """,
         )
+        await execute_statements(connection, RESUME_DRAFT_SCHEMA)
+        await connection.execute("PRAGMA user_version=9")
         await connection.commit()
         await connection.execute("PRAGMA journal_mode=WAL")
     logger.info("SQLite schema v%s initialized: %s", SCHEMA_VERSION, database.path)

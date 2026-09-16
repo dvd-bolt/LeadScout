@@ -8,6 +8,8 @@ import type {
   OperationStart,
   Questionnaire,
   Resume,
+  ResumeDraft,
+  ResumeDraftData,
   StructuredResume,
   VacancyMatchInput,
 } from "../types/api";
@@ -50,6 +52,34 @@ export const api = {
     if (structured) body.set("structured_json", JSON.stringify(structured));
     return request<OperationStart>(`/accounts/${accountId}/resumes/import`, { method: "POST", body });
   },
+  resumeDrafts: (accountId: number) => request<ResumeDraft[]>(`/accounts/${accountId}/resume-drafts`),
+  resumeDraft: (accountId: number, draftId: number) => request<ResumeDraft>(`/accounts/${accountId}/resume-drafts/${draftId}`),
+  createResumeDraft: (accountId: number, source: "MANUAL" | "PDF") =>
+    request<ResumeDraft>(`/accounts/${accountId}/resume-drafts`, { method: "POST", body: JSON.stringify({ source }) }),
+  patchResumeDraft: (accountId: number, draftId: number, expectedRevision: number, currentStep: string, data: ResumeDraftData) =>
+    request<ResumeDraft>(`/accounts/${accountId}/resume-drafts/${draftId}`, {
+      method: "PATCH", body: JSON.stringify({ expected_revision: expectedRevision, current_step: currentStep, data }),
+    }),
+  deleteResumeDraft: (accountId: number, draftId: number) =>
+    request<void>(`/accounts/${accountId}/resume-drafts/${draftId}`, { method: "DELETE" }),
+  extractResumePdf: (accountId: number, draftId: number, file: File) => {
+    const body = new FormData();
+    body.set("file", file);
+    return request<OperationStart>(`/accounts/${accountId}/resume-drafts/${draftId}/extract-pdf`, { method: "POST", body });
+  },
+  validateResumeDraft: (accountId: number, draftId: number) =>
+    request<{ status: string; valid: boolean; field_errors: import("../types/api").ResumeFieldError[] }>(`/accounts/${accountId}/resume-drafts/${draftId}/validate`, { method: "POST" }),
+  preflightResumeDraft: (accountId: number, draftId: number) =>
+    request<OperationStart>(`/accounts/${accountId}/resume-drafts/${draftId}/preflight`, { method: "POST" }),
+  publishResumeDraft: (accountId: number, draftId: number, expectedRevision: number, idempotencyKey: string, confirmationFingerprint: string) =>
+    request<OperationStart>(`/accounts/${accountId}/resume-drafts/${draftId}/publish`, {
+      method: "POST",
+      body: JSON.stringify({ expected_revision: expectedRevision, idempotency_key: idempotencyKey, confirmation_fingerprint: confirmationFingerprint }),
+    }),
+  resumeResumeDraft: (accountId: number, draftId: number) =>
+    request<OperationStart>(`/accounts/${accountId}/resume-drafts/${draftId}/resume`, { method: "POST" }),
+  reconcileResumeDraft: (accountId: number, draftId: number) =>
+    request<OperationStart>(`/accounts/${accountId}/resume-drafts/${draftId}/reconcile`, { method: "POST" }),
 
   questionnaires: (accountId?: number) => request<Questionnaire[]>(`/questionnaires${accountId ? `?account_id=${accountId}` : ""}`),
   questionnaire: (applyId: number) => request<Questionnaire>(`/questionnaires/${applyId}`),

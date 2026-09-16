@@ -68,6 +68,19 @@ def questionnaire(item_id: int, account_id: int, title: str, status: str = "PEND
     }
 
 
+def resume_draft_data() -> dict:
+    return {
+        "profession": {"title": "", "hh_profession": "", "hh_profession_id": "", "specializations": []},
+        "personal": {"first_name": "", "last_name": "", "middle_name": "", "birth_date": "", "gender": "", "city": "", "citizenships": [], "work_authorizations": []},
+        "contacts": {"phone": "", "email": "", "telegram": "", "preferred": "", "methods": []},
+        "work_conditions": {"salary": None, "currency": "RUR", "employment_types": [], "schedules": [], "work_formats": [], "relocation": "", "business_trips": ""},
+        "skills": [], "experiences": [], "education": [], "languages": [],
+        "additional": {"courses": [], "exams": [], "certificates": [], "recommendations": [], "driving_licenses": [], "has_car": False},
+        "about": {"text": "", "links": []},
+        "publication": {"visibility": "", "target_account_confirmed": False},
+    }
+
+
 class QuietHandler(SimpleHTTPRequestHandler):
     def log_message(self, *_args):
         pass
@@ -135,6 +148,8 @@ class ContractApi:
             }
         ]
         self.operations: dict[str, dict] = {}
+        self.resume_drafts: dict[int, list[dict]] = {1: [], 2: []}
+        self.draft_counter = 0
         self.requests: list[CapturedRequest] = []
         self.import_count = 0
         self.match_count = 0
@@ -188,7 +203,7 @@ class ContractApi:
             self.active_id = target
             await self.json_response(route, {"active_account_id": target})
             return
-        if method == "PATCH" and path.startswith("/accounts/"):
+        if method == "PATCH" and path.startswith("/accounts/") and "/resume-drafts" not in path:
             target = int(path.split("/")[2])
             values = json.loads(body)
             current = next(item for item in self.accounts if item["id"] == target)
@@ -262,6 +277,61 @@ class ContractApi:
                 await self.json_response(route, {"detail": "Аккаунт не найден"}, 404)
                 return
             await self.json_response(route, self.resumes.get(target, []))
+            return
+        if "/resume-drafts" in path:
+            parts = path.strip("/").split("/")
+            target = int(parts[1])
+            draft_id = int(parts[3]) if len(parts) >= 4 else None
+            drafts = self.resume_drafts.setdefault(target, [])
+            if method == "POST" and len(parts) == 3:
+                self.draft_counter += 1
+                draft = {
+                    "id": self.draft_counter, "account_id": target, "source": json.loads(body).get("source", "MANUAL"),
+                    "schema_version": 1, "revision": 1, "current_step": "profession", "status": "DRAFT",
+                    "data": resume_draft_data(), "validation": {}, "preflight": {}, "preflight_revision": None,
+                    "preflight_fingerprint": "", "hh_resume_id": "", "hh_resume_url": "", "hh_status": "",
+                    "updated_at": "2026-09-11 08:00:00",
+                }
+                drafts.insert(0, draft)
+                await self.json_response(route, draft, 201)
+                return
+            if method == "GET" and len(parts) == 3:
+                await self.json_response(route, drafts)
+                return
+            draft = next((item for item in drafts if item["id"] == draft_id), None)
+            if not draft:
+                await self.json_response(route, {"detail": "Черновик не найден"}, 404)
+                return
+            if method == "GET" and len(parts) == 4:
+                await self.json_response(route, draft)
+                return
+            if method == "PATCH" and len(parts) == 4:
+                payload = json.loads(body)
+                if payload["expected_revision"] != draft["revision"]:
+                    await self.json_response(route, {"detail": "Черновик уже изменён"}, 409)
+                    return
+                draft.update(data=payload["data"], current_step=payload["current_step"], revision=draft["revision"] + 1)
+                await self.json_response(route, draft)
+                return
+            if method == "DELETE" and len(parts) == 4:
+                drafts.remove(draft)
+                await route.fulfill(status=204, body="")
+                return
+            if method == "POST" and parts[-1] == "extract-pdf":
+                self.import_count += 1
+                draft["data"]["profession"].update(title="Python-разработчик", hh_profession="Программист, разработчик")
+                draft["data"]["skills"] = [{"name": "Python", "level": ""}]
+                draft["data"]["about"]["text"] = "Сохранённое описание"
+                draft.update(status="NEEDS_INPUT", revision=draft["revision"] + 1)
+                operation_id = f"draft-extract-{self.import_count}"
+                self.operations[operation_id] = {
+                    "id": operation_id, "kind": "resume-draft-extract", "status": "SUCCEEDED",
+                    "result": {"status": "SUCCESS", "message": "PDF распознан. Проверьте заполненные данные."},
+                    "error_text": "",
+                }
+                await self.json_response(route, {"operation_id": operation_id, "status": "PENDING"}, 202)
+                return
+            await self.json_response(route, {"detail": f"Mock draft route is not implemented: {method} {path}"}, 404)
             return
         if method == "POST" and path.endswith("/resumes/import"):
             self.import_count += 1
@@ -559,37 +629,26 @@ async def test_partial_start_all_has_per_account_results(browser_app):
     await expect(results).to_contain_text("Нужен повторный вход")
 
 
-async def test_import_needs_input_has_no_auto_retry_then_succeeds_and_reports_error(browser_app, tmp_path):
+async def test_pdf_prefill_creates_a_durable_draft_without_direct_hh_import(browser_app, tmp_path):
     page, mock, base_url = browser_app.page, browser_app.mock, browser_app.base_url
     pdf = tmp_path / "resume.pdf"
     pdf.write_bytes(b"%PDF-1.4\nmock resume")
     await page.goto(f"{base_url}/#/resumes", wait_until="networkidle")
-    await page.get_by_label("PDF для импорта в hh.ru").set_input_files(str(pdf))
-    await page.get_by_role("button", name="Импортировать в hh.ru").click()
-    await expect(page.get_by_role("heading", name="Дополните данные")).to_be_visible()
-    await page.wait_for_timeout(500)
+    await page.get_by_label("Заполнить из PDF", exact=False).set_input_files(str(pdf))
+    await expect(page.get_by_role("heading", name="Python-разработчик")).to_be_visible()
+    await expect(page.get_by_text("Все изменения сохранены")).to_be_visible()
     assert mock.import_count == 1
-    await page.get_by_label("Имя").fill("Иван")
-    await page.get_by_label("Дата рождения").fill("1990-02-03")
-    await page.get_by_label("Город").fill("Москва")
-    await page.get_by_label("Желаемая должность").fill("Python-разработчик")
-    await page.get_by_role("button", name="Подтвердить и продолжить импорт").click()
-    await expect(page.get_by_role("status").filter(has_text="Новое резюме создано")).to_have_text(
-        "Новое резюме создано"
-    )
-    assert mock.import_count == 2
-    continuation = [request for request in mock.requests if request.path.endswith("/resumes/import")][1]
-    multipart = continuation.body.decode("utf-8", errors="ignore")
-    assert 'name="file"; filename="resume.pdf"' in multipart
-    assert 'name="structured_json"' in multipart
-    assert "Сохранённое описание" in multipart and "Python-разработчик" in multipart
+    assert not any(request.path.endswith("/resumes/import") for request in mock.requests)
 
-    await page.get_by_label("PDF для импорта в hh.ru").set_input_files(str(pdf))
-    await page.get_by_role("button", name="Импортировать в hh.ru").click()
-    await expect(page.get_by_role("status").filter(has_text="hh.ru не подтвердил создание резюме")).to_have_text(
-        "hh.ru не подтвердил создание резюме"
-    )
-    assert mock.import_count == 3
+    skills_step = page.get_by_role("button", name="5. Навыки")
+    await skills_step.click()
+    await expect(skills_step).to_have_attribute("aria-current", "step")
+    await expect(page.get_by_label("Навыки")).to_have_value("Python")
+    await page.get_by_role("button", name="10. О себе").click()
+    await expect(page.get_by_label("О себе")).to_have_value("Сохранённое описание")
+    await page.get_by_role("button", name="Закрыть").click()
+    await page.get_by_role("button", name="Продолжить").click()
+    await expect(page.get_by_label("О себе")).to_have_value("Сохранённое описание")
 
 
 async def test_independent_audit_details_and_text_or_url_match_payload(browser_app):

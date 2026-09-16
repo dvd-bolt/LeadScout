@@ -190,6 +190,7 @@ async def test_build_services_contract_and_repeated_login(dependencies):
     assert set(facade.__dataclass_fields__) == {
         "accounts",
         "resumes",
+        "resume_drafts",
         "automation",
         "questionnaires",
         "audits",

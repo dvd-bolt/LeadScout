@@ -151,6 +151,34 @@ async def test_schema_version_and_foreign_keys(isolated_db):
 
 
 @pytest.mark.asyncio
+async def test_v8_database_is_migrated_to_resume_drafts_v9(tmp_path):
+    db = Database(tmp_path / "v8.db")
+    await init_db(db)
+    async with db.connection() as connection:
+        await connection.execute("DROP TABLE resume_publish_events")
+        await connection.execute("DROP TABLE resume_publish_attempts")
+        await connection.execute("DROP TABLE resume_drafts")
+        await connection.execute("PRAGMA user_version=8")
+        await connection.commit()
+
+    await init_db(db)
+
+    async with db.connection() as connection:
+        version = (await (await connection.execute("PRAGMA user_version")).fetchone())[0]
+        rows = await (
+            await connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'resume_%'"
+            )
+        ).fetchall()
+    assert version == 9
+    assert {row[0] for row in rows} >= {
+        "resume_drafts",
+        "resume_publish_attempts",
+        "resume_publish_events",
+    }
+
+
+@pytest.mark.asyncio
 async def test_account_delete_cascades_owned_records(isolated_db):
     await database.get_or_create_user(1)
     account = await database.create_hh_account(1, "cascade@example.com")

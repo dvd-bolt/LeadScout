@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from .audits import AuditService
     from .automation import AutomationService
     from .questionnaires import QuestionnaireService
+    from .resume_drafts import ResumeDraftService
     from .resumes import ResumeService
 
 
@@ -27,6 +28,7 @@ class AuditSource:
 class Services:
     accounts: "AccountService"
     resumes: "ResumeService"
+    resume_drafts: "ResumeDraftService"
     automation: "AutomationService"
     questionnaires: "QuestionnaireService"
     audits: "AuditService"

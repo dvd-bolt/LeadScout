@@ -14,6 +14,7 @@ from leadscout.integrations.ai.prompts import (
 )
 from leadscout.models.audits import ResumeAuditPayload, VacancyMatchPayload
 from leadscout.models.questions import JobApplicationPayload, QuestionField
+from leadscout.models.resume_drafts import ResumeDraftData
 from leadscout.models.resumes import SearchKeywordsPayload, StructuredResume
 
 
@@ -159,10 +160,10 @@ class AIIntegration:
         self.cache.put(key, result)
         return result
 
-    async def extract_full_structured_resume(self, resume_text: str) -> StructuredResume:
+    async def extract_full_structured_resume(self, resume_text: str, *, strict: bool = False) -> StructuredResume:
         if not resume_text.strip():
             return StructuredResume()
-        data = {"resume": resume_text[:20_000]}
+        data = {"resume": resume_text[: config.PDF_MAX_TEXT_CHARS]}
         key = _cache_key("structured_resume", data)
         cached = self.cache.get(key, StructuredResume)
         if cached:
@@ -170,7 +171,29 @@ class AIIntegration:
         try:
             result = await self.client.generate(structured_resume_prompt(data), StructuredResume)
         except AIServiceError:
+            if strict:
+                raise
             return StructuredResume()
+        self.cache.put(key, result)
+        return result
+
+    async def extract_resume_draft(self, resume_text: str, *, strict: bool = False) -> ResumeDraftData:
+        """Extract the complete wizard shape without inventing missing values."""
+        if not resume_text.strip():
+            return ResumeDraftData()
+        data = {"resume": resume_text[: config.PDF_MAX_TEXT_CHARS]}
+        key = _cache_key("resume_draft", data)
+        cached = self.cache.get(key, ResumeDraftData)
+        if cached:
+            return cached
+        try:
+            result = await self.client.generate(structured_resume_prompt(data), ResumeDraftData)
+        except AIServiceError:
+            if strict:
+                raise
+            return ResumeDraftData()
+        result.profession.hh_profession = ""
+        result.profession.hh_profession_id = ""
         self.cache.put(key, result)
         return result
 

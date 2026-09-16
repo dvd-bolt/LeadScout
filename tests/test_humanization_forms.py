@@ -119,7 +119,10 @@ async def test_resume_wizard_waits_for_delayed_profession_field(monkeypatch):
 
         result = await HHResumeManager._fill_step_by_step_resume(page, resume)
 
-        assert result == {"status": "SUBMITTED"}
+        assert result == {
+            "status": "SUBMITTED",
+            "recognized_screens": ["profession", "personal", "skills", "publish"],
+        }
         assert await page.evaluate("window.published === true", isolated_context=False)
     finally:
         await browser.close()

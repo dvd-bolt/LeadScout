@@ -119,6 +119,61 @@ export type StructuredResume = Record<string, unknown> & {
   title?: string;
 };
 
+export type ResumeDraftData = {
+  profession: { title: string; hh_profession: string; hh_profession_id: string; specializations: string[] };
+  personal: {
+    first_name: string; last_name: string; middle_name: string; birth_date: string; gender: string; city: string;
+    citizenships: string[]; work_authorizations: string[];
+  };
+  contacts: { phone: string; email: string; telegram: string; preferred: string; methods: string[] };
+  work_conditions: {
+    salary: number | null; currency: string; employment_types: string[]; schedules: string[];
+    work_formats: string[]; relocation: string; business_trips: string;
+  };
+  skills: Array<{ name: string; level: string }>;
+  experiences: Array<{
+    company: string; position: string; city: string; start_month: string; start_year: string;
+    is_current: boolean; end_month: string; end_year: string; description: string; selected: boolean;
+  }>;
+  education: Array<{
+    level: string; institution: string; faculty: string; specialization: string; end_year: string; selected: boolean;
+  }>;
+  languages: Array<{ name: string; level: string }>;
+  additional: {
+    courses: NamedResumeDetail[]; exams: NamedResumeDetail[]; certificates: NamedResumeDetail[];
+    recommendations: NamedResumeDetail[]; driving_licenses: string[]; has_car: boolean;
+  };
+  about: { text: string; links: Array<{ label: string; url: string }> };
+  publication: { visibility: string; target_account_confirmed: boolean };
+};
+
+export type NamedResumeDetail = { name: string; organization: string; year: string; description: string };
+
+export type ResumeFieldError = { path: string; code: string; message: string };
+
+export type ResumeDraft = {
+  id: number;
+  account_id: number;
+  source: "MANUAL" | "PDF";
+  schema_version: number;
+  revision: number;
+  current_step: string;
+  status: "DRAFT" | "PARSING" | "READY" | "PUBLISHING" | "COMPLETED" | "NEEDS_INPUT" | "NEEDS_REVIEW" | "FAILED";
+  data: ResumeDraftData;
+  validation: { valid?: boolean; field_errors?: ResumeFieldError[] };
+  preflight: {
+    conflicts?: Array<{ path: string; draft_value: string; profile_value: string }>;
+    profile_changes?: Array<{ path: string; draft_value: string; profile_value: string }>;
+    capabilities?: { max_skills?: number; supports_custom_skills?: boolean };
+  };
+  preflight_revision: number | null;
+  preflight_fingerprint: string;
+  hh_resume_id: string;
+  hh_resume_url: string;
+  hh_status: string;
+  updated_at: string;
+};
+
 export type NeedsFieldsResult = {
   status: "NEEDS_FIELDS";
   missing_fields: string[];
@@ -134,7 +189,7 @@ export type Operation = {
   error_text: string;
 };
 
-export type OperationStart = { operation_id: string; status?: string };
+export type OperationStart = { operation_id: string; status?: string; attempt_id?: string; reused?: boolean };
 export type AutomationStartResult = { account_id: number; status: string; message?: string };
 export type LoginFlowStatus =
   | "WAITING_FOR_CAPTCHA"

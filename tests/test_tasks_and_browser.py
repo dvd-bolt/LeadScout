@@ -111,7 +111,7 @@ async def test_real_browser_context_close_releases_global_slot(monkeypatch):
 
 @pytest.mark.parametrize(
     "body,expected",
-    [("<main>Пройдите проверку CAPTCHA</main>", "ERROR"), ("<main>У вас пока нет резюме</main>", "SUCCESS")],
+    [("<main>Пройдите проверку CAPTCHA</main>", "NEEDS_ACTION"), ("<main>У вас пока нет резюме</main>", "SUCCESS")],
 )
 async def test_resume_sync_only_clears_confirmed_empty_lists(isolated_db, monkeypatch, body, expected):
     account = await database.create_hh_account(42, "sync-check@example.com")
@@ -130,7 +130,7 @@ async def test_resume_sync_only_clears_confirmed_empty_lists(isolated_db, monkey
             result = await HHResumeManager.fetch_user_resumes(42, account["id"])
             assert result["status"] == expected
             snapshots = await database.list_resume_snapshots(42, account["id"])
-            assert len(snapshots) == (1 if expected == "ERROR" else 0)
+            assert len(snapshots) == (1 if expected == "NEEDS_ACTION" else 0)
         finally:
             await browser.close()
 

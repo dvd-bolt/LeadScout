@@ -45,6 +45,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 SESSION_ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY", "").strip()
 APP_URL = os.getenv("APP_URL", "").strip().rstrip("/")
+APP_VERSION = os.getenv("APP_VERSION", "dev").strip() or "dev"
 WEB_APP_ORIGINS = tuple(
     origin.strip().rstrip("/") for origin in os.getenv("WEB_APP_ORIGINS", APP_URL).split(",") if origin.strip()
 )

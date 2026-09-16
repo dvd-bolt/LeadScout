@@ -21,6 +21,7 @@ async def initialize(context: AppContext) -> tuple[int, int]:
         context.storage_ready = True
         await context.admin_store.bootstrap(context.settings.root_admin_telegram_id, context.settings.allowed_owner_ids)
         operations = await context.db.recover_interrupted_operations()
+        await context.db.recover_interrupted_resume_publishes()
         questionnaires = await context.db.recover_interrupted_questionnaires()
         await context.admin_store.recover_tasks()
         await context.admin.recover()
