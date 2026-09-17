@@ -66,3 +66,26 @@ export function applicationStageLabel(stage?: string) {
     default: return stage || "";
   }
 }
+
+export function resumeStatusLabel(status: string) {
+  return ({
+    DRAFT: "Черновик", PARSING: "Распознаётся", READY: "Готов к проверке",
+    PUBLISHING: "Публикуется", COMPLETED: "Опубликован", NEEDS_INPUT: "Нужно заполнить",
+    NEEDS_REVIEW: "Нужна проверка", FAILED: "Ошибка",
+  } as Record<string, string>)[status] || "Неизвестное состояние";
+}
+
+export function resumeStepLabel(step: string) {
+  return ({
+    profession: "Профессия", personal: "Личные данные", contacts: "Контакты",
+    conditions: "Условия", skills: "Навыки", experience: "Опыт", education: "Образование",
+    languages: "Языки", additional: "Дополнительно", about: "О себе", review: "Проверка",
+  } as Record<string, string>)[step] || "Проверка";
+}
+
+export function auditCategoryLabel(category: string) {
+  return ({
+    hard_skills: "Профессиональные навыки", impact_metrics: "Результаты и метрики",
+    parseability: "Читаемость", timeline: "Хронология", style: "Стиль",
+  } as Record<string, string>)[category] || category.replaceAll("_", " ");
+}

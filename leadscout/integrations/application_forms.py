@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 from collections.abc import Awaitable, Callable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from patchright.async_api import Locator, Page
 
+from leadscout.integrations.ai.client import AIServiceError
 from leadscout.integrations.vacancies import extract_vacancy_details, vacancy_id_from_url, vacancy_page_status
 from leadscout.models.questions import FormAnswer, JobApplicationPayload, QuestionField
 from utils.humanization import (
@@ -62,6 +65,32 @@ async def _is_visible(locator: Locator) -> bool:
     return await locator.count() > 0 and await locator.is_visible()
 
 
+def _attribute_proves_resume(value: str | None, target_resume_id: str) -> bool:
+    if not value:
+        return False
+    value = str(value).strip()
+    if value == target_resume_id:
+        return True
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.path.rstrip("/").endswith(f"/resume/{target_resume_id}"):
+        return True
+    return any(target_resume_id == candidate for values in parse_qs(parsed.query).values() for candidate in values)
+
+
+async def _response_button_proves_resume(response_button: Locator, target_resume_id: str | None) -> bool:
+    if not target_resume_id:
+        return False
+    values = [
+        await response_button.get_attribute("href"),
+        await response_button.get_attribute("data-resume-id"),
+        await response_button.get_attribute("value"),
+    ]
+    return any(_attribute_proves_resume(value, target_resume_id) for value in values)
+
+
 async def handle_resume_selection_if_needed(page: Page, target_resume_id: str | None = None) -> bool:
     """Select only the recorded hh.ru resume ID; order and title are unsafe fallbacks."""
     selector = page.locator(DATA_QA["resume_selector"]).first
@@ -81,13 +110,7 @@ async def handle_resume_selection_if_needed(page: Page, target_resume_id: str | 
         )
         matches = False
         for value in attributes:
-            if value == target_resume_id:
-                matches = True
-                break
-            try:
-                matches = urlsplit(str(value)).path.rstrip("/").endswith(f"/resume/{target_resume_id}")
-            except ValueError:
-                continue
+            matches = _attribute_proves_resume(str(value), target_resume_id)
             if matches:
                 break
         if not matches:
@@ -116,6 +139,7 @@ async def handle_resume_selection_if_needed(page: Page, target_resume_id: str | 
 async def extract_questionnaire_fields(page: Page) -> list[QuestionField]:
     containers = page.locator(DATA_QA["question"])
     fields: list[QuestionField] = []
+    seen_ids: dict[str, int] = {}
     for index in range(min(await containers.count(), 50)):
         container = containers.nth(index)
         label = ((await container.text_content()) or "").strip()
@@ -125,10 +149,16 @@ async def extract_questionnaire_fields(page: Page) -> list[QuestionField]:
         answer_type: str = "text"
         required = "*" in label
         options: list[str] = []
+        stable_source = label.casefold()
         if await inputs.count() > 0:
             first = inputs.first
             input_type = ((await first.get_attribute("type")) or "text").lower()
             tag_name = await first.evaluate("el => el.tagName.toLowerCase()")
+            attributes = await first.evaluate(
+                """element => [element.name, element.id, element.getAttribute('data-qa')]
+                    .filter(Boolean).join('|')"""
+            )
+            stable_source = f"{attributes}|{stable_source}"
             if input_type in {"radio", "checkbox"}:
                 answer_type = input_type
                 labels = container.locator("label")
@@ -138,11 +168,24 @@ async def extract_questionnaire_fields(page: Page) -> list[QuestionField]:
                         options.append(text)
             elif tag_name == "textarea":
                 answer_type = "textarea"
+            elif tag_name == "select":
+                answer_type = "select"
+                option_nodes = first.locator("option")
+                for option_index in range(min(await option_nodes.count(), 30)):
+                    text = ((await option_nodes.nth(option_index).text_content()) or "").strip()
+                    if text and text not in options:
+                        options.append(text)
+            elif input_type not in {"text", "email", "tel", "number", "url", "date", "search"}:
+                answer_type = "unsupported"
             required = required or (await first.get_attribute("required") is not None)
             required = required or (await first.get_attribute("aria-required") == "true")
+        base_id = f"q-{hashlib.sha256(stable_source.encode('utf-8')).hexdigest()[:16]}"
+        duplicate_index = seen_ids.get(base_id, 0)
+        seen_ids[base_id] = duplicate_index + 1
+        field_id = base_id if duplicate_index == 0 else f"{base_id}-{duplicate_index + 1}"
         fields.append(
             QuestionField(
-                field_id=f"q{index}",
+                field_id=field_id,
                 label=label[:1000],
                 answer_type=answer_type,
                 required=required,
@@ -152,12 +195,32 @@ async def extract_questionnaire_fields(page: Page) -> list[QuestionField]:
     return fields
 
 
+def questionnaire_schema_fingerprint(questions: list[QuestionField] | list[dict]) -> str:
+    normalized = [
+        question.model_dump() if isinstance(question, QuestionField) else QuestionField.model_validate(question).model_dump()
+        for question in questions
+    ]
+    value = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _remap_positional_answers(payload: JobApplicationPayload, questions: list[QuestionField]) -> None:
+    """Accept old q0/q1 AI output while storing stable field identifiers."""
+    for answer in payload.answers:
+        index = _question_index(answer.field_id)
+        if index is not None and index < len(questions):
+            answer.field_id = questions[index].field_id
+
+
 def _question_index(field_id: str) -> int | None:
+    """Legacy positional ID parser kept for older callers and saved drafts."""
     return int(field_id[1:]) if field_id.startswith("q") and field_id[1:].isdigit() else None
 
 
 async def fill_questionnaire_form(page: Page, answers: list[dict | FormAnswer]) -> bool:
     containers = page.locator(DATA_QA["question"])
+    current_questions = await extract_questionnaire_fields(page)
+    positions = {question.field_id: index for index, question in enumerate(current_questions)}
     all_filled = True
     for raw_answer in answers:
         try:
@@ -165,7 +228,9 @@ async def fill_questionnaire_form(page: Page, answers: list[dict | FormAnswer]) 
         except Exception:
             all_filled = False
             continue
-        index = _question_index(answer.field_id)
+        index = positions.get(answer.field_id)
+        if index is None:
+            index = _question_index(answer.field_id)
         if index is None or index >= await containers.count():
             all_filled = False
             continue
@@ -176,28 +241,51 @@ async def fill_questionnaire_form(page: Page, answers: list[dict | FormAnswer]) 
                 if not await _is_visible(input_locator):
                     all_filled = False
                     continue
-                await human_type(page, input_locator, answer.value)
+                await human_type(page, input_locator, str(answer.value))
+            elif answer.answer_type == "select":
+                input_locator = container.locator("select").first
+                if not await _is_visible(input_locator) or not isinstance(answer.value, str):
+                    all_filled = False
+                    continue
+                try:
+                    await input_locator.select_option(label=answer.value)
+                except Exception:
+                    await input_locator.select_option(value=answer.value)
             else:
                 input_locator = None
+                requested = answer.value if isinstance(answer.value, list) else [answer.value]
+                if answer.answer_type == "checkbox":
+                    choices = container.locator('input[type="checkbox"]')
+                    for choice_index in range(await choices.count()):
+                        choice = choices.nth(choice_index)
+                        value = (await choice.get_attribute("value") or "").strip()
+                        label = choice.locator("xpath=ancestor::label[1]")
+                        label_text = ((await label.text_content()) or "").strip() if await label.count() else ""
+                        if await choice.is_checked() and value not in requested and label_text not in requested:
+                            await human_click(page, label if await label.count() else choice)
                 labels = container.locator("label")
-                for label_index in range(await labels.count()):
-                    label = labels.nth(label_index)
-                    if ((await label.text_content()) or "").strip() == answer.value:
-                        candidate = label.locator('input[type="radio"], input[type="checkbox"]').first
-                        if await candidate.count() > 0:
-                            await human_click(page, label)
-                            input_locator = candidate
-                            break
-                if input_locator is None:
-                    inputs = container.locator('input[type="radio"], input[type="checkbox"]')
-                    for input_index in range(await inputs.count()):
-                        candidate = inputs.nth(input_index)
-                        if await candidate.get_attribute("value") == answer.value:
-                            await human_click(page, candidate)
-                            input_locator = candidate
-                            break
-                if input_locator is None or not await input_locator.is_checked():
-                    all_filled = False
+                for requested_value in requested:
+                    input_locator = None
+                    for label_index in range(await labels.count()):
+                        label = labels.nth(label_index)
+                        if ((await label.text_content()) or "").strip() == requested_value:
+                            candidate = label.locator('input[type="radio"], input[type="checkbox"]').first
+                            if await candidate.count() > 0:
+                                if not await candidate.is_checked():
+                                    await human_click(page, label)
+                                input_locator = candidate
+                                break
+                    if input_locator is None:
+                        options = container.locator('input[type="radio"], input[type="checkbox"]')
+                        for input_index in range(await options.count()):
+                            candidate = options.nth(input_index)
+                            if await candidate.get_attribute("value") == requested_value:
+                                if not await candidate.is_checked():
+                                    await human_click(page, candidate)
+                                input_locator = candidate
+                                break
+                    if input_locator is None or not await input_locator.is_checked():
+                        all_filled = False
         except Exception as exc:
             logger.warning("Question field %s could not be filled: %s", answer.field_id, type(exc).__name__)
             all_filled = False
@@ -209,13 +297,20 @@ def questionnaire_requires_confirmation(questions: list[QuestionField], payload:
     if not payload.can_auto_submit or payload.confidence_score < 0.85:
         return True
     for question in questions:
+        if question.answer_type == "unsupported":
+            return True
         lowered = question.label.lower()
         if any(marker in lowered for marker in MANUAL_QUESTION_MARKERS):
             return True
         answer = answer_map.get(question.field_id)
-        if question.required and (answer is None or not answer.value.strip()):
+        if question.required and (
+            answer is None
+            or (isinstance(answer.value, str) and not answer.value.strip())
+            or (isinstance(answer.value, list) and not answer.value)
+        ):
             return True
-        if answer and question.options and answer.value not in question.options:
+        values = answer.value if answer and isinstance(answer.value, list) else [answer.value] if answer else []
+        if answer and question.options and any(value not in question.options for value in values):
             return True
         if answer and answer.answer_type != question.answer_type:
             return True
@@ -223,8 +318,8 @@ def questionnaire_requires_confirmation(questions: list[QuestionField], payload:
 
 
 def effective_cover_letter(generated: str, send_cover_letter: bool) -> str:
-    """hh.ru requires a non-empty letter field; disabled mode intentionally sends a dot."""
-    return generated if send_cover_letter else "."
+    """Return a real letter or omit it entirely when the user disabled letters."""
+    return generated if send_cover_letter else ""
 
 
 async def verify_hh_application_success(page: Page) -> bool:
@@ -243,6 +338,17 @@ async def verify_hh_application_success(page: Page) -> bool:
 
 
 async def _open_letter_and_fill(page: Page, cover_letter: str) -> bool:
+    if not cover_letter.strip():
+        input_locator = page.locator(DATA_QA["letter_input"]).first
+        if not await _is_visible(input_locator):
+            return True
+        if (
+            await input_locator.get_attribute("required") is not None
+            or await input_locator.get_attribute("aria-required") == "true"
+        ):
+            return False
+        await input_locator.fill("")
+        return await input_locator.input_value() == ""
     toggle = page.locator(DATA_QA["letter_toggle"]).first
     if await _is_visible(toggle):
         await human_click(page, toggle)
@@ -339,9 +445,20 @@ async def apply_to_hh_vacancy(
         await _trace_stage(trace, "AI_PREPARATION")
         try:
             payload = await ai.generate_hh_job_application(resume_context, vacancy["description"], [])
+        except AIServiceError as exc:
+            logger.warning("AI application preparation failed: %s", exc.code)
+            return "ERROR_AI", None, {
+                **vacancy,
+                "reason": f"{exc}. Повторите подготовку отклика позже.",
+                "retryable": exc.retryable,
+            }
         except Exception:
             logger.warning("AI application preparation failed")
-            return "ERROR_AI", None, vacancy
+            return "ERROR_AI", None, {
+                **vacancy,
+                "reason": "ИИ не подготовил отклик. Повторите попытку позже.",
+                "retryable": True,
+            }
         payload.cover_letter = effective_cover_letter(payload.cover_letter, send_cover_letter)
         if not payload.is_relevant:
             return (
@@ -356,6 +473,11 @@ async def apply_to_hh_vacancy(
         response_button = page.locator(DATA_QA["response"]).first
         if not await _is_visible(response_button):
             return "ERROR_NO_BUTTON", None, vacancy
+        if not await _response_button_proves_resume(response_button, target_resume_id):
+            return "ERROR_RESUME_SELECTION", None, {
+                **vacancy,
+                "reason": "Кнопка мгновенного отклика не подтверждает выбранное резюме.",
+            }
         await _trace_stage(trace, "SUBMITTING")
         await human_click(page, response_button)
         await page.wait_for_timeout(1500)
@@ -376,9 +498,21 @@ async def apply_to_hh_vacancy(
             await _trace_stage(trace, "AI_PREPARATION")
             try:
                 payload = await ai.generate_hh_job_application(resume_context, vacancy["description"], questions)
+            except AIServiceError as exc:
+                logger.warning("AI questionnaire preparation failed: %s", exc.code)
+                return "ERROR_AI", None, {
+                    **vacancy,
+                    "reason": f"{exc}. Повторите подготовку анкеты позже.",
+                    "retryable": exc.retryable,
+                }
             except Exception:
                 logger.warning("AI questionnaire preparation failed")
-                return "ERROR_AI", None, vacancy
+                return "ERROR_AI", None, {
+                    **vacancy,
+                    "reason": "ИИ не подготовил ответы анкеты. Повторите попытку позже.",
+                    "retryable": True,
+                }
+            _remap_positional_answers(payload, questions)
             payload.cover_letter = effective_cover_letter(
                 payload.cover_letter,
                 send_cover_letter,
@@ -400,7 +534,10 @@ async def apply_to_hh_vacancy(
                 {
                     "vacancy": vacancy,
                     "questions": [question.model_dump() for question in questions],
-                    "ai_payload": payload.model_dump(),
+                    "ai_payload": {
+                        **payload.model_dump(),
+                        "question_schema_fingerprint": questionnaire_schema_fingerprint(questions),
+                    },
                 },
             )
         if payload.answers and not await fill_questionnaire_form(page, payload.answers):
@@ -410,7 +547,10 @@ async def apply_to_hh_vacancy(
                 {
                     "vacancy": vacancy,
                     "questions": [question.model_dump() for question in questions],
-                    "ai_payload": payload.model_dump(),
+                    "ai_payload": {
+                        **payload.model_dump(),
+                        "question_schema_fingerprint": questionnaire_schema_fingerprint(questions),
+                    },
                 },
             )
 
@@ -435,6 +575,7 @@ async def submit_approved_questionnaire(
     cover_letter: str,
     answers: list[dict] | None = None,
     target_resume_id: str | None = None,
+    expected_questions: list[dict] | None = None,
     *,
     trace: TraceCallback | None = None,
 ) -> tuple[bool, str]:
@@ -456,12 +597,19 @@ async def submit_approved_questionnaire(
         response_button = page.locator(DATA_QA["response"]).first
         if not await _is_visible(response_button):
             return False, "Кнопка отклика не найдена."
+        if not await _response_button_proves_resume(response_button, target_resume_id):
+            return False, "Мгновенный отклик не подтверждает выбранное резюме; отправьте его вручную."
         await human_click(page, response_button)
         await page.wait_for_timeout(1200)
         if not await _is_hh_location(page.url):
             return False, "Вакансия перенаправляет на внешний сайт."
         if not await handle_resume_selection_if_needed(page, target_resume_id):
             return False, "Выбранное резюме не найдено в форме отклика."
+        current_questions = await extract_questionnaire_fields(page)
+        if expected_questions is not None and questionnaire_schema_fingerprint(
+            current_questions
+        ) != questionnaire_schema_fingerprint(expected_questions):
+            return False, "Вопросы анкеты изменились. Обновите анкету и подтвердите ответы заново."
         await _trace_stage(trace, "FILLING")
         if answers and not await fill_questionnaire_form(page, answers):
             return False, "Не удалось заполнить все поля анкеты."
@@ -501,6 +649,7 @@ __all__ = [
     "fill_questionnaire_form",
     "handle_resume_selection_if_needed",
     "questionnaire_requires_confirmation",
+    "questionnaire_schema_fingerprint",
     "submit_approved_questionnaire",
     "verify_hh_application_success",
 ]

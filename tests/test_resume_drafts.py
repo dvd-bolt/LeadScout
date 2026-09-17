@@ -129,6 +129,9 @@ async def test_profile_conflicts_require_exact_preflight_revision(runtime_contex
     data["personal"].update(
         {"first_name": "Анна", "last_name": "Смирнова", "birth_date": "1991-02-03", "city": "Санкт-Петербург"}
     )
+    data["publication"].update(
+        {"visibility": "Виден всем работодателям", "target_account_confirmed": True}
+    )
     draft = await service.create(42, account["id"], "MANUAL", data)
 
     result = await service.preflight(42, account["id"], draft["id"])

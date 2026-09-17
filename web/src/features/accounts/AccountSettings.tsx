@@ -60,7 +60,7 @@ export function AccountSettings({ account }: { account: Account }) {
       <Button disabled={update.isPending} type="submit">Сохранить настройки</Button>
     </form>
     <Button className={`${styles.secondary} ${styles.dangerButton}`} disabled={remove.isPending} onClick={() => {
-      if (window.confirm(`Удалить аккаунт «${account.account_name}» и его локальные данные?`)) remove.mutate();
+      if (window.confirm(`Удалить аккаунт «${account.account_name}», его сессию, резюме и историю откликов? Независимые ИИ-аудиты сохранятся.`)) remove.mutate();
     }}>Удалить аккаунт</Button>
   </section>;
 }

@@ -119,11 +119,26 @@ class ApplicationAttemptTracer:
 
     @classmethod
     async def start(
-        cls, dependencies: Any, user_id: int, account_id: int, vacancy_hh_id: str, vacancy_title: str = ""
+        cls,
+        dependencies: Any,
+        user_id: int,
+        account_id: int,
+        vacancy_hh_id: str,
+        vacancy_title: str = "",
+        *,
+        resume_snapshot_id: int | None = None,
+        resume_hh_id: str = "",
+        resume_title: str = "",
     ) -> "ApplicationAttemptTracer | None":
         try:
             attempt_id = await dependencies.create_application_attempt(
-                user_id, account_id, vacancy_hh_id, vacancy_title
+                user_id,
+                account_id,
+                vacancy_hh_id,
+                vacancy_title,
+                resume_snapshot_id=resume_snapshot_id,
+                resume_hh_id=resume_hh_id,
+                resume_title=resume_title,
             )
         except Exception:
             logging.getLogger(__name__).warning("Could not create application diagnostic record")

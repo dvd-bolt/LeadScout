@@ -273,9 +273,63 @@ async def test_unknown_result_blocks_search_retry_without_opening_external_form(
 
     result = await job.run(10, account["id"])
 
-    assert result == {"status": "SUCCESS", "processed": 0}
+    assert result["status"] == "SUCCESS"
+    assert result["processed"] == 0
+    assert result["search_errors"] == []
     apply.assert_not_awaited()
     assert (await database.list_application_events(10, account_id=account["id"]))[0]["status"] == "SKIPPED_NEEDS_REVIEW"
+
+
+async def test_restart_recovers_submit_attempt_and_allows_presubmit_retry(runtime_context):
+    await database.get_or_create_user(10)
+    account = await database.create_hh_account(10, "restart-attempt@example.test")
+    uncertain = await database.create_application_attempt(
+        10, account["id"], "https://hh.ru/vacancy/123", "Uncertain"
+    )
+    retryable = await database.create_application_attempt(
+        10, account["id"], "https://hh.ru/vacancy/124", "Retryable"
+    )
+    await database.update_application_attempt(uncertain, 10, account["id"], "SUBMITTING")
+    await database.update_application_attempt(retryable, 10, account["id"], "FILLING")
+
+    assert await runtime_context.db.recover_interrupted_application_attempts() == 2
+    assert await database.has_unresolved_application_attempt(10, account["id"], "123") is True
+    assert await database.has_unresolved_application_attempt(10, account["id"], "124") is False
+    events = await database.list_application_events(10, account_id=account["id"])
+    assert [(item["vacancy_hh_id"], item["status"]) for item in events] == [
+        ("123", "ERROR_SUBMIT_UNCONFIRMED")
+    ]
+
+
+async def test_resolution_updates_only_exact_vacancy_questionnaire(runtime_context):
+    await database.get_or_create_user(10)
+    account = await database.create_hh_account(10, "exact-vacancy@example.test")
+    ids = []
+    for vacancy_id in ("123", "1234"):
+        item_id = await database.save_pending_questionnaire_account(
+            10,
+            account["id"],
+            f"https://hh.ru/vacancy/{vacancy_id}",
+            vacancy_id,
+            "",
+            [],
+            {"answers": []},
+        )
+        await database.finish_pending_questionnaire(10, item_id, "NEEDS_REVIEW")
+        ids.append(item_id)
+    attempt_id = await database.create_application_attempt(
+        10, account["id"], "https://hh.ru/vacancy/123", "Role"
+    )
+    await database.update_application_attempt(
+        attempt_id, 10, account["id"], "SUBMITTING", outcome="ERROR_SUBMIT_UNCONFIRMED"
+    )
+
+    await database.resolve_application_attempt(10, attempt_id, applied=True)
+
+    first = await database.get_pending_questionnaire_for_user(10, ids[0])
+    second = await database.get_pending_questionnaire_for_user(10, ids[1])
+    assert first["status"] == "SUBMITTED"
+    assert second["status"] == "NEEDS_REVIEW"
 
 
 @pytest.mark.asyncio

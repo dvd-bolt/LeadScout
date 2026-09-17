@@ -263,7 +263,7 @@ async def test_patchright_fixture_questionnaire_and_success_detection():
             """
         )
         fields = await extract_questionnaire_fields(page)
-        assert fields[0].field_id == "q0"
+        assert fields[0].field_id.startswith("q-")
         assert fields[0].required
         assert fields[0].options == ["Да", "Нет"]
         assert await fill_questionnaire_form(
@@ -375,7 +375,7 @@ async def test_direct_response_does_not_report_an_unsubmitted_cover_letter(monke
                 <meta charset="utf-8">
                 <h1 data-qa="vacancy-title">Python developer</h1>
                 <div data-qa="vacancy-description">Python FastAPI backend</div>
-                <button data-qa="vacancy-response-link-top"
+                <button data-qa="vacancy-response-link-top" data-resume-id="resume-124"
                         onclick="window.responseClicked=true">Откликнуться</button>
                 """,
                 content_type="text/html",
@@ -385,6 +385,7 @@ async def test_direct_response_does_not_report_an_unsubmitted_cover_letter(monke
             page,
             "Python backend developer with FastAPI production experience",
             "https://hh.ru/vacancy/124",
+            target_resume_id="resume-124",
             send_cover_letter=False,
         )
         assert status == "APPLIED_DIRECT"
@@ -468,7 +469,7 @@ async def test_modal_questionnaire_pipeline_fills_and_confirms(monkeypatch):
                 <meta charset="utf-8">
                 <h1 data-qa="vacancy-title">Python developer</h1>
                 <div data-qa="vacancy-description">Python FastAPI backend</div>
-                <button data-qa="vacancy-response-link-top"
+                <button data-qa="vacancy-response-link-top" data-resume-id="resume-125"
                   onclick="document.querySelector('#form').hidden=false">Откликнуться</button>
                 <div id="form" role="dialog" hidden>
                   <div data-qa="general-form-element">
@@ -488,6 +489,7 @@ async def test_modal_questionnaire_pipeline_fills_and_confirms(monkeypatch):
             page,
             "Python backend developer with FastAPI production experience",
             "https://hh.ru/vacancy/125",
+            target_resume_id="resume-125",
         )
         assert status == "APPLIED_WITH_LETTER", (confirmation_results, fill_results)
         assert confirmation_results == [False]

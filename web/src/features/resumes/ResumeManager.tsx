@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../shared/http/api";
 import { errorMessage, formatDate } from "../../shared/lib/format";
@@ -12,17 +12,36 @@ export function ResumeManager({ dashboard, highlightedSnapshotId }: { dashboard:
   const accountId = dashboard.active_account_id!;
   const client = useQueryClient();
   const [operationId, setOperationId] = useState<string | null>(null);
+  const terminalOperation = useRef<string | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
   const resumes = useQuery({ queryKey: ["resumes", accountId], queryFn: () => api.resumes(accountId) });
+  const activeSync = useQuery({
+    queryKey: ["operations", "resume-sync", accountId],
+    queryFn: () => api.operations({ kind: "resume-sync", accountId, resource: String(accountId) }),
+    refetchInterval: (query) => query.state.data?.length ? 3000 : false,
+  });
+  useEffect(() => {
+    const current = activeSync.data?.[0];
+    if (current && !operationId && current.id !== terminalOperation.current) setOperationId(current.id);
+  }, [activeSync.data, operationId]);
   const handleError = (error: unknown) => setNotice({ text: errorMessage(error), error: true });
   const select = useMutation({
     mutationFn: (id: number) => api.activateResume(accountId, id),
     onSuccess: () => client.invalidateQueries({ queryKey: ["dashboard"] }),
     onError: handleError,
   });
-  const sync = useMutation({ mutationFn: () => api.syncResumes(accountId), onSuccess: (data) => { setNotice(null); setOperationId(data.operation_id); }, onError: handleError });
-  const remove = useMutation({ mutationFn: (id: number) => api.deleteResume(accountId, id), onSuccess: (data) => { setNotice(null); setOperationId(data.operation_id); }, onError: handleError });
+  const sync = useMutation({ mutationFn: () => api.syncResumes(accountId), onSuccess: (data) => { terminalOperation.current = null; setNotice(null); setOperationId(data.operation_id); }, onError: handleError });
+  const remove = useMutation({ mutationFn: (id: number) => api.deleteResume(accountId, id), onSuccess: (data) => { terminalOperation.current = null; setNotice(null); setOperationId(data.operation_id); }, onError: handleError });
   const handleTerminal = (operation: Operation) => {
+    terminalOperation.current = operation.id;
+    const message = typeof operation.result.message === "string"
+      ? operation.result.message
+      : operation.error_text;
+    if (message) {
+      setNotice({ text: message, error: !operationSucceeded(operation) });
+    }
+    setOperationId(null);
+    void activeSync.refetch();
     if (operationSucceeded(operation)) {
       client.invalidateQueries({ queryKey: ["resumes", accountId] });
       client.invalidateQueries({ queryKey: ["dashboard"] });
@@ -30,7 +49,7 @@ export function ResumeManager({ dashboard, highlightedSnapshotId }: { dashboard:
   };
 
   return <section className={styles.card}>
-    <div className={styles.cardHeader}><h2>Резюме hh.ru</h2><Button className={styles.secondary} disabled={sync.isPending} onClick={() => sync.mutate()}>Синхронизировать</Button></div>
+    <div className={styles.cardHeader}><h2>Резюме hh.ru</h2><Button className={styles.secondary} disabled={sync.isPending || Boolean(activeSync.data?.length)} onClick={() => sync.mutate()}>Синхронизировать</Button></div>
     <Message notice={resumes.isError ? { text: resumes.error.message, error: true } : notice} />
     <OperationStatus operationId={operationId} scopeKey={accountId} onTerminal={handleTerminal} />
     <ResumeImport accountId={accountId} />

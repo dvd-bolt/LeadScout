@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../shared/http/api";
-import { errorMessage, formatDate } from "../../shared/lib/format";
+import { errorMessage, formatDate, resumeStatusLabel, resumeStepLabel } from "../../shared/lib/format";
 import type { Operation, ResumeDraft } from "../../shared/types/api";
 import { Button, Message, type Notice } from "../../shared/ui";
 import { OperationStatus } from "../../shared/ui/OperationStatus";
@@ -12,23 +12,52 @@ export function ResumeImport({ accountId }: { accountId: number }) {
   const client = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
   const autoOpenedAccount = useRef<number | null>(null);
+  const terminalOperation = useRef<string | null>(null);
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [operationId, setOperationId] = useState<string | null>(null);
-  const [pendingDraftId, setPendingDraftId] = useState<number | null>(null);
+  const operationKey = `leadscout:operation:pdf:${accountId}`;
+  const pendingKey = `leadscout:operation:pdf-draft:${accountId}`;
+  const [operationId, setOperationId] = useState<string | null>(() => sessionStorage.getItem(operationKey));
+  const [pendingDraftId, setPendingDraftId] = useState<number | null>(() => {
+    const value = Number(sessionStorage.getItem(pendingKey));
+    return value > 0 ? value : null;
+  });
   const [notice, setNotice] = useState<Notice>(null);
+  const activeExtract = useQuery({
+    queryKey: ["operations", "resume-draft-extract", accountId],
+    queryFn: () => api.operations({ kind: "resume-draft-extract", accountId }),
+    refetchInterval: (query) => query.state.data?.length ? 2500 : false,
+  });
   const drafts = useQuery({
     queryKey: ["resume-drafts", accountId],
     queryFn: () => api.resumeDrafts(accountId),
+    refetchInterval: (query) => query.state.data?.some((item) => item.status === "PARSING") ? 2500 : false,
   });
   const selected = drafts.data?.find((item) => item.id === selectedId) ?? null;
 
   useEffect(() => {
+    const active = activeExtract.data?.[0];
+    if (!active || operationId || active.id === terminalOperation.current) return;
+    const draftId = Number(active.resource);
+    setOperationId(active.id);
+    if (draftId > 0) setPendingDraftId(draftId);
+  }, [activeExtract.data, operationId]);
+
+  useEffect(() => {
     autoOpenedAccount.current = null;
     setSelectedId(null);
-    setPendingDraftId(null);
-    setOperationId(null);
+    const restoredOperation = sessionStorage.getItem(`leadscout:operation:pdf:${accountId}`);
+    const restoredDraft = Number(sessionStorage.getItem(`leadscout:operation:pdf-draft:${accountId}`));
+    setPendingDraftId(restoredDraft > 0 ? restoredDraft : null);
+    setOperationId(restoredOperation);
     setNotice(null);
   }, [accountId]);
+
+  useEffect(() => {
+    if (operationId) sessionStorage.setItem(operationKey, operationId);
+    else sessionStorage.removeItem(operationKey);
+    if (pendingDraftId) sessionStorage.setItem(pendingKey, String(pendingDraftId));
+    else sessionStorage.removeItem(pendingKey);
+  }, [operationId, operationKey, pendingDraftId, pendingKey]);
 
   useEffect(() => {
     if (autoOpenedAccount.current === accountId || selectedId !== null || pendingDraftId !== null || !drafts.data?.length) return;
@@ -68,6 +97,7 @@ export function ResumeImport({ accountId }: { accountId: number }) {
       setPendingDraftId(draftId);
       await refresh();
       const result = await api.extractResumePdf(accountId, draftId, file);
+      terminalOperation.current = null;
       setOperationId(result.operation_id);
       setNotice({ text: "PDF принят. Распознаю данные в локальный черновик.", tone: "info" });
     } catch (error) {
@@ -79,11 +109,13 @@ export function ResumeImport({ accountId }: { accountId: number }) {
   };
 
   const terminal = async (operation: Operation) => {
+    terminalOperation.current = operation.id;
     await refresh();
     const parsed = operation.status === "SUCCEEDED" && "code" in operation.result && operation.result.code === "PDF_PARSED";
     if (parsed && pendingDraftId !== null) setSelectedId(pendingDraftId);
     setPendingDraftId(null);
     setOperationId(null);
+    void activeExtract.refetch();
     const message = typeof operation.result.message === "string" ? operation.result.message : operation.error_text;
     setNotice(message ? { text: message, error: !parsed, tone: parsed ? "success" : "warning" } : null);
   };
@@ -126,7 +158,7 @@ export function ResumeImport({ accountId }: { accountId: number }) {
         return <article className={styles.resume} key={draft.id}>
         <div className={styles.row}>
           <div><div className={styles.resumeTitle}>{draft.data.profession.title || `Черновик №${draft.id}`}</div>
-            <div className={styles.meta}>{draft.status} · шаг «{draft.current_step}» · {formatDate(draft.updated_at)}</div>
+            <div className={styles.meta}>{resumeStatusLabel(draft.status)} · шаг «{resumeStepLabel(draft.current_step)}» · {formatDate(draft.updated_at)}</div>
           </div>
           {!needsPdfUpload ? <Button className={styles.secondary} disabled={parsing} onClick={() => setSelectedId(draft.id)}>{draft.status === "COMPLETED" ? "Посмотреть" : parsing ? "Распознавание…" : "Продолжить"}</Button> : null}
         </div>

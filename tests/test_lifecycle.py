@@ -14,7 +14,7 @@ from leadscout.runtime import build_context
 from leadscout.runtime.lifecycle import initialize, shutdown
 from leadscout.runtime.runner import run_application
 from leadscout.runtime.scheduler import start_scheduler
-from leadscout.storage import Database
+from leadscout.storage import SCHEMA_VERSION, Database
 
 
 def test_direct_system_python_launch_restarts_in_project_venv(monkeypatch):
@@ -198,7 +198,7 @@ async def test_initialize_logs_ready_schema_version(tmp_path, caplog):
     caplog.set_level("INFO", logger="leadscout.runtime.lifecycle")
     try:
         await initialize(context)
-        assert "DB_SCHEMA_READY version=9" in caplog.text
+        assert f"DB_SCHEMA_READY version={SCHEMA_VERSION}" in caplog.text
     finally:
         await shutdown(context)
 
@@ -208,7 +208,9 @@ async def test_scheduler_uses_moscow_single_instance_jobs(runtime_context):
     runtime_context.scheduler = scheduler
     assert str(scheduler.timezone) == "Europe/Moscow"
     jobs = {job.id: job for job in scheduler.get_jobs()}
-    assert set(jobs) == {"hh_auto_search", "daily_reset", "admin_retention"}
+    assert set(jobs) == {
+        "hh_auto_search", "daily_reset", "admin_retention", "product_retention", "browser_idle_cleanup"
+    }
     assert all(job.max_instances == 1 and job.coalesce for job in jobs.values())
     assert jobs["hh_auto_search"].kwargs["db"] is runtime_context.db
     assert jobs["hh_auto_search"].kwargs["coordinator"] is runtime_context.coordinator

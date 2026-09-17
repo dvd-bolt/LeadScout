@@ -24,7 +24,11 @@ async def test_save_response_identifies_own_committed_draft(audit_client, runtim
         return result
 
     monkeypatch.setattr(db, "edit_pending_questionnaire", another_writer_after_commit)
-    saved = await audit_client.patch(f"/api/v1/questionnaires/{qid}", json={"cover_letter": "My reviewed draft"})
+    current = (await audit_client.get(f"/api/v1/questionnaires/{qid}")).json()
+    saved = await audit_client.patch(
+        f"/api/v1/questionnaires/{qid}",
+        json={"expected_revision": current["revision"], "cover_letter": "My reviewed draft"},
+    )
     assert saved.status_code == 200
     assert saved.json()["cover_letter"] == "My reviewed draft"
     assert saved.json()["revision"] == 1

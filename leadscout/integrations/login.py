@@ -451,6 +451,7 @@ class HHLoginManager:
         self.access = None
         self._sessions: dict[tuple[int, int | None], HHLoginSession] = {}
         self._cleanup_tasks: dict[tuple[int, int | None], asyncio.Task] = {}
+        self._last_results: dict[tuple[int, int | None], dict[str, Any]] = {}
 
     @staticmethod
     def _key(user_id: int, account_id: int | None) -> tuple[int, int | None]:
@@ -483,6 +484,7 @@ class HHLoginManager:
         if self._sessions.get(key) is not session:
             return
         self._sessions.pop(key, None)
+        self._last_results.pop(key, None)
         timer = self._cleanup_tasks.pop(key, None)
         if timer:
             timer.cancel()
@@ -491,8 +493,26 @@ class HHLoginManager:
             await session.abort()
 
     async def _finish_step(self, key: tuple[int, int | None], session: HHLoginSession, result: dict[str, Any]) -> dict[str, Any]:
+        if result.get("status") in _WAITING_STATUSES:
+            self._last_results[key] = dict(result)
         if result.get("status") not in _WAITING_STATUSES:
             await self._release_terminal(key, session)
+        return result
+
+    def active_flow(self, user_id: int) -> dict[str, Any] | None:
+        candidates = [
+            (key, session) for key, session in self._sessions.items()
+            if key[0] == user_id and not session.is_done
+        ]
+        if not candidates:
+            return None
+        key, session = max(candidates, key=lambda item: item[1].created_at)
+        result = dict(self._last_results.get(key) or {
+            "status": "STARTING",
+            "message": "hh.ru ещё обрабатывает начало входа.",
+        })
+        result["account_id"] = session.account_id
+        result["expires_in"] = max(0, int(600 - (time.time() - session.created_at)))
         return result
 
     @serialize_login
@@ -562,6 +582,7 @@ class HHLoginManager:
             timer.cancel()
             await asyncio.gather(timer, return_exceptions=True)
         session = self._sessions.pop(key, None)
+        self._last_results.pop(key, None)
         if session:
             await session.abort()
         elif account_id:
@@ -601,6 +622,7 @@ class HHLoginManager:
             await asyncio.gather(*timers, return_exceptions=True)
         sessions = list(self._sessions.values())
         self._sessions.clear()
+        self._last_results.clear()
         results = await asyncio.gather(*(session.abort() for session in sessions), return_exceptions=True)
         errors = [result for result in results if isinstance(result, Exception)]
         if errors:

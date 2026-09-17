@@ -65,14 +65,15 @@ export function AutomationControls({ active, accounts }: { active: Account; acco
   const busy = automation.isPending || startAll.isPending || stopAll.isPending;
   return <div className={local.controls}>
     <Message notice={notice} />
+    <p className={styles.meta}>Автопоиск сразу проверит вакансии и затем повторится примерно каждые 45 минут. LeadScout автоматически отправляет подходящие отклики с выбранным резюме до дневного лимита; анкеты с вопросами отправляются только при достаточной уверенности, остальные ждут вашей проверки.</p>
     {loginPending ? <div className={styles.meta}>Подключение аккаунта не завершено. Автоматизация станет доступна после входа.</div> : null}
-    <Button className={local.primary} aria-busy={automation.isPending} disabled={busy || loginPending || (!enabled && (!active.resume_ready || active.session_status !== "ACTIVE" || limitReached))} onClick={() => automation.mutate()}>
-      <Icon name={enabled ? "stop" : "play"} size={26} />{automation.isPending ? "Обновляем…" : enabled ? "Остановить поиск" : "Запустить поиск"}<Icon name="chevron" size={20} />
+    <Button className={local.primary} aria-label={enabled ? "Остановить автоматические отклики" : "Включить автоматические отклики каждые 45 минут"} aria-busy={automation.isPending} disabled={busy || loginPending || (!enabled && (!active.resume_ready || active.session_status !== "ACTIVE" || limitReached))} onClick={() => automation.mutate()}>
+      <Icon name={enabled ? "stop" : "play"} size={26} />{automation.isPending ? "Обновляем…" : enabled ? "Остановить автопоиск" : "Включить автопоиск"}<Icon name="chevron" size={20} />
     </Button>
     <Link to="/settings" className={`${styles.button} ${styles.secondary} ${local.parameters}`}><Icon name="sliders" size={26} />Параметры<Icon name="chevron" size={20} /></Link>
     <details className={local.all}><summary>Все аккаунты</summary>
       <div className={styles.actionRow}>
-        <Button className={styles.secondary} disabled={busy || accounts.length === 0 || accounts.some((item) => item.session_status === "AUTH_PENDING")} onClick={() => { setResults([]); startAll.mutate(); }}>Запустить все</Button>
+        <Button className={styles.secondary} disabled={busy || accounts.length === 0} onClick={() => { setResults([]); startAll.mutate(); }}>Запустить все</Button>
         <Button className={`${styles.secondary} ${styles.dangerButton}`} disabled={busy} onClick={() => stopAll.mutate()}>Остановить всё</Button>
       </div>
       {results.length > 0 ? <div className={styles.resultList} aria-label="Результаты массового запуска">

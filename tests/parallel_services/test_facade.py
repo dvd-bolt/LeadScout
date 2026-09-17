@@ -241,7 +241,7 @@ async def test_start_and_stop_all_report_each_owned_account(dependencies):
     assert await facade.automation.start_all(42) == {
         "results": [
             {"account_id": 1, "status": "STARTED"},
-            {"account_id": 2, "status": "CONFLICT"},
+                {"account_id": 2, "status": "CONFLICT", "message": "Сначала войдите в аккаунт hh.ru."},
         ]
     }
     assert await facade.automation.stop_all(42) == {

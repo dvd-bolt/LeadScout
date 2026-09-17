@@ -266,12 +266,27 @@ async def create_resume_publish_attempt(
         active_cursor = await connection.execute(
             """SELECT * FROM resume_publish_attempts
                WHERE draft_id = ?
-                 AND status IN ('PENDING', 'PUBLISHING', 'NEEDS_ACTION', 'UNCERTAIN', 'PARTIAL')
+                 AND (status IN ('PENDING', 'PUBLISHING', 'NEEDS_ACTION', 'UNCERTAIN', 'PARTIAL')
+                      OR COALESCE(hh_resume_id, '') <> '')
                ORDER BY created_at DESC, rowid DESC LIMIT 1""",
             (draft_id,),
         )
         active = await active_cursor.fetchone()
         if active:
+            # A failed attempt can still have created a remote resume. Reuse it
+            # forever, but allow a freshly confirmed preflight to replace the
+            # stale fingerprint before resuming that same attempt.
+            if confirmed_fingerprint and active["confirmed_fingerprint"] != confirmed_fingerprint:
+                await connection.execute(
+                    """UPDATE resume_publish_attempts
+                       SET confirmed_fingerprint = ?, draft_revision = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE id = ?""",
+                    (confirmed_fingerprint, draft_revision, active["id"]),
+                )
+                active_cursor = await connection.execute(
+                    "SELECT * FROM resume_publish_attempts WHERE id = ?", (active["id"],)
+                )
+                active = await active_cursor.fetchone()
             await connection.commit()
             return _attempt(active), True
         draft_cursor = await connection.execute(
@@ -352,7 +367,7 @@ async def has_active_resume_publish(database: Database, user_id: int, account_id
         cursor = await connection.execute(
             """SELECT 1 FROM resume_publish_attempts
                WHERE user_id = ? AND account_id = ?
-                 AND status IN ('PENDING', 'PUBLISHING', 'NEEDS_ACTION', 'UNCERTAIN')
+                 AND status IN ('PENDING', 'PUBLISHING', 'NEEDS_ACTION', 'UNCERTAIN', 'PARTIAL')
                LIMIT 1""",
             (user_id, account_id),
         )
@@ -370,6 +385,7 @@ async def update_resume_publish_attempt(
     hh_resume_id: str = "",
     hh_resume_url: str = "",
     draft_status: str | None = None,
+    confirmed_fingerprint: str | None = None,
 ) -> dict | None:
     async with database.connection() as connection:
         await connection.execute("BEGIN IMMEDIATE")
@@ -378,6 +394,7 @@ async def update_resume_publish_attempt(
                SET stage = ?, status = ?, result_json = ?,
                    hh_resume_id = CASE WHEN ? <> '' THEN ? ELSE hh_resume_id END,
                    hh_resume_url = CASE WHEN ? <> '' THEN ? ELSE hh_resume_url END,
+                   confirmed_fingerprint = COALESCE(?, confirmed_fingerprint),
                    updated_at = CURRENT_TIMESTAMP
                WHERE id = ? AND user_id = ?""",
             (
@@ -388,6 +405,7 @@ async def update_resume_publish_attempt(
                 hh_resume_id,
                 hh_resume_url,
                 hh_resume_url,
+                confirmed_fingerprint,
                 attempt_id,
                 user_id,
             ),
@@ -464,6 +482,28 @@ async def recover_interrupted_resume_publishes(database: Database) -> int:
                    SELECT draft_id FROM resume_publish_attempts
                    WHERE status = 'UNCERTAIN' AND stage = 'RECOVERY'
                )"""
+        )
+        await connection.commit()
+        return cursor.rowcount
+
+
+async def recover_interrupted_resume_parsing(database: Database) -> int:
+    """Return PDF drafts left in PARSING to an actionable state after restart."""
+    error = {
+        "parse_error": {
+            "code": "PROCESS_RESTARTED",
+            "stage": "PARSE",
+            "message": "Распознавание PDF прервано перезапуском. Загрузите файл повторно.",
+            "retryable": True,
+            "required_action": "RETRY_PDF",
+        }
+    }
+    async with database.connection() as connection:
+        cursor = await connection.execute(
+            """UPDATE resume_drafts
+               SET status = 'NEEDS_INPUT', validation_json = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE status = 'PARSING'""",
+            (_json(error),),
         )
         await connection.commit()
         return cursor.rowcount

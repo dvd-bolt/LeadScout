@@ -74,7 +74,7 @@ def _payload(confidence: float, answer: str = "Да") -> JobApplicationPayload:
     )
 
 
-def test_questionnaire_threshold_and_intentional_dot():
+def test_questionnaire_threshold_and_optional_letter():
     questions = [QuestionField(field_id="q0", label="Работали с Python?", answer_type="radio", options=["Да", "Нет"])]
     assert questionnaire_requires_confirmation(questions, _payload(0.849))
     assert not questionnaire_requires_confirmation(questions, _payload(0.85))
@@ -88,7 +88,7 @@ def test_questionnaire_threshold_and_intentional_dot():
         )
     ]
     assert questionnaire_requires_confirmation(sensitive, _payload(0.99))
-    assert effective_cover_letter("Обычное письмо", False) == "."
+    assert effective_cover_letter("Обычное письмо", False) == ""
     assert effective_cover_letter("Обычное письмо", True) == "Обычное письмо"
 
 

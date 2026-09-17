@@ -23,10 +23,14 @@ async def test_draft_clear_omit_and_confirmation_validation(audit_client):
     qid = await make_questionnaire()
     url = f"/api/v1/questionnaires/{qid}"
     first = (await audit_client.get(url)).json()
-    cleared = await audit_client.patch(url, json={"answers": [], "cover_letter": "Draft"})
+    cleared = await audit_client.patch(
+        url, json={"expected_revision": first["revision"], "answers": [], "cover_letter": "Draft"}
+    )
     assert cleared.status_code == 200
     assert cleared.json()["revision"] == first["revision"] + 1
-    changed = await audit_client.patch(url, json={"cover_letter": "Later"})
+    changed = await audit_client.patch(
+        url, json={"expected_revision": cleared.json()["revision"], "cover_letter": "Later"}
+    )
     assert changed.json()["ai_payload"]["answers"] == []
     assert changed.json()["revision"] == cleared.json()["revision"] + 1
     assert (await audit_client.post(url + "/confirm")).status_code == 422
@@ -37,7 +41,9 @@ async def test_stale_confirmation_does_not_claim(audit_client):
     qid = await make_questionnaire()
     url = f"/api/v1/questionnaires/{qid}"
     old = (await audit_client.get(url)).json()["revision"]
-    await audit_client.patch(url, json={"cover_letter": "Changed by another request"})
+    await audit_client.patch(
+        url, json={"expected_revision": old, "cover_letter": "Changed by another request"}
+    )
     response = await audit_client.post(url + "/confirm", json={"expected_revision": old})
     assert response.status_code == 409
     assert (await database.get_pending_questionnaire_for_user(42, qid))["status"] == "PENDING"

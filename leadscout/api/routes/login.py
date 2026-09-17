@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from leadscout.runtime import AppContext
 from leadscout.services import ServiceError
 
-from ..dependencies import get_context, require_csrf, service_http_error
+from ..dependencies import current_user, get_context, require_csrf, service_http_error
 from ..schemas import CaptchaSubmission, LoginFlowAccount, LoginStart, OtpSubmission
 
 
@@ -27,6 +27,15 @@ def captcha_response(result: dict) -> dict:
             "ascii"
         )
     return response
+
+
+@router.get("/active")
+async def active_login(
+    session: dict = Depends(current_user),
+    context: AppContext = Depends(get_context),
+) -> dict:
+    result = context.login_manager.active_flow(int(session["user_id"]))
+    return captcha_response(result) if result else {"status": "NONE"}
 
 
 @router.post("/start", status_code=status.HTTP_202_ACCEPTED)

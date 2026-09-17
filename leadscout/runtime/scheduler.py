@@ -64,6 +64,15 @@ def start_scheduler(coordinator, *, db) -> AsyncIOScheduler:
         misfire_grace_time=3600,
         replace_existing=True,
     )
+    scheduler.add_job(
+        db.prune_product_history,
+        "cron",
+        hour=3,
+        minute=5,
+        id="product_retention",
+        max_instances=1,
+        coalesce=True,
+    )
     if getattr(coordinator, "monitor", None):
         scheduler.add_job(
             coordinator.monitor.store.prune,
@@ -71,6 +80,16 @@ def start_scheduler(coordinator, *, db) -> AsyncIOScheduler:
             hour=3,
             minute=20,
             id="admin_retention",
+            max_instances=1,
+            coalesce=True,
+        )
+    browser_pool = getattr(getattr(coordinator, "_dependencies", None), "browser_pool", None)
+    if browser_pool is not None and hasattr(browser_pool, "close_idle"):
+        scheduler.add_job(
+            browser_pool.close_idle,
+            "interval",
+            minutes=10,
+            id="browser_idle_cleanup",
             max_instances=1,
             coalesce=True,
         )

@@ -12,7 +12,7 @@ export function ResumesPage({ dashboard }: { dashboard: Dashboard }) {
   const resumes = active?.session_status === "AUTH_PENDING" ? <section className={`${styles.card} ${styles.empty}`}>Подключение аккаунта не завершено. Сначала введите код или отмените вход в настройках.</section>
     : dashboard.active_account_id ? <ResumeManager dashboard={dashboard} highlightedSnapshotId={highlightedSnapshotId} />
     : <section className={`${styles.card} ${styles.empty}`}>Для синхронизации и импорта резюме подключите аккаунт hh.ru. Независимый аудит доступен ниже.</section>;
-  const audits = <AuditPanel accountId={dashboard.active_account_id ?? undefined} focus={focusAudit} />;
+  const audits = <AuditPanel key={`audit:${dashboard.active_account_id ?? "none"}`} accountId={dashboard.active_account_id ?? undefined} snapshotId={highlightedSnapshotId} focus={focusAudit} />;
 
   return <section className={styles.page}>
     <h1 className={styles.pageTitle}>Резюме</h1>

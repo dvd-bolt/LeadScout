@@ -820,11 +820,11 @@ async def test_direct_links_validate_before_account_switch(browser_app):
 async def test_mono_start_stop_and_account_reset(browser_app):
     page, mock, base_url = browser_app.page, browser_app.mock, browser_app.base_url
     await page.goto(f"{base_url}/#/", wait_until="networkidle")
-    await page.get_by_role("button", name="Запустить поиск", exact=True).click()
+    await page.get_by_role("button", name="Включить автоматические отклики каждые 45 минут", exact=True).click()
     await expect(page.get_by_text("Идёт поиск", exact=True)).to_be_visible()
     await expect(page.get_by_text("Следующий запуск · МСК", exact=True)).to_be_visible()
     assert await page.evaluate("document.documentElement.scrollWidth <= innerWidth")
-    await page.get_by_role("button", name="Остановить поиск", exact=True).click()
+    await page.get_by_role("button", name="Остановить автоматические отклики", exact=True).click()
     await expect(page.get_by_text("Готов к запуску", exact=True)).to_be_visible()
     assert [r.path for r in mock.requests if r.path.startswith("/automation/")] == [
         "/automation/1/start",
@@ -835,7 +835,7 @@ async def test_mono_start_stop_and_account_reset(browser_app):
     await expect(page.get_by_label("Результаты массового запуска")).to_be_visible()
     await page.get_by_label("Активный аккаунт").select_option("2")
     await expect(page.get_by_label("Результаты массового запуска")).to_have_count(0)
-    await expect(page.get_by_role("button", name="Запустить поиск", exact=True)).to_be_disabled()
+    await expect(page.get_by_role("button", name="Включить автоматические отклики каждые 45 минут", exact=True)).to_be_disabled()
     await expect(page.get_by_role("status")).to_have_count(0)
     await page.get_by_text("Все аккаунты", exact=True).click()
     await page.get_by_role("button", name="Остановить всё", exact=True).click()

@@ -35,7 +35,7 @@ def _vacancy_html(*, questionnaire: bool) -> str:
     return f"""<main><h1 data-qa="vacancy-title">Backend role</h1>
       <div data-qa="vacancy-company-name">Example</div>
       <div data-qa="vacancy-description">Python backend development</div>
-      <button data-qa="vacancy-response-link-top" onclick="document.querySelector('#form').hidden=false">Откликнуться</button>
+      <button data-qa="vacancy-response-link-top" data-resume-id="resume-flow" onclick="document.querySelector('#form').hidden=false">Откликнуться</button>
       <div id="form" role="dialog" hidden>{question}
         <textarea name="message"></textarea>
         <button data-qa="vacancy-response-submit-popup" onclick="document.querySelector('#confirmed').hidden=false">Отправить отклик</button>

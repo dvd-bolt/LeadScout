@@ -50,10 +50,20 @@ class FormAnswer(BaseModel):
 
     field_id: str = Field(min_length=1, max_length=256)
     answer_type: str = Field(min_length=1, max_length=32)
-    value: str = Field(min_length=1, max_length=2_000)
+    value: str | list[str]
+
+    @model_validator(mode="after")
+    def valid_value(self):
+        values = self.value if isinstance(self.value, list) else [self.value]
+        if not values or len(values) > 30 or any(not value.strip() or len(value) > 2_000 for value in values):
+            raise ValueError("Некорректный ответ анкеты")
+        if isinstance(self.value, list) and self.answer_type != "checkbox":
+            raise ValueError("Несколько значений допустимы только для флажков")
+        return self
 
 
 class QuestionnaireUpdate(BaseModel):
+    expected_revision: int = Field(ge=0)
     cover_letter: str | None = Field(default=None, max_length=10_000)
     answers: list[FormAnswer] | None = Field(default=None, max_length=50)
 

@@ -65,16 +65,24 @@ def extract_text_from_pdf(
             raise PDFValidationError(f"В PDF должно быть не больше {page_limit} страниц.")
         parts: list[str] = []
         total = 0
+        truncated = False
         for page in reader.pages:
             text = (page.extract_text() or "").strip()
             if not text:
                 continue
             remaining = text_limit - total
             if remaining <= 0:
+                truncated = True
                 break
+            if len(text) > remaining:
+                truncated = True
             parts.append(text[:remaining])
             total += len(parts[-1])
         result = "\n".join(parts).strip()
+        if truncated:
+            raise PDFValidationError(
+                f"Текст PDF превышает лимит {text_limit} символов. Сократите документ и загрузите его снова."
+            )
     except PDFValidationError:
         raise
     except Exception as exc:

@@ -48,15 +48,13 @@ class AutomationService(_Service):
 
     async def start_all(self, user_id: int) -> dict:
         accounts = await _await(self.db.get_user_accounts(user_id))
-        if any(account.get("session_status") == "AUTH_PENDING" for account in accounts):
-            raise ServiceError("LOGIN_IN_PROGRESS", "Сначала завершите подключение аккаунта.")
         results: list[dict] = []
         for account in accounts:
             account_id = int(account["id"])
             try:
                 results.append(await self.start(user_id, account_id))
             except ServiceError as exc:
-                results.append({"account_id": account_id, "status": exc.code})
+                results.append({"account_id": account_id, "status": exc.code, "message": exc.message})
         return {"results": results}
 
     async def stop_all(self, user_id: int) -> dict:

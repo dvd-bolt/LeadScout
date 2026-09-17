@@ -30,6 +30,7 @@ export const api = {
 
   startLogin: (phone_or_email: string, account_name = "") =>
     request<LoginFlowResponse>("/login-flows/start", { method: "POST", body: JSON.stringify({ phone_or_email, account_name }) }),
+  activeLogin: () => request<LoginFlowResponse>("/login-flows/active"),
   submitOtp: (code: string, accountId?: number) => request<LoginFlowResponse>("/login-flows/otp", { method: "POST", body: JSON.stringify({ code, account_id: accountId }) }),
   submitCaptcha: (code: string, accountId?: number) => request<LoginFlowResponse>("/login-flows/captcha", { method: "POST", body: JSON.stringify({ code, account_id: accountId }) }),
   reloadCaptcha: (accountId?: number) => request<LoginFlowResponse>("/login-flows/captcha/reload", { method: "POST", body: JSON.stringify({ account_id: accountId }) }),
@@ -76,25 +77,60 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ expected_revision: expectedRevision, idempotency_key: idempotencyKey, confirmation_fingerprint: confirmationFingerprint }),
     }),
-  resumeResumeDraft: (accountId: number, draftId: number) =>
-    request<OperationStart>(`/accounts/${accountId}/resume-drafts/${draftId}/resume`, { method: "POST" }),
+  resumeResumeDraft: (accountId: number, draftId: number, expectedRevision: number, confirmationFingerprint: string) =>
+    request<OperationStart>(`/accounts/${accountId}/resume-drafts/${draftId}/resume`, {
+      method: "POST",
+      body: JSON.stringify({ expected_revision: expectedRevision, confirmation_fingerprint: confirmationFingerprint }),
+    }),
   reconcileResumeDraft: (accountId: number, draftId: number) =>
     request<OperationStart>(`/accounts/${accountId}/resume-drafts/${draftId}/reconcile`, { method: "POST" }),
 
-  questionnaires: (accountId?: number) => request<Questionnaire[]>(`/questionnaires${accountId ? `?account_id=${accountId}` : ""}`),
+  questionnaires: async (accountId?: number) => {
+    const result: Questionnaire[] = [];
+    let beforeId: number | undefined;
+    for (;;) {
+      const params = new URLSearchParams({ limit: "100" });
+      if (accountId) params.set("account_id", String(accountId));
+      if (beforeId) params.set("before_id", String(beforeId));
+      const page = await request<Questionnaire[]>(`/questionnaires?${params}`);
+      result.push(...page);
+      if (page.length < 100) return result;
+      beforeId = page[page.length - 1].id;
+    }
+  },
   questionnaire: (applyId: number) => request<Questionnaire>(`/questionnaires/${applyId}`),
-  updateQuestionnaire: (id: number, values: { cover_letter?: string; answers?: Questionnaire["ai_payload"]["answers"] }) =>
+  updateQuestionnaire: (id: number, values: { expected_revision: number; cover_letter?: string; answers?: Questionnaire["ai_payload"]["answers"] }) =>
     request<Questionnaire>(`/questionnaires/${id}`, { method: "PATCH", body: JSON.stringify(values) }),
   confirmQuestionnaire: (id: number, expectedRevision: number) => request<{ status: string; apply_id: number }>(`/questionnaires/${id}/confirm`, {
     method: "POST", body: JSON.stringify({ expected_revision: expectedRevision }),
   }),
   skipQuestionnaire: (id: number) => request<Questionnaire>(`/questionnaires/${id}/skip`, { method: "POST" }),
-  applications: (accountId?: number) => request<{ history: Dashboard["recent_events"]; stats: Dashboard["stats"] }>(`/applications${accountId ? `?account_id=${accountId}` : ""}`),
+  applications: (accountId?: number, beforeId?: number, limit = 50) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (accountId) params.set("account_id", String(accountId));
+    if (beforeId) params.set("before_id", String(beforeId));
+    return request<{ history: Dashboard["recent_events"]; review_required: Dashboard["recent_events"]; search_runs: Array<{ id: number; status: string; processed: number; found: number; details: string; created_at: string }>; stats: Dashboard["stats"] }>(`/applications?${params}`);
+  },
   resolveApplication: (attemptId: string, applied: boolean) => request<{ attempt_id: string; status: string; resolved: boolean; changed: boolean }>(`/applications/${attemptId}/resolve`, {
     method: "POST", body: JSON.stringify({ applied }),
   }),
+  exportApplicationHistory: () => request<Record<string, unknown>>("/applications/export"),
+  deleteApplicationHistory: () => request<Record<string, number>>("/applications/history", { method: "DELETE" }),
 
-  audits: (accountId?: number) => request<Audit[]>(`/audits${accountId ? `?account_id=${accountId}` : ""}`),
+  audits: async (filters: { accountId?: number; independentOnly?: boolean } = {}) => {
+    const result: Audit[] = [];
+    let beforeId: number | undefined;
+    for (;;) {
+      const params = new URLSearchParams({ limit: "100" });
+      if (filters.accountId) params.set("account_id", String(filters.accountId));
+      if (filters.independentOnly) params.set("independent_only", "true");
+      if (beforeId) params.set("before_id", String(beforeId));
+      const page = await request<Audit[]>(`/audits?${params}`);
+      result.push(...page);
+      if (page.length < 100) return result;
+      beforeId = page[page.length - 1].id;
+    }
+  },
   createAudit: (values: { account_id?: number; resume_snapshot_id?: number; resume_text?: string }) =>
     request<OperationStart>("/audits", { method: "POST", body: JSON.stringify(values) }),
   createPdfAudit: (accountId: number | undefined, file: File) => {
@@ -106,4 +142,12 @@ export const api = {
   matchAudit: (auditId: number, vacancy: VacancyMatchInput) =>
     request<OperationStart>(`/audits/${auditId}/match`, { method: "POST", body: JSON.stringify(vacancy) }),
   operation: (id: string) => request<Operation>(`/operations/${id}`),
+  operations: (filters: { kind?: string; accountId?: number; resource?: string; activeOnly?: boolean } = {}) => {
+    const params = new URLSearchParams();
+    if (filters.kind) params.set("kind", filters.kind);
+    if (filters.accountId) params.set("account_id", String(filters.accountId));
+    if (filters.resource) params.set("resource", filters.resource);
+    params.set("active_only", String(filters.activeOnly ?? true));
+    return request<Operation[]>(`/operations?${params}`);
+  },
 };

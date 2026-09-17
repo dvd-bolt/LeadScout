@@ -17,6 +17,7 @@ DB_METHODS = frozenset(
         "has_unresolved_application_attempt",
         "has_open_questionnaire_for_vacancy",
         "record_application_event",
+        "record_search_run",
         "record_successful_application",
         "create_application_attempt",
         "update_application_attempt",
@@ -59,6 +60,16 @@ class RuntimeJobDependencies:
         except (TypeError, ValueError):
             return False
         return any(parameter.name == "trace" or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+
+    def supports_application_parameter(self, operation: str, name: str) -> bool:
+        callback = getattr(self.applications, operation, None)
+        if callback is None:
+            return False
+        try:
+            parameters = inspect.signature(callback).parameters.values()
+        except (TypeError, ValueError):
+            return False
+        return any(parameter.name == name or parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters)
 
     async def extract_search_keywords_from_resume(self, *args, **kwargs):
         return await self.ai.extract_search_keywords_from_resume(*args, **kwargs)

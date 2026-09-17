@@ -35,9 +35,14 @@ def validate_questionnaire(payload: JobApplicationPayload, questions: list[Quest
     answers = {answer.field_id: answer for answer in payload.answers}
     for question in questions:
         answer = answers.get(question.field_id)
-        if question.required and (not answer or not answer.value.strip()):
+        if question.required and (
+            not answer
+            or (isinstance(answer.value, str) and not answer.value.strip())
+            or (isinstance(answer.value, list) and not answer.value)
+        ):
             return False
-        if answer and question.options and answer.value not in question.options:
+        values = answer.value if answer and isinstance(answer.value, list) else [answer.value] if answer else []
+        if answer and question.options and any(value not in question.options for value in values):
             return False
         if answer and answer.answer_type != question.answer_type:
             return False
@@ -69,8 +74,8 @@ class AIIntegration:
                 confidence_score=0.0,
             )
         payload_data = {
-            "resume": resume_context[:10_000],
-            "vacancy": vacancy_description[:10_000],
+            "resume": resume_context,
+            "vacancy": vacancy_description,
             "questions": [item.model_dump() for item in questions],
         }
         key = _cache_key("job_application", payload_data)
@@ -83,14 +88,8 @@ class AIIntegration:
                 JobApplicationPayload,
                 system_instruction=config.HH_COVER_LETTER_SYSTEM_PROMPT,
             )
-        except AIServiceError as exc:
-            return JobApplicationPayload(
-                is_relevant=False,
-                relevance_reason=str(exc),
-                cover_letter="",
-                can_auto_submit=False,
-                confidence_score=0.0,
-            )
+        except AIServiceError:
+            raise
         result.can_auto_submit = validate_questionnaire(result, questions)
         self.cache.put(key, result)
         return result
@@ -98,7 +97,7 @@ class AIIntegration:
     async def extract_search_keywords_from_resume(self, resume_text: str, resume_title: str = "") -> list[str]:
         if not resume_text.strip():
             return []
-        data = {"title": resume_title[:300], "resume": resume_text[:8_000]}
+        data = {"title": resume_title, "resume": resume_text}
         key = _cache_key("keywords", data)
         cached = self.cache.get(key, SearchKeywordsPayload)
         if cached:
@@ -118,7 +117,7 @@ class AIIntegration:
                 profession_name="Недостаточно данных",
                 rejection_reason="Текст резюме слишком короткий или отсутствует.",
             )
-        data = {"resume": resume_text[:15_000]}
+        data = {"resume": resume_text}
         key = _cache_key("resume_audit", data)
         cached = self.cache.get(key, ResumeAuditPayload)
         if cached:
@@ -151,7 +150,7 @@ class AIIntegration:
                 is_suitable=False,
                 advice_for_apply="Отсутствуют необходимые данные резюме или вакансии.",
             )
-        data = {"resume": resume_text[:10_000], "vacancy": vacancy_text[:10_000]}
+        data = {"resume": resume_text, "vacancy": vacancy_text}
         key = _cache_key("vacancy_match", data)
         cached = self.cache.get(key, VacancyMatchPayload)
         if cached:
@@ -163,7 +162,7 @@ class AIIntegration:
     async def extract_full_structured_resume(self, resume_text: str, *, strict: bool = False) -> StructuredResume:
         if not resume_text.strip():
             return StructuredResume()
-        data = {"resume": resume_text[: config.PDF_MAX_TEXT_CHARS]}
+        data = {"resume": resume_text}
         key = _cache_key("structured_resume", data)
         cached = self.cache.get(key, StructuredResume)
         if cached:
@@ -181,7 +180,7 @@ class AIIntegration:
         """Extract the complete wizard shape without inventing missing values."""
         if not resume_text.strip():
             return ResumeDraftData()
-        data = {"resume": resume_text[: config.PDF_MAX_TEXT_CHARS]}
+        data = {"resume": resume_text}
         key = _cache_key("resume_draft", data)
         cached = self.cache.get(key, ResumeDraftData)
         if cached:

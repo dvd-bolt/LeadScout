@@ -35,6 +35,11 @@ class PublishDraftBody(BaseModel):
     confirmation_fingerprint: str = Field(default="", max_length=100)
 
 
+class ResumeDraftBody(BaseModel):
+    expected_revision: int = Field(gt=0)
+    confirmation_fingerprint: str = Field(default="", max_length=100)
+
+
 async def _service_call(function, *args):
     try:
         return await function(*args)
@@ -218,6 +223,7 @@ async def publish_draft(
 async def resume_publish(
     account_id: int,
     draft_id: int,
+    payload: ResumeDraftBody,
     session: dict = Depends(require_csrf),
     context: AppContext = Depends(get_context),
 ) -> dict:
@@ -226,7 +232,9 @@ async def resume_publish(
     return await context.operations.schedule(
         user_id,
         "resume-draft-resume",
-        lambda: context.services.resume_drafts.resume(user_id, account_id, draft_id),
+        lambda: context.services.resume_drafts.resume(
+            user_id, account_id, draft_id, payload.expected_revision, payload.confirmation_fingerprint
+        ),
         resource=str(draft_id),
         account_id=account_id,
     )

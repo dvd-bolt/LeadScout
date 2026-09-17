@@ -258,20 +258,31 @@ async def test_questionnaire_edits_are_validated_and_locked_after_claim(audit_cl
         42, account["id"], "https://hh.ru/vacancy/1", "Role", "Old", questions, {}
     )
     url = f"/api/v1/questionnaires/{qid}"
+    revision = (await audit_client.get(url)).json()["revision"]
     for answer in (
         {},
         {"field_id": "unknown", "answer_type": "text", "value": "test"},
         {"field_id": "q0", "answer_type": "radio", "value": "Maybe"},
     ):
-        response = await audit_client.patch(url, json={"cover_letter": "Must not persist", "answers": [answer]})
+        response = await audit_client.patch(
+            url,
+            json={"expected_revision": revision, "cover_letter": "Must not persist", "answers": [answer]},
+        )
         assert response.status_code == 422
         assert (await database.get_pending_questionnaire_for_user(42, qid))["cover_letter"] == "Old"
     answer = {"field_id": "q0", "answer_type": "radio", "value": "Да"}
-    assert (await audit_client.patch(url, json={"cover_letter": "New", "answers": [answer]})).status_code == 200
+    assert (
+        await audit_client.patch(
+            url,
+            json={"expected_revision": revision, "cover_letter": "New", "answers": [answer]},
+        )
+    ).status_code == 200
     claimed = await database.claim_pending_questionnaire(42, qid)
     assert claimed["cover_letter"] == "New"
     assert json.loads(claimed["ai_payload_json"])["answers"] == [answer]
-    assert (await audit_client.patch(url, json={"cover_letter": "Too late"})).status_code == 409
+    assert (
+        await audit_client.patch(url, json={"expected_revision": revision + 1, "cover_letter": "Too late"})
+    ).status_code == 409
 
 
 async def test_global_browser_limit_covers_different_engines(monkeypatch):

@@ -15,10 +15,14 @@ router = APIRouter(prefix="/questionnaires", tags=["questionnaires"])
 @router.get("")
 async def list_questionnaires(
     account_id: int | None = None,
+    before_id: int | None = None,
+    limit: int = 100,
     session: dict = Depends(current_user),
     context: AppContext = Depends(get_context),
 ) -> list[dict]:
-    items = await context.db.list_pending_questionnaires(int(session["user_id"]), account_id=account_id)
+    items = await context.db.list_pending_questionnaires(
+        int(session["user_id"]), account_id=account_id, before_id=before_id, limit=limit
+    )
     return [public_questionnaire(item) for item in items]
 
 
@@ -47,6 +51,7 @@ async def update_questionnaire(
             apply_id,
             payload.cover_letter,
             payload.answers,
+            payload.expected_revision,
         )
     except ServiceError as exc:
         raise service_http_error(exc) from exc

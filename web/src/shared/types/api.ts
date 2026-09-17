@@ -34,6 +34,7 @@ export type CaptchaSubmitResult = {
   account_id: number;
   captcha_data_uri?: string;
   message?: string;
+  expires_in?: number;
 };
 
 export type Event = {
@@ -47,6 +48,11 @@ export type Event = {
   attempt_id?: string;
   stage?: string;
   created_at: string;
+  resolved_at?: string;
+  cover_letter?: string;
+  resume_snapshot_id?: number | null;
+  resume_hh_id?: string;
+  resume_title?: string;
 };
 
 export type Dashboard = {
@@ -75,7 +81,7 @@ export type Resume = {
   synced_at: string;
 };
 
-export type QuestionnaireAnswer = { field_id: string; value: string; answer_type: string };
+export type QuestionnaireAnswer = { field_id: string; value: string | string[]; answer_type: string };
 
 export type Questionnaire = {
   revision: number;
@@ -102,6 +108,7 @@ export type AuditInsight = {
 export type Audit = {
   id: number;
   account_id?: number | null;
+  source_account_name?: string;
   profession_name: string;
   overall_score: number;
   category_scores: Record<string, number>;
@@ -122,7 +129,7 @@ export type StructuredResume = Record<string, unknown> & {
 export type ResumeDraftData = {
   profession: { title: string; hh_profession: string; hh_profession_id: string; specializations: string[] };
   personal: {
-    first_name: string; last_name: string; middle_name: string; birth_date: string; gender: string; city: string;
+    first_name: string; last_name: string; middle_name: string; birth_date: string; gender: string; city: string; hh_city_id: string;
     citizenships: string[]; work_authorizations: string[];
   };
   contacts: { phone: string; email: string; telegram: string; preferred: string; methods: string[] };
@@ -205,12 +212,24 @@ export type NeedsFieldsResult = {
   message?: string;
 };
 
+export type OperationResultStatus =
+  | "SUCCESS" | "SUCCEEDED" | "STARTED" | "ALREADY_RUNNING" | "READY" | "CANCELLED" | "STOPPED"
+  | "NEEDS_FIELDS" | "NEEDS_INPUT" | "NEEDS_REVIEW" | "NEEDS_ACTION" | "PARTIAL" | "UNCERTAIN"
+  | "WAITING_FOR_CAPTCHA" | "WAITING_FOR_OTP" | "WAITING_FOR_CODE" | "WAITING_FOR_SMS"
+  | "INVALID_CAPTCHA" | "INVALID_CODE" | "PENDING" | "SUBMITTED" | "SKIPPED"
+  | "SKIPPED_LIMIT" | "SKIPPED_NOT_AUTHORIZED" | "SKIPPED_NO_RESUME" | "SKIPPED_NO_SESSION"
+  | "SKIPPED_STOPPED" | "CLIENT_UPDATE_REQUIRED" | "DAILY_LIMIT" | "ERROR" | "ERROR_CAPTCHA"
+  | "ERROR_INVALID_URL" | "ERROR_SESSION_EXPIRED" | "EXPIRED_SESSION" | "FAILED"
+  | "MISSING_RESUME" | "NOT_FOUND" | "NO_SESSION";
+
 export type Operation = {
   id: string;
   kind: string;
+  account_id?: number | null;
+  resource?: string;
   status: "PENDING" | "RUNNING" | "SUCCEEDED" | "FAILED" | "NEEDS_INPUT";
   result: (Record<string, unknown> & {
-    status?: string; code?: string; stage?: string; message?: string;
+    status?: OperationResultStatus; code?: string; stage?: string; message?: string;
     retryable?: boolean; required_action?: string; draft_id?: number;
   }) | NeedsFieldsResult;
   error_text: string;
@@ -219,6 +238,7 @@ export type Operation = {
 export type OperationStart = { operation_id: string; status?: string; attempt_id?: string; reused?: boolean };
 export type AutomationStartResult = { account_id: number; status: string; message?: string };
 export type LoginFlowStatus =
+  | "STARTING"
   | "WAITING_FOR_CAPTCHA"
   | "WAITING_FOR_OTP"
   | "SUCCESS"
@@ -232,5 +252,6 @@ export type LoginFlowResponse = {
   code?: string;
   captcha_data_uri?: string;
   message?: string;
+  expires_in?: number;
 };
 export type VacancyMatchInput = { vacancy_text: string } | { vacancy_url: string };

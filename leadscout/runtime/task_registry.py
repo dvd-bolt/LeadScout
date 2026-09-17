@@ -8,12 +8,14 @@ from datetime import datetime, timezone
 
 from leadscout.core.access import AccessError
 from leadscout.core.task_scope import check_access, track_resource
+from leadscout.models.operations import ResultDisposition, result_disposition
 from leadscout.storage.admin import ACTIVE_TASKS
 
 
 @dataclass
 class LiveTask:
     user_id: int
+    account_id: int | None = None
     task: asyncio.Task | None = None
     cleanup: object = None
     cleanup_task: asyncio.Task | None = None
@@ -37,9 +39,11 @@ class TaskRegistry:
         async with self.access.admission(user_id):
             if not self.accepting:
                 raise AccessError("SHUTTING_DOWN", "Приложение завершает работу.", 409)
+            if account_id is not None:
+                self.access.check_account_start(account_id)
             task_id = str(uuid.uuid4())
             await self.store.create_task(task_id, user_id, kind, account_id, source_id)
-            live = LiveTask(user_id, cleanup=cleanup)
+            live = LiveTask(user_id, account_id=account_id, cleanup=cleanup)
             self.live[task_id] = live
             live.task = asyncio.create_task(self._run(task_id, run), name=f"tracked-{kind}-{task_id}")
             live.task.add_done_callback(lambda task: None if task.cancelled() else task.exception())
@@ -61,22 +65,9 @@ class TaskRegistry:
             await self.store.task_state(task_id, "RUNNING")
             result = await run()
             status = str(result.get("status", "SUCCESS")) if isinstance(result, dict) else "SUCCESS"
-            waiting = status in {
-                "WAITING_FOR_CAPTCHA",
-                "WAITING_FOR_OTP",
-                "WAITING_FOR_CODE",
-                "WAITING_FOR_SMS",
-                "INVALID_CAPTCHA",
-                "NEEDS_FIELDS",
-                "NEEDS_INPUT",
-            }
-            success = status in {
-                "SUCCESS",
-                "SUCCEEDED",
-                "STARTED",
-                "ALREADY_RUNNING",
-                "CANCELLED",
-            } or status.startswith("SKIPPED")
+            disposition = result_disposition(status)
+            waiting = disposition is ResultDisposition.NEEDS_INPUT
+            success = disposition is ResultDisposition.SUCCESS
             failure_code = str(result.get("code") or "TASK_FAILED") if isinstance(result, dict) else "TASK_FAILED"
             await self.store.task_state(
                 task_id,
@@ -251,3 +242,17 @@ class TaskRegistry:
         results = await asyncio.gather(*(self.stop(task_id) for task_id in list(self.live)), return_exceptions=True)
         if any(isinstance(r, BaseException) or r.get("status") != "STOPPED" for r in results):
             raise RuntimeError("Some tracked resources did not stop")
+
+    async def stop_account(self, user_id: int, account_id: int) -> None:
+        """Cancel every tracked operation for an account before its data is removed."""
+        task_ids = [
+            task_id
+            for task_id, live in tuple(self.live.items())
+            if live.user_id == user_id and live.account_id == account_id
+        ]
+        results = await asyncio.gather(*(self.stop(task_id) for task_id in task_ids), return_exceptions=True)
+        if any(
+            isinstance(result, BaseException) or result.get("status") != "STOPPED"
+            for result in results
+        ):
+            raise RuntimeError("Не удалось остановить все операции удаляемого аккаунта.")

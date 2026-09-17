@@ -151,7 +151,7 @@ async def test_schema_version_and_foreign_keys(isolated_db):
 
 
 @pytest.mark.asyncio
-async def test_v8_database_is_migrated_to_resume_drafts_v9(tmp_path):
+async def test_v8_database_is_migrated_to_current_schema(tmp_path):
     db = Database(tmp_path / "v8.db")
     await init_db(db)
     async with db.connection() as connection:
@@ -170,7 +170,7 @@ async def test_v8_database_is_migrated_to_resume_drafts_v9(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'resume_%'"
             )
         ).fetchall()
-    assert version == 9
+    assert version == database.SCHEMA_VERSION
     assert {row[0] for row in rows} >= {
         "resume_drafts",
         "resume_publish_attempts",
@@ -179,7 +179,35 @@ async def test_v8_database_is_migrated_to_resume_drafts_v9(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_v7_database_migrates_to_v9_without_losing_accounts_or_resumes(tmp_path):
+async def test_v11_database_adds_exact_resume_and_audit_origin_columns(tmp_path):
+    db = Database(tmp_path / "v11.db")
+    await init_db(db)
+    async with db.connection() as connection:
+        for table in ("application_attempts", "application_events", "hh_applies"):
+            for column in ("resume_snapshot_id", "resume_hh_id", "resume_title"):
+                await connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        await connection.execute("ALTER TABLE hh_applies DROP COLUMN attempt_id")
+        await connection.execute("ALTER TABLE resume_audits DROP COLUMN source_account_name")
+        await connection.execute("PRAGMA user_version=11")
+        await connection.commit()
+
+    await init_db(db)
+
+    async with db.connection() as connection:
+        version = (await (await connection.execute("PRAGMA user_version")).fetchone())[0]
+        columns = {}
+        for table in ("application_attempts", "application_events", "hh_applies", "resume_audits"):
+            rows = await (await connection.execute(f"PRAGMA table_info({table})")).fetchall()
+            columns[table] = {row["name"] for row in rows}
+    assert version == database.SCHEMA_VERSION
+    for table in ("application_attempts", "application_events", "hh_applies"):
+        assert {"resume_snapshot_id", "resume_hh_id", "resume_title"} <= columns[table]
+    assert "attempt_id" in columns["hh_applies"]
+    assert "source_account_name" in columns["resume_audits"]
+
+
+@pytest.mark.asyncio
+async def test_v7_database_migrates_without_losing_accounts_or_resumes(tmp_path):
     db = Database(tmp_path / "v7.db")
     await init_db(db)
     await users.get_or_create_user(db, 71)
@@ -210,7 +238,7 @@ async def test_v7_database_migrates_to_v9_without_losing_accounts_or_resumes(tmp
         }
     restored_account = await accounts.get_account_for_user(db, 71, account["id"])
     snapshots = await resumes.list_resume_snapshots(db, 71, account["id"])
-    assert version == 9
+    assert version == database.SCHEMA_VERSION
     assert {"resume_drafts", "resume_publish_attempts", "resume_publish_events"} <= tables
     assert restored_account["phone_or_email"] == "migration@example.com"
     assert [(item["hh_resume_id"], item["title"]) for item in snapshots] == [

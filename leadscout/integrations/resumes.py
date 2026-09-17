@@ -261,10 +261,56 @@ def _missing_external_sections(data: dict, external_text: str) -> list[str]:
             return needle in "".join(character for character in haystack if character.isdigit())
         return not needle or needle in haystack
 
+    def contains_pair(first: str, second: str) -> bool:
+        left = " ".join(str(first or "").casefold().split())
+        right = " ".join(str(second or "").casefold().split())
+        if not left or not right:
+            return contains(left or right)
+        # Values belonging to one row must appear together. Independent
+        # membership would accept levels swapped between languages/skills.
+        return f"{left} {right}" in haystack or f"{right} {left}" in haystack
+
+    month_names = {
+        "1": ("январь", "января", "january"),
+        "2": ("февраль", "февраля", "february"),
+        "3": ("март", "марта", "march"),
+        "4": ("апрель", "апреля", "april"),
+        "5": ("май", "мая", "may"),
+        "6": ("июнь", "июня", "june"),
+        "7": ("июль", "июля", "july"),
+        "8": ("август", "августа", "august"),
+        "9": ("сентябрь", "сентября", "september"),
+        "10": ("октябрь", "октября", "october"),
+        "11": ("ноябрь", "ноября", "november"),
+        "12": ("декабрь", "декабря", "december"),
+    }
+
+    def contains_month(value: str) -> bool:
+        normalized = str(value or "").strip().lstrip("0") or "0"
+        names = month_names.get(normalized)
+        return not names or any(name in haystack for name in names)
+
+    def contains_token(value: str) -> bool:
+        token = str(value or "").strip().casefold()
+        return not token or re.search(rf"(?<![\w]){re.escape(token)}(?![\w])", haystack) is not None
+
     experiences = [item for item in data.get("experiences") or [] if item.get("selected", True)]
     if experiences and any(
         not contains(item.get("company", ""))
         or not contains(item.get("position", ""))
+        or not contains_month(item.get("start_month", ""))
+        or not contains(item.get("start_year", ""))
+        or (
+            not item.get("is_current")
+            and (
+                not contains_month(item.get("end_month", ""))
+                or not contains(item.get("end_year", ""))
+            )
+        )
+        or (
+            item.get("is_current")
+            and not any(marker in haystack for marker in ("настоящее время", "по настоящее", "present"))
+        )
         or not contains(item.get("description", ""))
         for item in experiences
     ):
@@ -272,31 +318,37 @@ def _missing_external_sections(data: dict, external_text: str) -> list[str]:
     education = [item for item in data.get("education") or [] if item.get("selected", True)]
     if education and any(
         not contains(item.get("institution", ""))
+        or not contains(item.get("level", ""))
+        or not contains(item.get("faculty", ""))
         or not contains(item.get("specialization", ""))
         or not contains(item.get("end_year", ""))
         for item in education
     ):
         missing.append("Образование")
-    skills = [item.get("name", "") for item in data.get("skills") or [] if item.get("name")]
-    if skills and any(not contains(skill) for skill in skills):
+    skills = data.get("skills") or []
+    if skills and any(not contains_pair(item.get("name", ""), item.get("level", "")) for item in skills):
         missing.append("Навыки")
     about = str((data.get("about") or {}).get("text") or "")
     if about and not contains(about):
         missing.append("О себе")
-    languages = [item.get("name", "") for item in data.get("languages") or [] if item.get("name")]
-    if languages and any(not contains(language) for language in languages):
+    languages = data.get("languages") or []
+    if languages and any(not contains_pair(item.get("name", ""), item.get("level", "")) for item in languages):
         missing.append("Языки")
     links = [item.get("url", "") for item in (data.get("about") or {}).get("links") or [] if item.get("url")]
     if links and any(not contains(link) for link in links):
         missing.append("Ссылки")
     additional = data.get("additional") or {}
-    extra_names = [
-        item.get("name", "")
+    extra_values = [
+        value
         for key in ("courses", "exams", "certificates", "recommendations")
         for item in additional.get(key) or []
-        if item.get("name")
+        for value in (
+            item.get("name", ""), item.get("organization", ""),
+            item.get("year", ""), item.get("description", ""),
+        )
+        if value
     ]
-    if extra_names and any(not contains(name) for name in extra_names):
+    if extra_values and any(not contains(value) for value in extra_values):
         missing.append("Дополнительные разделы")
     conditions = data.get("work_conditions") or {}
     condition_values = [
@@ -307,8 +359,27 @@ def _missing_external_sections(data: dict, external_text: str) -> list[str]:
         str(conditions.get("relocation") or ""),
         str(conditions.get("business_trips") or ""),
     ]
-    if any(value and not contains(value) for value in condition_values):
+    currency = str(conditions.get("currency") or "").upper()
+    currency_aliases = {
+        "RUR": ("rur", "rub", "₽", "руб"),
+        "RUB": ("rur", "rub", "₽", "руб"),
+        "USD": ("usd", "$", "доллар"),
+        "EUR": ("eur", "€", "евро"),
+    }
+    currency_missing = bool(currency) and not any(
+        alias in haystack for alias in currency_aliases.get(currency, (currency.casefold(),))
+    )
+    if currency_missing or any(value and not contains(value) for value in condition_values):
         missing.append("Условия работы")
+    licenses = additional.get("driving_licenses") or []
+    car_missing = additional.get("has_car") and not any(
+        marker in haystack for marker in ("есть автомобиль", "личный автомобиль", "own car")
+    )
+    if any(not contains_token(value) for value in licenses) or car_missing:
+        missing.append("Транспорт")
+    visibility = str((data.get("publication") or {}).get("visibility") or "")
+    if visibility and not contains(visibility):
+        missing.append("Видимость")
     return missing
 
 
@@ -408,7 +479,8 @@ class HHResumeManager(HHAccountClient):
                     resume_text, blocked = await _extract_visible_resume_text(detail_page)
                     if "/account/login" in detail_page.url or blocked:
                         return {"status": "ERROR", "message": _DETAIL_BLOCKED_MESSAGE}
-                    resume_text = resume_text[:PDF_MAX_TEXT_CHARS]
+                    if len(resume_text) > PDF_MAX_TEXT_CHARS:
+                        raise ValueError("Resume text exceeds the supported size")
                 except Exception:
                     logger.debug("Resume text was not available for %s", raw["id"])
                 finally:
@@ -504,6 +576,7 @@ class HHResumeManager(HHAccountClient):
         account, storage_state = await self._account_and_state(user_id, account_id)
         if not account:
             return {"status": "NEEDS_ACTION", "code": "LOGIN_REQUIRED", "stage": "OPEN", "message": "Войдите в hh.ru."}
+        replace_profile_values = bool(data.get("_confirmed_profile_changes"))
         structured = StructuredResume.model_validate(
             {
                 "first_name": (data.get("personal") or {}).get("first_name", ""),
@@ -531,7 +604,11 @@ class HHResumeManager(HHAccountClient):
                 else "https://hh.ru/profile/resume/professional_role"
             )
             result = await self._fill_step_by_step_resume(
-                page, structured, draft_data=data, start_url=start_url
+                page,
+                structured,
+                draft_data=data,
+                start_url=start_url,
+                replace_profile_values=replace_profile_values,
             )
             recognized_screens = list(result.get("recognized_screens") or [])
             if result.get("code") == "CAPTCHA_REQUIRED":
@@ -664,6 +741,7 @@ class HHResumeManager(HHAccountClient):
         resume: StructuredResume,
         draft_data: dict | None = None,
         start_url: str = "https://hh.ru/profile/resume/professional_role",
+        replace_profile_values: bool = False,
     ) -> dict[str, Any]:
         visited_screens: list[str] = []
         current_stage = "OPEN"
@@ -733,12 +811,28 @@ class HHResumeManager(HHAccountClient):
                             "stage": "PROFESSION",
                             "message": "hh.ru не предложил профессию. Выберите её вручную в мастере.",
                         }
-                    option_texts = [text.strip() for text in await options.all_inner_texts() if text.strip()]
+                    option_items = await options.evaluate_all(
+                        """nodes => nodes.map(node => ({
+                            label: (node.textContent || '').trim(),
+                            id: node.getAttribute('data-id') || node.getAttribute('data-value') ||
+                                node.getAttribute('value') || node.id || ''
+                        })).filter(item => item.label)"""
+                    )
+                    option_texts = [str(item.get("label") or "") for item in option_items]
+                    profession_id = str(
+                        ((draft_data or {}).get("profession") or {}).get("hh_profession_id") or ""
+                    )
+                    id_indexes = [
+                        i for i, item in enumerate(option_items)
+                        if profession_id and str(item.get("id") or "") == profession_id
+                    ]
                     exact_indexes = [
                         i for i, text in enumerate(option_texts)
                         if text.casefold() == profession_value.casefold()
                     ]
-                    if exact_indexes:
+                    if id_indexes:
+                        await human_click(page, options.nth(id_indexes[0]))
+                    elif exact_indexes:
                         await human_click(page, options.nth(exact_indexes[0]))
                     elif len(option_texts) == 1:
                         await human_click(page, options.first)
@@ -748,7 +842,7 @@ class HHResumeManager(HHAccountClient):
                             "code": "AMBIGUOUS_PROFESSION",
                             "stage": "PROFESSION",
                             "message": "Профессия неоднозначна. Подтвердите вариант перед продолжением.",
-                            "options": option_texts[:20],
+                            "options": option_items[:20],
                         }
                     for specialization in ((draft_data or {}).get("profession") or {}).get(
                         "specializations"
@@ -771,16 +865,35 @@ class HHResumeManager(HHAccountClient):
                         (page.locator('[data-qa="resume-person-last-name"], input[name*="lastName"]').first, resume.last_name),
                         (page.locator('[data-qa="resume-person-middle-name"], input[name*="middleName"]').first, resume.middle_name),
                     ):
-                        await self._fill_empty(page, locator, value)
+                        if replace_profile_values and value and await _visible(locator):
+                            await self._replace_value(page, locator, value)
+                        else:
+                            await self._fill_empty(page, locator, value)
                     city = page.locator('[data-qa="resume-person-area"], input[placeholder*="Город"]').first
-                    if await _visible(city) and not (await city.input_value()).strip():
-                        await human_type(page, city, resume.city)
+                    if await _visible(city) and (
+                        replace_profile_values or not (await city.input_value()).strip()
+                    ):
+                        await self._replace_value(page, city, resume.city)
                         options = page.locator('[role="option"], [data-qa="suggest-item-cell"]')
                         if not await _wait_visible(options.first):
                             return await self._form_failure(page, "PERSONAL", "hh.ru не подтвердил город.")
-                        texts = [text.strip() for text in await options.all_inner_texts() if text.strip()]
+                        city_options = await options.evaluate_all(
+                            """nodes => nodes.map(node => ({
+                                label: (node.textContent || '').trim(),
+                                id: node.getAttribute('data-id') || node.getAttribute('data-value') ||
+                                    node.getAttribute('value') || node.id || ''
+                            })).filter(item => item.label)"""
+                        )
+                        texts = [str(item.get("label") or "") for item in city_options]
+                        city_id = str(((draft_data or {}).get("personal") or {}).get("hh_city_id") or "")
+                        by_id = [
+                            i for i, item in enumerate(city_options)
+                            if city_id and str(item.get("id") or "") == city_id
+                        ]
                         exact = [i for i, text in enumerate(texts) if text.casefold() == resume.city.casefold()]
-                        if exact:
+                        if by_id:
+                            await human_click(page, options.nth(by_id[0]))
+                        elif exact:
                             await human_click(page, options.nth(exact[0]))
                         elif len(texts) == 1:
                             await human_click(page, options.first)
@@ -790,7 +903,7 @@ class HHResumeManager(HHAccountClient):
                                 "code": "AMBIGUOUS_CITY",
                                 "stage": "PERSONAL",
                                 "message": "Город неоднозначен. Подтвердите вариант.",
-                                "options": texts[:20],
+                                "options": city_options[:20],
                             }
                     try:
                         birth = date.fromisoformat(resume.birth_date)
@@ -798,14 +911,18 @@ class HHResumeManager(HHAccountClient):
                         return await self._form_failure(page, "PERSONAL", "Укажите точную дату рождения.")
                     birthday = page.locator('input[name="birthday"], input[type="date"]').first
                     if await _visible(birthday):
-                        await self._fill_empty(page, birthday, resume.birth_date)
+                        if replace_profile_values:
+                            await self._replace_value(page, birthday, resume.birth_date)
+                        else:
+                            await self._fill_empty(page, birthday, resume.birth_date)
                     else:
-                        await self._fill_empty(
+                        fill_value = self._replace_value if replace_profile_values else self._fill_empty
+                        await fill_value(
                             page,
                             page.locator('[data-qa="resume-person-birth-day"], input[name*="birthDay"]').first,
                             str(birth.day),
                         )
-                        await self._fill_empty(
+                        await fill_value(
                             page,
                             page.locator('[data-qa="resume-person-birth-year"], input[name*="birthYear"]').first,
                             str(birth.year),
@@ -813,7 +930,9 @@ class HHResumeManager(HHAccountClient):
                         month = page.locator(
                             '[data-qa="resume-person-birth-month"], select[name*="birthMonth"]'
                         ).first
-                        if await _visible(month) and not (await month.input_value()).strip():
+                        if await _visible(month) and (
+                            replace_profile_values or not (await month.input_value()).strip()
+                        ):
                             await month.select_option(index=birth.month)
                     personal = (draft_data or {}).get("personal") or {}
                     for value in [
@@ -835,8 +954,14 @@ class HHResumeManager(HHAccountClient):
                     current_stage = "CONTACTS"
                     visited_screens.append("contacts")
                     contacts = (draft_data or {}).get("contacts") or {}
-                    await self._fill_empty(page, phone, str(contacts.get("phone") or ""))
-                    await self._fill_empty(page, email, str(contacts.get("email") or ""))
+                    for locator, value in (
+                        (phone, str(contacts.get("phone") or "")),
+                        (email, str(contacts.get("email") or "")),
+                    ):
+                        if replace_profile_values and value and await _visible(locator):
+                            await self._replace_value(page, locator, value)
+                        else:
+                            await self._fill_empty(page, locator, value)
                     telegram = page.locator('input[name*="telegram" i], [data-qa*="telegram" i] input').first
                     await self._fill_empty(page, telegram, str(contacts.get("telegram") or ""))
                     for value in [contacts.get("preferred"), *(contacts.get("methods") or [])]:
@@ -858,6 +983,13 @@ class HHResumeManager(HHAccountClient):
                     conditions = (draft_data or {}).get("work_conditions") or {}
                     salary_value = conditions.get("salary")
                     await self._fill_empty(page, salary, str(salary_value) if salary_value is not None else "")
+                    currency_value = str(conditions.get("currency") or "")
+                    currency = page.locator(
+                        '[data-qa*="currency" i] select, select[name*="currency" i], '
+                        '[data-qa*="salary" i] select'
+                    ).first
+                    if currency_value and await _visible(currency):
+                        await self._replace_value(page, currency, currency_value)
                     for value in (
                         conditions.get("employment_types") or []
                     ) + (conditions.get("schedules") or []) + (conditions.get("work_formats") or []) + [
@@ -957,7 +1089,13 @@ class HHResumeManager(HHAccountClient):
                                 item.specialization,
                             ),
                             (page.locator('[data-qa="profile-education-year-input"]').first, item.end_year),
-                            (page.locator('[data-qa*="education-level" i] input, input[name="level"]').first, item.level),
+                            (
+                                page.locator(
+                                    '[data-qa*="education-level" i] select, select[name="level"], '
+                                    '[data-qa*="education-level" i] input, input[name="level"]'
+                                ).first,
+                                item.level,
+                            ),
                         ):
                             await self._fill_empty(page, locator, str(value or ""))
                     if not await self._click_continue(page, scope=institution):
@@ -1123,8 +1261,36 @@ class HHResumeManager(HHAccountClient):
                     )
                     if visibility:
                         visibility_option = page.get_by_text(visibility, exact=True).first
-                        if await _visible(visibility_option):
-                            await human_click(page, visibility_option)
+                        if not await _visible(visibility_option):
+                            return {
+                                "status": "NEEDS_ACTION",
+                                "code": "VISIBILITY_NOT_FOUND",
+                                "stage": "PUBLISH",
+                                "message": "Не удалось выбрать подтверждённую видимость резюме. Публикация остановлена.",
+                                "required_action": "SELECT_VISIBILITY",
+                            }
+                        await human_click(page, visibility_option)
+                        visibility_confirmed = await visibility_option.evaluate(
+                            """element => {
+                                const own = element.matches('input[type=radio],input[type=checkbox]') ? element : null;
+                                const nested = element.querySelector?.('input[type=radio],input[type=checkbox]');
+                                const label = element.closest?.('label');
+                                const labelled = label?.control || label?.querySelector?.('input[type=radio],input[type=checkbox]');
+                                const control = own || nested || labelled;
+                                if (control) return Boolean(control.checked);
+                                const selected = element.getAttribute('aria-selected');
+                                const checked = element.getAttribute('aria-checked');
+                                return selected === 'true' || checked === 'true';
+                            }"""
+                        )
+                        if not visibility_confirmed:
+                            return {
+                                "status": "NEEDS_ACTION",
+                                "code": "VISIBILITY_NOT_CONFIRMED",
+                                "stage": "PUBLISH",
+                                "message": "hh.ru не подтвердил выбранную видимость. Публикация остановлена.",
+                                "required_action": "SELECT_VISIBILITY",
+                            }
                     old_resume = page.locator(
                         '[data-qa*="resume-selector" i] input[type="radio"]:checked, '
                         '[data-qa*="resume-selector" i] input[type="checkbox"]:checked'

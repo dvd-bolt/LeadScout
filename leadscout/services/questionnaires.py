@@ -44,20 +44,36 @@ class QuestionnaireService(_Service):
             question = by_id.get(field_id)
             answer_type = str(answer.get("answer_type") or "")
             value = answer.get("value")
+            values = value if isinstance(value, list) else [value]
             if (
                 not question
                 or field_id in seen
                 or answer_type != question.get("answer_type", "text")
-                or not isinstance(value, str)
-                or not value.strip()
-                or len(value) > 2_000
+                or not values
+                or any(
+                    not isinstance(option, str) or not option.strip() or len(option) > 2_000
+                    for option in values
+                )
+                or (isinstance(value, list) and answer_type != "checkbox")
             ):
                 raise ServiceError("INVALID_INPUT", "Ответ не соответствует вопросу анкеты.")
             options = question.get("options") or []
-            if answer_type in {"radio", "checkbox"} and value not in options:
+            if answer_type in {"radio", "checkbox", "select"} and any(
+                option not in options for option in values
+            ):
                 raise ServiceError("INVALID_INPUT", "Выберите предложенный вариант ответа.")
             seen.add(field_id)
-            normalized.append({"field_id": field_id, "answer_type": answer_type, "value": value.strip()})
+            normalized.append(
+                {
+                    "field_id": field_id,
+                    "answer_type": answer_type,
+                    "value": (
+                        [option.strip() for option in value]
+                        if isinstance(value, list)
+                        else value.strip()
+                    ),
+                }
+            )
         if require_all:
             missing = [
                 str(question.get("field_id"))
@@ -80,8 +96,11 @@ class QuestionnaireService(_Service):
         apply_id: int,
         cover_letter: str | None = None,
         answers: list[Any] | None = None,
+        expected_revision: int | None = None,
     ) -> dict:
         item = await self._item(user_id, apply_id)
+        if expected_revision is not None and int(item.get("revision", 0)) != expected_revision:
+            raise ServiceError("CONFLICT", "Анкета была изменена. Обновите данные перед сохранением.")
         if item.get("status") not in _EDITABLE_QUESTIONNAIRE_STATES:
             raise ServiceError("CONFLICT", "Анкета уже обрабатывается.")
         if cover_letter is not None and (not isinstance(cover_letter, str) or len(cover_letter) > 10_000):
@@ -91,8 +110,13 @@ class QuestionnaireService(_Service):
             if not isinstance(answers, list) or len(answers) > 50:
                 raise ServiceError("INVALID_INPUT", "Слишком много ответов в анкете.")
             normalized = self._validate_answers(self._questions(item), answers, require_all=False)
+        edit_kwargs = {"return_item": True}
+        if expected_revision is not None:
+            edit_kwargs["expected_revision"] = expected_revision
         saved = await _await(
-            self.db.edit_pending_questionnaire(user_id, apply_id, cover_letter, normalized, return_item=True)
+            self.db.edit_pending_questionnaire(
+                user_id, apply_id, cover_letter, normalized, **edit_kwargs
+            )
         )
         if not saved:
             raise ServiceError("CONFLICT", "Анкета уже обрабатывается.")

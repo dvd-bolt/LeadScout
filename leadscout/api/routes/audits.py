@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 from pathlib import Path
@@ -30,10 +31,16 @@ def temporary_pdf(prefix: str) -> Path:
 @router.get("")
 async def list_audits(
     account_id: int | None = None,
+    before_id: int | None = None,
+    limit: int = 100,
+    independent_only: bool = False,
     session: dict = Depends(current_user),
     context: AppContext = Depends(get_context),
 ) -> list[dict]:
-    return await context.db.list_resume_audits(int(session["user_id"]), account_id=account_id)
+    return await context.db.list_resume_audits(
+        int(session["user_id"]), account_id=account_id, before_id=before_id,
+        limit=limit, independent_only=independent_only,
+    )
 
 
 @router.post("", status_code=status.HTTP_202_ACCEPTED)
@@ -53,7 +60,11 @@ async def create_audit(
     except ServiceError as exc:
         raise service_http_error(exc) from exc
     return await context.operations.schedule(
-        user_id, "resume-audit", lambda: context.services.audits.run(source), account_id=source.account_id
+        user_id,
+        "resume-audit",
+        lambda: context.services.audits.run(source),
+        resource=f"audit:{source.resume_snapshot_id or hashlib.sha256(source.resume_text.encode()).hexdigest()}",
+        account_id=source.account_id,
     )
 
 
@@ -80,7 +91,13 @@ async def create_pdf_audit(
         source = await context.services.audits.prepare(user_id, account_id=account_id, resume_text=resume_text)
         return await context.services.audits.run(source)
 
-    return await context.operations.schedule(user_id, "pdf-resume-audit", job, account_id=account_id)
+    return await context.operations.schedule(
+        user_id,
+        "pdf-resume-audit",
+        job,
+        resource=f"pdf-audit:{hashlib.sha256(contents).hexdigest()}",
+        account_id=account_id,
+    )
 
 
 @router.post("/{audit_id}/match", status_code=status.HTTP_202_ACCEPTED)
@@ -104,6 +121,7 @@ async def match_audit(
             vacancy_text=payload.vacancy_text,
             vacancy_url=payload.vacancy_url,
         ),
+        resource=f"match:{audit_id}:{hashlib.sha256((payload.vacancy_text or payload.vacancy_url or '').encode()).hexdigest()}",
         account_id=audit.get("account_id"),
     )
 

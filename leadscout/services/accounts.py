@@ -85,8 +85,23 @@ class AccountService(_Service):
 
     async def delete(self, user_id: int, account_id: int) -> bool:
         await self._account(user_id, account_id)
-        await _await(self.coordinator.stop_account(user_id, account_id))
-        deleted = await _await(self.db.delete_hh_account_for_user(user_id, account_id))
-        if not deleted:
-            raise ServiceError("NOT_FOUND", "Аккаунт не найден.")
-        return True
+        access = getattr(self.coordinator, "access", None)
+        barrier = f"delete:{user_id}:{account_id}"
+        if access is not None:
+            # Serialize the deletion fence with operation admission. An
+            # operation already inside admission finishes registration first,
+            # so the cancellation pass below cannot miss it.
+            async with access.admission(user_id):
+                access.account_barriers[account_id].add(barrier)
+        try:
+            await _await(self.coordinator.stop_account(user_id, account_id))
+            monitor = getattr(self.coordinator, "monitor", None)
+            if monitor is not None:
+                await _await(monitor.stop_account(user_id, account_id))
+            deleted = await _await(self.db.delete_hh_account_for_user(user_id, account_id))
+            if not deleted:
+                raise ServiceError("NOT_FOUND", "Аккаунт не найден.")
+            return True
+        finally:
+            if access is not None:
+                access.account_barriers[account_id].discard(barrier)

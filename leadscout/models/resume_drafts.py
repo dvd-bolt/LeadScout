@@ -25,6 +25,7 @@ class PersonalData(DraftModel):
     birth_date: str = Field(default="", max_length=10)
     gender: str = Field(default="", max_length=30)
     city: str = Field(default="", max_length=200)
+    hh_city_id: str = Field(default="", max_length=100)
     citizenships: list[str] = Field(default_factory=list, max_length=20)
     work_authorizations: list[str] = Field(default_factory=list, max_length=20)
 

@@ -229,13 +229,46 @@ def validate_draft(data: ResumeDraftData) -> dict:
     required("personal.last_name", data.personal.last_name, "Укажите фамилию.")
     required("personal.city", data.personal.city, "Укажите город.")
     required("personal.birth_date", data.personal.birth_date, "Укажите точную дату рождения.")
+    required("publication.visibility", data.publication.visibility, "Выберите видимость резюме.")
     if data.personal.birth_date:
         try:
-            date.fromisoformat(data.personal.birth_date)
+            birth_date = date.fromisoformat(data.personal.birth_date)
+            if birth_date >= date.today():
+                errors.append(
+                    {"path": "personal.birth_date", "code": "INVALID_DATE", "message": "Дата рождения должна быть в прошлом."}
+                )
         except ValueError:
             errors.append(
                 {"path": "personal.birth_date", "code": "INVALID_DATE", "message": "Дата должна быть в формате ГГГГ-ММ-ДД."}
             )
+    if data.contacts.email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", data.contacts.email):
+        errors.append({"path": "contacts.email", "code": "INVALID_EMAIL", "message": "Укажите корректный email."})
+    valid_months = {str(month) for month in range(1, 13)} | {
+        "январь", "февраль", "март", "апрель", "май", "июнь",
+        "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь",
+    }
+    month_numbers = {
+        name: number
+        for number, name in enumerate(
+            ("январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"),
+            1,
+        )
+    }
+
+    def month_number(value: str) -> int | None:
+        normalized = value.casefold().strip().lstrip("0")
+        if normalized.isdigit() and 1 <= int(normalized) <= 12:
+            return int(normalized)
+        return month_numbers.get(normalized)
+
+    def valid_year(path: str, value: str, *, allow_future: bool = False) -> None:
+        maximum = date.today().year + 10 if allow_future else date.today().year
+        if value and (not value.isdigit() or not 1900 <= int(value) <= maximum):
+            errors.append({"path": path, "code": "INVALID_YEAR", "message": "Укажите корректный год из четырёх цифр."})
+
+    def valid_month(path: str, value: str) -> None:
+        if value and value.casefold().lstrip("0") not in valid_months:
+            errors.append({"path": path, "code": "INVALID_MONTH", "message": "Укажите корректный месяц."})
     for index, item in enumerate(data.experiences):
         if not item.selected:
             continue
@@ -249,11 +282,47 @@ def validate_draft(data: ResumeDraftData) -> dict:
         if not item.is_current:
             required(f"experiences.{index}.end_month", item.end_month, f"Укажите месяц окончания работы №{index + 1}.")
             required(f"experiences.{index}.end_year", item.end_year, f"Укажите год окончания работы №{index + 1}.")
+        valid_month(f"experiences.{index}.start_month", item.start_month)
+        valid_month(f"experiences.{index}.end_month", item.end_month)
+        valid_year(f"experiences.{index}.start_year", item.start_year)
+        valid_year(f"experiences.{index}.end_year", item.end_year)
+        if item.start_year.isdigit() and item.end_year.isdigit() and not item.is_current:
+            start = (int(item.start_year), month_number(item.start_month) or 0)
+            end = (int(item.end_year), month_number(item.end_month) or 0)
+            if end < start:
+                errors.append({
+                    "path": f"experiences.{index}.end_month",
+                    "code": "INVALID_PERIOD",
+                    "message": "Окончание работы не может быть раньше начала.",
+                })
     for index, item in enumerate(data.education):
         if not item.selected:
             continue
         required(f"education.{index}.institution", item.institution, f"Укажите учебное заведение №{index + 1}.")
         required(f"education.{index}.end_year", item.end_year, f"Укажите год окончания обучения №{index + 1}.")
+        valid_year(f"education.{index}.end_year", item.end_year, allow_future=True)
+    for key in ("courses", "exams", "certificates", "recommendations"):
+        for index, item in enumerate(getattr(data.additional, key)):
+            valid_year(f"additional.{key}.{index}.year", item.year, allow_future=True)
+    if data.contacts.phone:
+        digits = re.sub(r"\D", "", data.contacts.phone)
+        if not 10 <= len(digits) <= 15:
+            errors.append({"path": "contacts.phone", "code": "INVALID_PHONE", "message": "Укажите корректный номер телефона."})
+    for index, link in enumerate(data.about.links):
+        if link.url and not re.fullmatch(r"https?://[^\s]+", link.url, flags=re.IGNORECASE):
+            errors.append({"path": f"about.links.{index}.url", "code": "INVALID_URL", "message": "Ссылка должна начинаться с http:// или https://."})
+    choices = (
+        ("personal.gender", data.personal.gender, {"", "Мужчина", "Женщина"}),
+        ("work_conditions.currency", data.work_conditions.currency, {"RUR", "USD", "EUR"}),
+        (
+            "publication.visibility",
+            data.publication.visibility,
+            {"Виден всем работодателям", "Виден только зарегистрированным работодателям", "Не виден никому"},
+        ),
+    )
+    for path, value, allowed in choices:
+        if value not in allowed:
+            errors.append({"path": path, "code": "INVALID_CHOICE", "message": "Выберите значение из списка."})
     return {"valid": not errors, "field_errors": errors}
 
 
@@ -555,6 +624,9 @@ class ResumeDraftService(_Service):
         if draft.get("preflight_revision") != expected_revision or not draft.get("preflight_fingerprint"):
             raise ServiceError("CONFLICT", "Сначала выполните проверку данных и профиля hh.ru.")
         conflicts = list((draft.get("preflight") or {}).get("conflicts") or [])
+        data = ResumeDraftData.model_validate(draft["data"])
+        if not data.publication.target_account_confirmed:
+            raise ServiceError("CONFLICT", "Подтвердите целевой аккаунт hh.ru для этой версии черновика.")
         if conflicts and confirmation_fingerprint != draft["preflight_fingerprint"]:
             raise ServiceError("CONFLICT", "Подтвердите показанные изменения профиля для этой версии черновика.")
         if not idempotency_key or len(idempotency_key) > 200:
@@ -648,12 +720,17 @@ class ResumeDraftService(_Service):
                 )
             )
 
+        publish_data = dict(draft["data"])
+        publish_data["_confirmed_profile_changes"] = bool(
+            (draft.get("preflight") or {}).get("conflicts")
+            and attempt.get("confirmed_fingerprint") == draft.get("preflight_fingerprint")
+        )
         result = _mapping(
             await _await(
                 self.resume_manager.publish_resume_draft(
                     user_id,
                     attempt["account_id"],
-                    draft["data"],
+                    publish_data,
                     attempt=attempt,
                     on_external_saved=external_saved,
                 )
@@ -727,7 +804,15 @@ class ResumeDraftService(_Service):
         )
         return {**result, "attempt_id": attempt["id"]}
 
-    async def resume(self, user_id: int, account_id: int, draft_id: int) -> dict:
+    async def resume(
+        self,
+        user_id: int,
+        account_id: int,
+        draft_id: int,
+        expected_revision: int | None = None,
+        confirmation_fingerprint: str = "",
+    ) -> dict:
+        draft = await self._draft(user_id, account_id, draft_id)
         attempt = await _await(self.db.get_latest_resume_publish_attempt(user_id, account_id, draft_id))
         if not attempt:
             raise ServiceError("NOT_FOUND", "Незавершённая публикация не найдена.")
@@ -742,6 +827,26 @@ class ResumeDraftService(_Service):
             }
         if attempt["status"] not in {"NEEDS_ACTION", "PARTIAL"}:
             return {"status": attempt["status"], "attempt_id": attempt["id"], **attempt.get("result", {})}
+        if expected_revision is not None and draft["revision"] != expected_revision:
+            raise ServiceError("CONFLICT", "Черновик изменился. Выполните сравнение с hh.ru ещё раз.")
+        data = ResumeDraftData.model_validate(draft["data"])
+        if not data.publication.target_account_confirmed:
+            raise ServiceError("CONFLICT", "Снова подтвердите целевой аккаунт hh.ru.")
+        if draft.get("preflight_revision") != draft.get("revision"):
+            raise ServiceError("CONFLICT", "Черновик изменился. Выполните сравнение с hh.ru ещё раз.")
+        conflicts = list((draft.get("preflight") or {}).get("conflicts") or [])
+        if conflicts and confirmation_fingerprint != draft.get("preflight_fingerprint"):
+            raise ServiceError("CONFLICT", "Подтвердите актуальные изменения профиля перед продолжением.")
+        await _await(self.db.update_resume_publish_attempt(
+            user_id,
+            attempt["id"],
+            stage=str(attempt.get("stage") or "PREFLIGHT_RECHECK"),
+            status=str(attempt.get("status") or "PARTIAL"),
+            result=attempt.get("result") or {},
+            hh_resume_id=str(attempt.get("hh_resume_id") or ""),
+            hh_resume_url=str(attempt.get("hh_resume_url") or ""),
+            confirmed_fingerprint=confirmation_fingerprint,
+        ))
         return await self.run_publish(user_id, attempt["id"])
 
 

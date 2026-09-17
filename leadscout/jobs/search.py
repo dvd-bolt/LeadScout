@@ -86,6 +86,7 @@ class AccountSearchJob:
         engine = await self.dependencies.get_browser_engine(account.get("proxy_url") or None)
         context = None
         processed = 0
+        search_errors: list[str] = []
         active_attempt: ApplicationAttemptTracer | None = None
         try:
             context = await engine.create_context(storage_state=storage_state)
@@ -97,13 +98,34 @@ class AccountSearchJob:
             for keyword in keywords:
                 if not await self._account_may_continue(user_id, account_id):
                     break
-                vacancies = await self._collect_vacancies(search_page, user_id, account_id, keyword, seen)
+                collected = await self._collect_vacancies(
+                    search_page, user_id, account_id, keyword, seen
+                )
+                if isinstance(collected, tuple):
+                    vacancies, keyword_errors = collected
+                else:  # Compatibility with injected collectors used by extensions.
+                    vacancies, keyword_errors = collected, []
+                search_errors.extend(keyword_errors)
                 for vacancy_url, vacancy_title in vacancies:
                     current = await self.dependencies.get_account_for_user(user_id, account_id)
                     if not current or not await self._account_may_continue(user_id, account_id):
                         break
+                    snapshot = await self.dependencies.get_active_resume_snapshot(user_id, account_id)
+                    source_resume = {
+                        "id": snapshot["id"] if snapshot and snapshot["hh_resume_id"] == current["active_resume_hh_id"] else None,
+                        "hh_resume_id": current["active_resume_hh_id"],
+                        "title": current["active_resume_title"],
+                        "extracted_text": current["resume_text"],
+                    }
                     active_attempt = await ApplicationAttemptTracer.start(
-                        self.dependencies, user_id, account_id, vacancy_url, vacancy_title
+                        self.dependencies,
+                        user_id,
+                        account_id,
+                        vacancy_url,
+                        vacancy_title,
+                        resume_snapshot_id=source_resume["id"],
+                        resume_hh_id=source_resume["hh_resume_id"],
+                        resume_title=source_resume["title"],
                     )
                     if stop_words and any(word in vacancy_title.lower() for word in stop_words):
                         await self._record_terminal(
@@ -145,17 +167,6 @@ class AccountSearchJob:
                         active_attempt = None
                         continue
                     page = await context.new_page()
-                    snapshot = await self.dependencies.get_active_resume_snapshot(user_id, account_id)
-                    source_resume = {
-                        "id": (
-                            snapshot["id"]
-                            if snapshot and snapshot["hh_resume_id"] == current["active_resume_hh_id"]
-                            else None
-                        ),
-                        "hh_resume_id": current["active_resume_hh_id"],
-                        "title": current["active_resume_title"],
-                        "extracted_text": current["resume_text"],
-                    }
                     captcha_uri = ""
                     captcha_page_url = ""
                     status, cover_letter, extra = "ERROR_BROWSER", None, None
@@ -214,6 +225,9 @@ class AccountSearchJob:
                                 company,
                                 details=reason,
                                 attempt_id=active_attempt.attempt_id if active_attempt else "",
+                                resume_snapshot_id=source_resume["id"],
+                                resume_hh_id=source_resume["hh_resume_id"],
+                                resume_title=source_resume["title"],
                             )
                         except Exception:
                             # hh.ru has confirmed the response, but a local write
@@ -319,7 +333,8 @@ class AccountSearchJob:
                         if status == "ERROR_SESSION_EXPIRED":
                             await self.dependencies.update_account_session(user_id, account_id, b"", "EXPIRED")
                         await self._record_terminal(
-                            user_id, account_id, vacancy_url, status, title, company, tracer=active_attempt
+                            user_id, account_id, vacancy_url, status, title, company,
+                            tracer=active_attempt, reason_override=str(details.get("reason") or ""),
                         )
                     else:
                         await self._record_terminal(
@@ -327,7 +342,30 @@ class AccountSearchJob:
                         )
                     active_attempt = None
 
-            return {"status": "SUCCESS", "processed": processed}
+            if search_errors and not seen:
+                await self.dependencies.record_search_run(
+                    user_id, account_id, "ERROR", processed, len(seen), ", ".join(dict.fromkeys(search_errors))
+                )
+                return {
+                    "status": "ERROR",
+                    "processed": processed,
+                    "message": "Поиск вакансий не выполнен: " + ", ".join(dict.fromkeys(search_errors)),
+                    "search_errors": search_errors,
+                }
+            await self.dependencies.record_search_run(
+                user_id, account_id, "WARNING" if search_errors else "SUCCESS",
+                processed, len(seen), ", ".join(dict.fromkeys(search_errors)),
+            )
+            return {
+                "status": "SUCCESS",
+                "processed": processed,
+                "search_errors": search_errors,
+                "message": (
+                    f"Поиск завершён с предупреждениями: {len(search_errors)}."
+                    if search_errors
+                    else f"Поиск завершён. Подтверждённых откликов: {processed}."
+                ),
+            }
         except asyncio.CancelledError:
             logger.info("Account task %d cancelled", account_id)
             if active_attempt:
@@ -341,6 +379,12 @@ class AccountSearchJob:
             raise
         except Exception as exc:
             logger.error("Account task %d failed: %s", account_id, type(exc).__name__)
+            try:
+                await self.dependencies.record_search_run(
+                    user_id, account_id, "ERROR", processed, 0, f"ERROR_{type(exc).__name__.upper()}"
+                )
+            except Exception:
+                logger.exception("Search run result could not be persisted")
             return {"status": "ERROR"}
         finally:
             if context:
@@ -384,6 +428,7 @@ class AccountSearchJob:
         company: str = "",
         *,
         tracer: ApplicationAttemptTracer | None = None,
+        reason_override: str = "",
     ) -> None:
         """Persist exactly one user-visible terminal event for an attempt."""
         if tracer is None:
@@ -391,6 +436,8 @@ class AccountSearchJob:
                 self.dependencies, user_id, account_id, vacancy_url, vacancy_title
             )
         reason = await self._finish_attempt(tracer, status)
+        if reason_override.strip():
+            reason = reason_override.strip()[:1000]
         await self.dependencies.record_application_event(
             user_id,
             account_id,
@@ -434,8 +481,9 @@ class AccountSearchJob:
         account_id: int,
         keyword: str,
         seen: set[str],
-    ) -> list[tuple[str, str]]:
+    ) -> tuple[list[tuple[str, str]], list[str]]:
         found: list[tuple[str, str]] = []
+        errors: list[str] = []
         for page_number in range(3):
             account = await self.dependencies.get_account_for_user(user_id, account_id)
             if not account or not await self._account_may_continue(user_id, account_id):
@@ -453,19 +501,23 @@ class AccountSearchJob:
                 await page.goto(url, wait_until="domcontentloaded", timeout=25_000)
             except Exception:
                 logger.warning("Search navigation failed for account %d", account_id)
+                errors.append("ERROR_SEARCH_NAVIGATION")
                 continue
             if "/account/captcha" in (page.url or "").lower():
                 read_status = "ERROR_CAPTCHA"
                 cards = []
             elif "account/login" in (page.url or "").lower():
                 await self.dependencies.update_account_session(user_id, account_id, b"", "EXPIRED")
+                errors.append("ERROR_SESSION_EXPIRED")
                 break
             else:
                 read_status, cards = await extract_search_vacancies(page)
             if read_status == "ERROR_SESSION_EXPIRED":
                 await self.dependencies.update_account_session(user_id, account_id, b"", "EXPIRED")
+                errors.append("ERROR_SESSION_EXPIRED")
                 break
             if read_status != "SUCCESS":
+                errors.append(read_status)
                 # There is no vacancy attempt to record yet.  Keep the concrete
                 # code in the worker log rather than creating a false application
                 # event with a search URL or query parameters.
@@ -495,4 +547,4 @@ class AccountSearchJob:
                     continue
                 seen.add(vacancy_id)
                 found.append((clean, title))
-        return found
+        return found, errors

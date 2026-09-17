@@ -24,15 +24,19 @@ async def save_resume_audit(
     source_resume_text: str = "",
     source_resume_snapshot_id: int | None = None,
 ) -> int:
+    source_account_name = ""
     if account_id is not None and not await get_account_for_user(database, user_id, account_id):
         raise PermissionError("Account does not belong to user")
+    if account_id is not None:
+        account = await get_account_for_user(database, user_id, account_id)
+        source_account_name = str((account or {}).get("account_name") or (account or {}).get("phone_or_email") or "")
     async with database.connection() as connection:
         cursor = await connection.execute(
             """INSERT INTO resume_audits
                    (user_id, account_id, profession_name, overall_score, category_scores_json,
                     penalties_json, top_recommendations_json, insights_json, summary_text,
-                    source_resume_snapshot_id, source_resume_text)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    source_resume_snapshot_id, source_resume_text, source_account_name)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 user_id,
                 account_id,
@@ -45,6 +49,7 @@ async def save_resume_audit(
                 summary_text,
                 source_resume_snapshot_id,
                 source_resume_text,
+                source_account_name,
             ),
         )
         await connection.commit()
@@ -71,7 +76,12 @@ async def get_user_latest_audit(database: Database, user_id: int) -> dict | None
 
 
 async def list_resume_audits(
-    database: Database, user_id: int, account_id: int | None = None, limit: int = 30
+    database: Database,
+    user_id: int,
+    account_id: int | None = None,
+    limit: int = 100,
+    before_id: int | None = None,
+    independent_only: bool = False,
 ) -> list[dict]:
     limit = max(1, min(limit, 100))
     params: list[object] = [user_id]
@@ -79,6 +89,11 @@ async def list_resume_audits(
     if account_id is not None:
         account_clause = " AND account_id = ?"
         params.append(account_id)
+    elif independent_only:
+        account_clause = " AND account_id IS NULL"
+    if before_id is not None:
+        account_clause += " AND id < ?"
+        params.append(before_id)
     params.append(limit)
     async with database.connection() as connection:
         cursor = await connection.execute(

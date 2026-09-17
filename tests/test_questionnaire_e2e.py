@@ -88,6 +88,9 @@ async def test_conflict_refreshes_draft_without_automatic_resubmission(mini_app,
     await page.goto(f"http://leadscout.test/?target=questionnaire&apply_id={qid}#/")
     await page.get_by_role("button", name="Подтвердить отправку", exact=True).click()
     await expect(page.get_by_role("status")).to_contain_text("Анкета уже изменилась")
+    await expect(page.get_by_text("Серверное письмо: «Concurrent draft»", exact=True)).to_be_visible()
+    await expect(page.get_by_text("Ваше письмо: «Original letter»", exact=True)).to_be_visible()
+    await page.get_by_role("button", name="Загрузить серверные ответы", exact=True).click()
     await expect(page.get_by_label("Сопроводительное письмо", exact=False)).to_have_value("Concurrent draft")
     assert not external_submission.calls
     assert (await mini_app.runtime.db.get_pending_questionnaire_for_user(42, qid))["status"] == "PENDING"

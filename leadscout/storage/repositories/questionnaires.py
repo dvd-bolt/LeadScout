@@ -6,11 +6,16 @@ import json
 
 from leadscout.storage.connection import Database
 from leadscout.storage.repositories.accounts import get_account_for_user, get_active_account
+from leadscout.storage.repositories.applications import normalize_vacancy_hh_id
 from leadscout.storage.repositories.resumes import get_active_resume_snapshot
 
 
 async def list_pending_questionnaires(
-    database: Database, user_id: int, account_id: int | None = None, limit: int = 100
+    database: Database,
+    user_id: int,
+    account_id: int | None = None,
+    limit: int = 100,
+    before_id: int | None = None,
 ) -> list[dict]:
     limit = max(1, min(limit, 100))
     params: list[object] = [user_id]
@@ -18,12 +23,15 @@ async def list_pending_questionnaires(
     if account_id is not None:
         account_clause = " AND account_id = ?"
         params.append(account_id)
+    if before_id is not None:
+        account_clause += " AND id < ?"
+        params.append(before_id)
     params.append(limit)
     async with database.connection() as connection:
         cursor = await connection.execute(
             f"""SELECT * FROM pending_questionnaires WHERE user_id = ?{account_clause}
                 AND status NOT IN ('SUBMITTED', 'SKIPPED')
-                ORDER BY updated_at DESC, id DESC LIMIT ?""",
+                ORDER BY id DESC LIMIT ?""",
             params,
         )
         return [dict(row) for row in await cursor.fetchall()]
@@ -48,9 +56,9 @@ async def has_open_questionnaire_for_vacancy(
     async with database.connection() as connection:
         cursor = await connection.execute(
             """SELECT 1 FROM pending_questionnaires
-               WHERE user_id = ? AND account_id = ? AND vacancy_url = ?
-                 AND status IN ('PENDING', 'SUBMITTING', 'NEEDS_REVIEW') LIMIT 1""",
-            (user_id, account_id, vacancy_url),
+               WHERE user_id = ? AND account_id = ? AND vacancy_hh_id = ?
+                 AND status IN ('PENDING', 'SUBMITTING', 'NEEDS_REVIEW', 'SKIPPED') LIMIT 1""",
+            (user_id, account_id, normalize_vacancy_hh_id(vacancy_url)),
         )
         return await cursor.fetchone() is not None
 
@@ -86,12 +94,13 @@ async def save_pending_questionnaire_account(
     if resume_snapshot is None:
         resume_snapshot = await get_active_resume_snapshot(database, user_id, account_id)
     snapshot = resume_snapshot or {}
+    vacancy_hh_id = normalize_vacancy_hh_id(vacancy_url)
     async with database.connection() as connection:
         cursor = await connection.execute(
             """SELECT id FROM pending_questionnaires
-               WHERE user_id = ? AND account_id = ? AND vacancy_url = ?
+               WHERE user_id = ? AND account_id = ? AND vacancy_hh_id = ?
                  AND status IN ('PENDING', 'SUBMITTING') ORDER BY id DESC LIMIT 1""",
-            (user_id, account_id, vacancy_url),
+            (user_id, account_id, vacancy_hh_id),
         )
         existing = await cursor.fetchone()
         if existing:
@@ -99,8 +108,8 @@ async def save_pending_questionnaire_account(
         cursor = await connection.execute(
             """INSERT INTO pending_questionnaires
                    (user_id, account_id, vacancy_url, vacancy_title, cover_letter, questions_json, ai_payload_json,
-                    resume_snapshot_id, resume_hh_id, resume_title, resume_text)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    resume_snapshot_id, resume_hh_id, resume_title, resume_text, vacancy_hh_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 user_id,
                 account_id,
@@ -113,6 +122,7 @@ async def save_pending_questionnaire_account(
                 snapshot.get("hh_resume_id") or account.get("active_resume_hh_id", ""),
                 snapshot.get("title") or account.get("active_resume_title", ""),
                 snapshot.get("extracted_text") or account.get("resume_text", ""),
+                vacancy_hh_id,
             ),
         )
         await connection.commit()
@@ -271,6 +281,7 @@ async def edit_pending_questionnaire(
     cover_letter: str | None,
     answers: list[dict] | None,
     *,
+    expected_revision: int | None = None,
     return_item: bool = False,
 ) -> bool | dict:
     """Save atomically; optionally return the exact committed draft/version.
@@ -281,8 +292,9 @@ async def edit_pending_questionnaire(
         await connection.execute("BEGIN IMMEDIATE")
         cursor = await connection.execute(
             """SELECT cover_letter, ai_payload_json FROM pending_questionnaires
-               WHERE id = ? AND user_id = ? AND status IN ('PENDING', 'FAILED', 'NEEDS_REVIEW')""",
-            (apply_id, user_id),
+               WHERE id = ? AND user_id = ? AND status IN ('PENDING', 'FAILED', 'NEEDS_REVIEW')
+                 AND (? IS NULL OR revision = ?)""",
+            (apply_id, user_id, expected_revision, expected_revision),
         )
         item = await cursor.fetchone()
         if not item:

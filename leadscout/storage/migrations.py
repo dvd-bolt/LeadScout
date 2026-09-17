@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 import aiosqlite
 
@@ -11,7 +12,7 @@ from leadscout.storage.admin_schema import SCHEMA as ADMIN_SCHEMA
 from leadscout.storage.connection import Database
 
 logger = logging.getLogger(__name__)
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 12
 
 
 RESUME_DRAFT_SCHEMA = """
@@ -91,6 +92,59 @@ async def add_missing_column(connection: aiosqlite.Connection, table: str, defin
         await connection.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
+async def migrate_v10(connection: aiosqlite.Connection) -> None:
+    await add_missing_column(connection, "application_events", "resolved_at TEXT NOT NULL DEFAULT ''")
+    await add_missing_column(connection, "application_attempts", "resolved_at TEXT NOT NULL DEFAULT ''")
+    await add_missing_column(connection, "pending_questionnaires", "vacancy_hh_id TEXT NOT NULL DEFAULT ''")
+    cursor = await connection.execute(
+        "SELECT id, vacancy_url FROM pending_questionnaires WHERE vacancy_hh_id = ''"
+    )
+    updates = []
+    for row in await cursor.fetchall():
+        match = re.search(r"(?:^|/vacancy/)(\d+)(?:/|$|[?#])", row["vacancy_url"] or "")
+        if match:
+            updates.append((match.group(1), row["id"]))
+    if updates:
+        await connection.executemany(
+            "UPDATE pending_questionnaires SET vacancy_hh_id = ? WHERE id = ?", updates
+        )
+    await connection.execute("DROP INDEX IF EXISTS uq_resume_active_attempt")
+    await connection.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS uq_resume_active_attempt
+           ON resume_publish_attempts(draft_id)
+           WHERE status IN ('PENDING', 'PUBLISHING', 'NEEDS_ACTION', 'UNCERTAIN', 'PARTIAL')"""
+    )
+    await connection.execute("PRAGMA user_version=10")
+
+
+async def migrate_v11(connection: aiosqlite.Connection) -> None:
+    await add_missing_column(connection, "operations", "account_id INTEGER")
+    await add_missing_column(connection, "operations", "resource TEXT NOT NULL DEFAULT ''")
+    await connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_operations_resource ON operations(user_id, kind, resource, updated_at DESC)"
+    )
+    await connection.execute(
+        """CREATE TABLE IF NOT EXISTS search_runs (
+               id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, account_id INTEGER NOT NULL,
+               status TEXT NOT NULL, processed INTEGER NOT NULL DEFAULT 0, found INTEGER NOT NULL DEFAULT 0,
+               details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+               FOREIGN KEY (account_id) REFERENCES hh_accounts(id) ON DELETE CASCADE)"""
+    )
+    await connection.execute("CREATE INDEX IF NOT EXISTS idx_search_runs_owner ON search_runs(user_id, account_id, id DESC)")
+    await connection.execute("PRAGMA user_version=11")
+
+
+async def migrate_v12(connection: aiosqlite.Connection) -> None:
+    for table in ("application_attempts", "application_events", "hh_applies"):
+        await add_missing_column(connection, table, "resume_snapshot_id INTEGER")
+        await add_missing_column(connection, table, "resume_hh_id TEXT NOT NULL DEFAULT ''")
+        await add_missing_column(connection, table, "resume_title TEXT NOT NULL DEFAULT ''")
+    await add_missing_column(connection, "hh_applies", "attempt_id TEXT NOT NULL DEFAULT ''")
+    await add_missing_column(connection, "resume_audits", "source_account_name TEXT NOT NULL DEFAULT ''")
+    await connection.execute("PRAGMA user_version=12")
+
+
 class MigrationConflictError(RuntimeError):
     """A migration cannot safely normalize colliding account identities."""
 
@@ -126,7 +180,7 @@ async def normalized_accounts(connection: aiosqlite.Connection) -> list[tuple[st
 
 
 async def init_db(database: Database) -> None:
-    """Create or transactionally migrate a database to schema v9."""
+    """Create or transactionally migrate a database to the current schema."""
     async with database.connection() as connection:
         await connection.execute("PRAGMA synchronous=NORMAL")
         await connection.execute("PRAGMA temp_store=MEMORY")
@@ -141,9 +195,30 @@ async def init_db(database: Database) -> None:
             await add_missing_column(connection, "hh_accounts", "pending_captcha_created_at TEXT NOT NULL DEFAULT ''")
             await connection.commit()
             return
+        if version == 11:
+            await migrate_v12(connection)
+            await connection.commit()
+            await connection.execute("PRAGMA journal_mode=WAL")
+            return
+        if version == 10:
+            await migrate_v11(connection)
+            await migrate_v12(connection)
+            await connection.commit()
+            await connection.execute("PRAGMA journal_mode=WAL")
+            return
+        if version == 9:
+            await migrate_v10(connection)
+            await migrate_v11(connection)
+            await migrate_v12(connection)
+            await connection.commit()
+            await connection.execute("PRAGMA journal_mode=WAL")
+            return
         if version == 8:
             await execute_statements(connection, RESUME_DRAFT_SCHEMA)
             await connection.execute("PRAGMA user_version=9")
+            await migrate_v10(connection)
+            await migrate_v11(connection)
+            await migrate_v12(connection)
             await connection.commit()
             await connection.execute("PRAGMA journal_mode=WAL")
             return
@@ -180,6 +255,9 @@ async def init_db(database: Database) -> None:
             )
             await execute_statements(connection, RESUME_DRAFT_SCHEMA)
             await connection.execute("PRAGMA user_version=9")
+            await migrate_v10(connection)
+            await migrate_v11(connection)
+            await migrate_v12(connection)
             await connection.commit()
             await connection.execute("PRAGMA journal_mode=WAL")
             return
@@ -464,6 +542,9 @@ async def init_db(database: Database) -> None:
         )
         await execute_statements(connection, RESUME_DRAFT_SCHEMA)
         await connection.execute("PRAGMA user_version=9")
+        await migrate_v10(connection)
+        await migrate_v11(connection)
+        await migrate_v12(connection)
         await connection.commit()
         await connection.execute("PRAGMA journal_mode=WAL")
     logger.info("SQLite schema v%s initialized: %s", SCHEMA_VERSION, database.path)

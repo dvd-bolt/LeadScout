@@ -187,7 +187,11 @@ async def submit_captcha(
                     user_id,
                     "resume-draft-resume",
                     lambda: context.services.resume_drafts.resume(
-                        user_id, payload.account_id, draft_id
+                        user_id,
+                        payload.account_id,
+                        draft_id,
+                        int(resume_attempt["draft_revision"]),
+                        str(resume_attempt.get("confirmed_fingerprint") or ""),
                     ),
                     resource=str(draft_id),
                     account_id=payload.account_id,

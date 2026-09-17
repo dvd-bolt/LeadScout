@@ -23,7 +23,10 @@ export function EventRow({
     || (POST_SUBMIT_REVIEWABLE.has(event.status) && ["SUBMITTING", "CONFIRMING"].includes(event.stage ?? ""))
   );
   const contents = <><span className={styles.icon}><Icon name={event.status === "ALREADY_APPLIED" ? "check" : event.status.startsWith("APPLIED") ? "send" : event.status.startsWith("ERROR") ? "alert" : "chat"} size={25} /></span>
-    <span className={styles.body}><strong>{event.vacancy_title || "Вакансия"}</strong><small>{eventStatusLabel(event.status)}</small>{event.stage ? <small>Этап: {applicationStageLabel(event.stage)}</small> : null}{event.details ? <small>{event.details}</small> : null}{event.company ? <small>{event.company}</small> : null}
+    <span className={styles.body}><strong>{!to && event.vacancy_hh_id ? <a href={`https://hh.ru/vacancy/${event.vacancy_hh_id}`} target="_blank" rel="noreferrer">{event.vacancy_title || "Вакансия"}</a> : event.vacancy_title || "Вакансия"}</strong><small>{eventStatusLabel(event.status)}</small>{event.stage ? <small>Этап: {applicationStageLabel(event.stage)}</small> : null}{event.details ? <small>{event.details}</small> : null}{event.company ? <small>{event.company}</small> : null}
+      <small>{formatDate(event.resolved_at || event.created_at)} МСК</small>
+      {event.resume_hh_id || event.resume_title ? <small>Отправлено с резюме: {event.resume_title || event.resume_hh_id}</small> : null}
+      {event.cover_letter ? <details><summary>Отправленное письмо</summary><small>{event.cover_letter}</small></details> : null}
       {reviewable && onResolve ? <span className={styles.reviewActions}>
         <button disabled={resolving} onClick={() => onResolve(true)}>Отклик есть на hh.ru</button>
         <button disabled={resolving} onClick={() => onResolve(false)}>Отклика нет</button>

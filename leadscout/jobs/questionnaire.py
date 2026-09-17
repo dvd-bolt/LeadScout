@@ -36,6 +36,9 @@ class QuestionnaireSubmissionJob:
             item["account_id"],
             item.get("vacancy_url", ""),
             item.get("vacancy_title", ""),
+            resume_snapshot_id=item.get("resume_snapshot_id"),
+            resume_hh_id=item.get("resume_hh_id", ""),
+            resume_title=item.get("resume_title", ""),
         )
         if not account or not account.get("encrypted_storage_state"):
             reason = await self._finish_attempt(tracer, "SKIPPED_NO_SESSION")
@@ -94,6 +97,15 @@ class QuestionnaireSubmissionJob:
             submit = self.dependencies.submit_approved_questionnaire
             trace_supported = bool(tracer and self._supports_trace("submit_approved_questionnaire"))
             kwargs = {"trace": tracer.stage} if trace_supported else {}
+            supports_parameter = getattr(self.dependencies, "supports_application_parameter", None)
+            if supports_parameter and supports_parameter(
+                "submit_approved_questionnaire", "expected_questions"
+            ):
+                try:
+                    expected_questions = json.loads(item.get("questions_json") or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    expected_questions = []
+                kwargs["expected_questions"] = expected_questions
             submission_started = True
             success, message = await submit(
                 page, item["vacancy_url"], item.get("cover_letter", ""), answers, item.get("resume_hh_id"), **kwargs
@@ -127,6 +139,9 @@ class QuestionnaireSubmissionJob:
                     item.get("vacancy_title", ""),
                     details=await self._finish_attempt(tracer, "APPLIED_WITH_QUESTIONNAIRE"),
                     attempt_id=tracer.attempt_id if tracer else "",
+                    resume_snapshot_id=item.get("resume_snapshot_id"),
+                    resume_hh_id=item.get("resume_hh_id", ""),
+                    resume_title=item.get("resume_title", ""),
                 )
             except Exception:
                 await self._finish_attempt(tracer, "ERROR_LOCAL_PERSISTENCE")
@@ -240,12 +255,14 @@ def _status_for_message(message: str) -> str:
         "Сессия требует повторного входа.": "ERROR_SESSION_EXPIRED",
         "hh.ru запросил CAPTCHA; требуется действие пользователя.": "ERROR_CAPTCHA",
         "Выбранное резюме не найдено в форме отклика.": "ERROR_NO_RESUME",
+        "Мгновенный отклик не подтверждает выбранное резюме; отправьте его вручную.": "ERROR_NO_RESUME",
         "Вакансия недоступна или закрыта.": "ERROR_UNAVAILABLE",
         "Операция превысила время ожидания; отправка не подтверждена.": "ERROR_TIMEOUT",
         "hh.ru не подтвердил отправку отклика.": "ERROR_SUBMIT_UNCONFIRMED",
         "Вакансия перенаправляет на внешний сайт.": "SKIPPED_EXTERNAL",
         "Кнопка отклика не найдена.": "ERROR_NO_BUTTON",
         "Не удалось заполнить все поля анкеты.": "ERROR_FORM",
+        "Вопросы анкеты изменились. Обновите анкету и подтвердите ответы заново.": "ERROR_QUESTIONNAIRE_CHANGED",
         "Поле сопроводительного письма не появилось или не заполнилось.": "ERROR_LETTER_FIELD",
         "Кнопка отправки анкеты не найдена.": "ERROR_SUBMIT_BUTTON",
     }

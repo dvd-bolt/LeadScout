@@ -43,6 +43,12 @@ services:
     depends_on:
       app:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "backup.py", "--check"]
+      interval: 1h
+      timeout: 30s
+      retries: 2
+      start_period: 2m
 
 volumes:
   leadscout-data:
