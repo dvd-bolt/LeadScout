@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,7 @@ from patchright.async_api import async_playwright
 import parsers.hh_login as hh_login
 import utils.humanization as humanization
 from leadscout.core.identity import hh_national_phone, validate_hh_login
+from leadscout.integrations.login import _login_page_diagnostic
 
 
 @pytest.mark.asyncio
@@ -126,6 +128,59 @@ async def test_login_state_detector_requires_visible_otp_and_uses_safe_codes():
             "code": "HH_LOGIN_REQUEST_REJECTED",
             "message": "hh.ru не подтвердил запрос кода. Проверьте данные и попробуйте позже.",
         }
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+
+@pytest.mark.asyncio
+async def test_auth_diagnostics_show_stage_without_sensitive_values(caplog):
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True)
+    try:
+        page = await browser.new_page()
+        target_url = "https://hh.ru/account/login?backurl=%2Fresume&code=secret-query"
+        await page.route(
+            target_url,
+            lambda route: route.fulfill(
+                body="""
+                <form data-qa="account-login-form">
+                  <input data-qa="otp-code-input" value="123456">
+                  <input name="phone" value="+79990000000">
+                  <div role="alert">Секретный текст +79990000000</div>
+                </form>
+                """,
+                content_type="text/html",
+            ),
+        )
+        await page.goto(target_url)
+        session = hh_login.HHLoginSession(
+            42,
+            "+79990000000",
+            account_id=7,
+            db=SimpleNamespace(),
+            security_factory=SimpleNamespace(),
+        )
+        session.page = page
+
+        diagnostic = await _login_page_diagnostic(page)
+        with caplog.at_level(logging.INFO, logger="leadscout.integrations.login"):
+            await session._trace("test_probe", stage="OTP")
+
+        log_text = caplog.text
+        assert diagnostic == {
+            "host": "hh.ru",
+            "path": "/account/login",
+            "screen": "otp",
+            "frames": 1,
+            "controls": ["account-login-form", "otp-code-input"],
+        }
+        assert "HH_AUTH event=test_probe user_id=42 account_id=7 stage=OTP" in log_text
+        assert "screen=otp" in log_text
+        assert "secret-query" not in log_text
+        assert "+79990000000" not in log_text
+        assert "123456" not in log_text
+        assert "Секретный текст" not in log_text
     finally:
         await browser.close()
         await playwright.stop()
