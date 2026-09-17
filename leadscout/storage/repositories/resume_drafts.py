@@ -70,9 +70,20 @@ async def create_resume_draft(
 async def list_resume_drafts(database: Database, user_id: int, account_id: int) -> list[dict]:
     async with database.connection() as connection:
         cursor = await connection.execute(
-            """SELECT * FROM resume_drafts
-               WHERE user_id = ? AND account_id = ?
-               ORDER BY CASE status WHEN 'COMPLETED' THEN 1 ELSE 0 END, updated_at DESC, id DESC""",
+            """SELECT d.*,
+                      (SELECT p.id FROM resume_publish_attempts p
+                       WHERE p.draft_id = d.id ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1)
+                          AS latest_publish_attempt_id,
+                      (SELECT p.status FROM resume_publish_attempts p
+                       WHERE p.draft_id = d.id ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1)
+                          AS latest_publish_status,
+                      (SELECT p.stage FROM resume_publish_attempts p
+                       WHERE p.draft_id = d.id ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1)
+                          AS latest_publish_stage
+               FROM resume_drafts d
+               WHERE d.user_id = ? AND d.account_id = ?
+               ORDER BY CASE d.status WHEN 'COMPLETED' THEN 1 ELSE 0 END,
+                        d.updated_at DESC, d.id DESC""",
             (user_id, account_id),
         )
         return [_draft(row) for row in await cursor.fetchall()]
@@ -81,7 +92,18 @@ async def list_resume_drafts(database: Database, user_id: int, account_id: int) 
 async def get_resume_draft(database: Database, user_id: int, account_id: int, draft_id: int) -> dict | None:
     async with database.connection() as connection:
         cursor = await connection.execute(
-            "SELECT * FROM resume_drafts WHERE id = ? AND user_id = ? AND account_id = ?",
+            """SELECT d.*,
+                      (SELECT p.id FROM resume_publish_attempts p
+                       WHERE p.draft_id = d.id ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1)
+                          AS latest_publish_attempt_id,
+                      (SELECT p.status FROM resume_publish_attempts p
+                       WHERE p.draft_id = d.id ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1)
+                          AS latest_publish_status,
+                      (SELECT p.stage FROM resume_publish_attempts p
+                       WHERE p.draft_id = d.id ORDER BY p.created_at DESC, p.rowid DESC LIMIT 1)
+                          AS latest_publish_stage
+               FROM resume_drafts d
+               WHERE d.id = ? AND d.user_id = ? AND d.account_id = ?""",
             (draft_id, user_id, account_id),
         )
         return _draft(await cursor.fetchone())
@@ -95,17 +117,27 @@ async def update_resume_draft(
     expected_revision: int,
     data: dict,
     current_step: str,
+    *,
+    validation: dict | None = None,
 ) -> dict | None:
     async with database.connection() as connection:
         cursor = await connection.execute(
             """UPDATE resume_drafts
                SET data_json = ?, current_step = ?, revision = revision + 1,
                    status = CASE WHEN status = 'COMPLETED' THEN 'COMPLETED' ELSE 'DRAFT' END,
-                   validation_json = '{}', preflight_json = '{}', preflight_revision = NULL,
+                   validation_json = ?, preflight_json = '{}', preflight_revision = NULL,
                    preflight_fingerprint = '', updated_at = CURRENT_TIMESTAMP
                WHERE id = ? AND user_id = ? AND account_id = ? AND revision = ?
                  AND status NOT IN ('PUBLISHING', 'COMPLETED')""",
-            (_json(data), current_step, draft_id, user_id, account_id, expected_revision),
+            (
+                _json(data),
+                current_step,
+                _json(validation or {}),
+                draft_id,
+                user_id,
+                account_id,
+                expected_revision,
+            ),
         )
         if cursor.rowcount != 1:
             existing = await connection.execute(
@@ -233,8 +265,9 @@ async def create_resume_publish_attempt(
             return _attempt(existing), True
         active_cursor = await connection.execute(
             """SELECT * FROM resume_publish_attempts
-               WHERE draft_id = ? AND status IN ('PENDING', 'PUBLISHING', 'NEEDS_ACTION', 'UNCERTAIN')
-               ORDER BY created_at DESC LIMIT 1""",
+               WHERE draft_id = ?
+                 AND status IN ('PENDING', 'PUBLISHING', 'NEEDS_ACTION', 'UNCERTAIN', 'PARTIAL')
+               ORDER BY created_at DESC, rowid DESC LIMIT 1""",
             (draft_id,),
         )
         active = await active_cursor.fetchone()
@@ -294,7 +327,7 @@ async def get_latest_resume_publish_attempt(
         cursor = await connection.execute(
             """SELECT * FROM resume_publish_attempts
                WHERE user_id = ? AND account_id = ? AND draft_id = ?
-               ORDER BY created_at DESC LIMIT 1""",
+               ORDER BY created_at DESC, rowid DESC LIMIT 1""",
             (user_id, account_id, draft_id),
         )
         return _attempt(await cursor.fetchone())

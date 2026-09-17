@@ -11,6 +11,7 @@ from datetime import date
 from typing import Any
 
 from patchright.async_api import Locator, Page
+from patchright.async_api import TimeoutError as PatchrightTimeoutError
 
 from leadscout.core.concurrency import serialize_account
 from leadscout.core.config import PDF_MAX_BYTES, PDF_MAX_PAGES, PDF_MAX_TEXT_CHARS
@@ -120,6 +121,128 @@ async def _page_gate(page: Page) -> dict | None:
         }"""
     )
     return dict(gate) if gate else None
+
+
+async def _wait_for_resume_page_signal(page: Page, timeout: int = DEFAULT_TRANSITION_TIMEOUT_MS) -> bool:
+    """Wait for either a supported wizard control or an authentication gate.
+
+    hh.ru hydrates the resume wizard after the initial document is committed.  A
+    ``domcontentloaded`` navigation wait can therefore hang even though the
+    useful UI is already available (or a login/captcha page was rendered).
+    """
+    try:
+        await page.wait_for_function(
+            r"""() => {
+                const text = (document.body?.innerText || '').replace(/\s+/g, ' ');
+                const selectors = [
+                    '[data-qa="resume-profile-position-input"]',
+                    '[data-qa="professional-role-search-input"]',
+                    '[data-qa="resume-title-input"]',
+                    'input[placeholder*="профессию"]',
+                    '[data-qa="resume-person-first-name"]',
+                    'input[name*="firstName"]',
+                    'input[type="tel"]',
+                    'input[type="email"]',
+                    '[data-qa*="salary" i] input',
+                    '[data-qa^="resume-profile-experience-specific-company-input"]',
+                    'input[name="company"]',
+                    '[data-qa*="education-institution" i]',
+                    'textarea[name="institution"]',
+                    '[data-qa*="language" i] input',
+                    '[data-qa*="skill" i] input',
+                    'input[placeholder*="навык"]',
+                    '[data-qa="resume-about-me-input"]',
+                    'textarea[name="about"]',
+                    'input[type="url"]',
+                    '[data-qa="resume-publish"]',
+                    '[data-qa="resume-save"]',
+                    '[data-qa*="captcha" i]',
+                    '[data-qa*="login-form" i]',
+                    'input[type="password"]',
+                    'input[autocomplete="one-time-code"]'
+                ];
+                return selectors.some((selector) => document.querySelector(selector)) ||
+                    /(?:Укажу профессию|Добавить (?:место работы|опыт|образование|учебное заведение)|уровень владения|оцените навык|войти в аккаунт|вход на hh\.ru|captcha|капч|не робот|код подтверждения)/i.test(text);
+            }""",
+            timeout=timeout,
+        )
+        return True
+    except PatchrightTimeoutError:
+        return False
+
+
+def _safe_page_path(page: Page) -> str:
+    """Return a diagnostic hh path without query data or user content."""
+    match = re.match(r"https?://[^/]+(?P<path>/[^?#]*)", page.url or "")
+    return match.group("path") if match else ""
+
+
+def _resume_id_from_url(url: str, *, allow_edit: bool = False) -> str:
+    suffix = r"(?:/edit)?" if allow_edit else ""
+    match = re.match(
+        rf"^https?://[^/]+/resume/([A-Za-z0-9_-]{{6,64}}){suffix}/?(?:[?#].*)?$",
+        url or "",
+    )
+    return match.group(1) if match else ""
+
+
+async def _read_resume_profile_fields(page: Page) -> dict[str, str]:
+    """Read displayed profile values; keep hh's numeric area ID separate."""
+    profile = await page.evaluate(
+        r"""() => {
+            const value = (...selectors) => {
+                for (const selector of selectors) {
+                    const node = document.querySelector(selector);
+                    if (node && 'value' in node && String(node.value || '').trim()) return String(node.value).trim();
+                }
+                return '';
+            };
+            const displayedValue = (...selectors) => {
+                const meaningful = (raw) => {
+                    const candidate = String(raw || '').replace(/\s+/g, ' ').trim();
+                    return candidate && !/^\d+$/.test(candidate) &&
+                        !/^(?:город|регион|место проживания)$/i.test(candidate) ? candidate : '';
+                };
+                for (const selector of selectors) {
+                    for (const node of document.querySelectorAll(selector)) {
+                        const style = getComputedStyle(node);
+                        const visible = style.display !== 'none' && style.visibility !== 'hidden' && node.getClientRects().length;
+                        if (!visible) continue;
+                        if (node instanceof HTMLSelectElement) {
+                            const label = meaningful(node.selectedOptions[0]?.textContent);
+                            if (label) return label;
+                        }
+                        const ariaValue = node.getAttribute('aria-valuetext') || node.getAttribute('aria-label');
+                        const ariaLabel = meaningful(ariaValue);
+                        if (ariaLabel) return ariaLabel;
+                        if ('value' in node) {
+                            const fieldValue = meaningful(node.value);
+                            if (fieldValue) return fieldValue;
+                        }
+                        const textValue = meaningful(node.textContent);
+                        if (textValue) return textValue;
+                    }
+                }
+                return '';
+            };
+            return {
+                first_name: value('[name="firstName"]', '[data-qa*="first-name" i]'),
+                last_name: value('[name="lastName"]', '[data-qa*="last-name" i]'),
+                birth_date: value('[name="birthday"]', 'input[type="date"]'),
+                city: displayedValue(
+                    '[data-qa*="area" i] [data-qa*="selected" i]',
+                    '[data-qa*="area" i] [role="option"][aria-selected="true"]',
+                    '[data-qa*="area" i] input:not([type="hidden"])',
+                    'input[name="area"]:not([type="hidden"])',
+                    'select[name="area"]'
+                ),
+                city_id: value('input[name="area"][type="hidden"]', 'input[name="area"]'),
+                phone: value('input[type="tel"]', '[name="phone"]'),
+                email: value('input[type="email"]', '[name="email"]'),
+            };
+        }"""
+    )
+    return {key: str(value or "").strip() for key, value in dict(profile).items()}
 
 
 def _profile_fingerprint(profile: dict) -> str:
@@ -342,25 +465,7 @@ class HHResumeManager(HHAccountClient):
                         user_id, account_id, captcha_uri or "", page.url
                     )
                 return {"status": "NEEDS_ACTION", **gate, "required_action": gate["code"]}
-            profile = await page.evaluate(
-                r"""() => {
-                    const value = (...selectors) => {
-                        for (const selector of selectors) {
-                            const node = document.querySelector(selector);
-                            if (node && 'value' in node && String(node.value || '').trim()) return String(node.value).trim();
-                        }
-                        return '';
-                    };
-                    return {
-                        first_name: value('[name="firstName"]', '[data-qa*="first-name" i]'),
-                        last_name: value('[name="lastName"]', '[data-qa*="last-name" i]'),
-                        birth_date: value('[name="birthday"]', 'input[type="date"]'),
-                        city: value('[name="area"]', '[data-qa*="area" i] input'),
-                        phone: value('input[type="tel"]', '[name="phone"]'),
-                        email: value('input[type="email"]', '[name="email"]'),
-                    };
-                }"""
-            )
+            profile = await _read_resume_profile_fields(page)
             return {
                 "status": "SUCCESS",
                 "profile": profile,
@@ -436,9 +541,9 @@ class HHResumeManager(HHAccountClient):
                 )
             if result.get("status") != "SUBMITTED":
                 return result
-            match = re.search(r"/resume/([A-Za-z0-9_-]{6,64})", page.url)
-            if match:
-                await on_external_saved(match.group(1), page.url.split("?", 1)[0])
+            saved_resume_id = _resume_id_from_url(page.url, allow_edit=True)
+            if saved_resume_id:
+                await on_external_saved(saved_resume_id, page.url.split("?", 1)[0])
         except Exception as exc:
             logger.error("Resume publication failed: %s", type(exc).__name__)
             return {
@@ -560,8 +665,22 @@ class HHResumeManager(HHAccountClient):
         draft_data: dict | None = None,
         start_url: str = "https://hh.ru/profile/resume/professional_role",
     ) -> dict[str, Any]:
+        visited_screens: list[str] = []
+        current_stage = "OPEN"
         try:
-            await page.goto(start_url, wait_until="domcontentloaded", timeout=30_000)
+            await page.goto(start_url, wait_until="commit", timeout=30_000)
+            page_ready = await _wait_for_resume_page_signal(page)
+            gate = await _page_gate(page)
+            if gate:
+                return {
+                    "status": "NEEDS_ACTION",
+                    **gate,
+                    "stage": "OPEN",
+                    "required_action": gate["code"],
+                    "recognized_screens": visited_screens,
+                }
+            if not page_ready:
+                return self._form_changed("initial", visited_screens)
             experience_index = 0
             education_index = 0
             link_index = 0
@@ -571,7 +690,6 @@ class HHResumeManager(HHAccountClient):
                 "certificates": 0,
                 "recommendations": 0,
             }
-            visited_screens: list[str] = []
             for _ in range(40):
                 gate = await _page_gate(page)
                 if gate:
@@ -580,16 +698,18 @@ class HHResumeManager(HHAccountClient):
                         **gate,
                         "stage": "HH_WIZARD",
                         "required_action": gate["code"],
+                        "recognized_screens": visited_screens,
                     }
                 manual = page.get_by_text("Укажу профессию", exact=True).first
                 if await _visible(manual):
+                    current_stage = "PROFESSION"
                     await human_click(page, manual)
                     title_wait = page.locator(
                         '[data-qa="resume-profile-position-input"], '
                         '[data-qa="professional-role-search-input"], [data-qa="resume-title-input"]'
                     ).first
                     if not await _wait_visible(title_wait):
-                        return self._form_changed("profession")
+                        return self._form_changed("profession", visited_screens)
                     continue
 
                 title_input = page.locator(
@@ -599,6 +719,7 @@ class HHResumeManager(HHAccountClient):
                     'input[placeholder*="профессию"], input[placeholder*="Должность"]'
                 ).first
                 if await _visible(title_input):
+                    current_stage = "PROFESSION"
                     visited_screens.append("profession")
                     profession_value = str(
                         ((draft_data or {}).get("profession") or {}).get("hh_profession") or resume.title
@@ -643,6 +764,7 @@ class HHResumeManager(HHAccountClient):
                     '[data-qa="resume-person-first-name"], input[name*="firstName"]'
                 ).first
                 if await _visible(first_name):
+                    current_stage = "PERSONAL"
                     visited_screens.append("personal")
                     for locator, value in (
                         (first_name, resume.first_name),
@@ -710,6 +832,7 @@ class HHResumeManager(HHAccountClient):
                 phone = page.locator('input[type="tel"], input[name="phone"]').first
                 email = page.locator('input[type="email"], input[name="email"]').first
                 if await _visible(phone) or await _visible(email):
+                    current_stage = "CONTACTS"
                     visited_screens.append("contacts")
                     contacts = (draft_data or {}).get("contacts") or {}
                     await self._fill_empty(page, phone, str(contacts.get("phone") or ""))
@@ -730,6 +853,7 @@ class HHResumeManager(HHAccountClient):
                     '[data-qa*="salary" i] input, input[name*="salary" i]'
                 ).first
                 if await _visible(salary):
+                    current_stage = "CONDITIONS"
                     visited_screens.append("conditions")
                     conditions = (draft_data or {}).get("work_conditions") or {}
                     salary_value = conditions.get("salary")
@@ -752,13 +876,14 @@ class HHResumeManager(HHAccountClient):
                     re.compile(r"Добавить (?:место работы|опыт)", re.IGNORECASE)
                 ).first
                 if experience_index < len(resume.experiences) and await _visible(add_experience):
+                    current_stage = "EXPERIENCE"
                     visited_screens.append("experience-list")
                     await human_click(page, add_experience)
                     expected = page.locator(
                         '[data-qa^="resume-profile-experience-specific-company-input"], input[name="company"]'
                     ).first
                     if not await _wait_visible(expected):
-                        return self._form_changed("experience-list")
+                        return self._form_changed("experience-list", visited_screens)
                     continue
 
                 experience_field = page.locator(
@@ -766,6 +891,7 @@ class HHResumeManager(HHAccountClient):
                     'input[placeholder*="Компания"]'
                 ).first
                 if await _visible(experience_field):
+                    current_stage = "EXPERIENCE"
                     visited_screens.append("experience")
                     if experience_index >= len(resume.experiences):
                         if not await self._click_continue(page, scope=experience_field):
@@ -804,13 +930,14 @@ class HHResumeManager(HHAccountClient):
                     re.compile(r"Добавить (?:образование|учебное заведение)", re.IGNORECASE)
                 ).first
                 if education_index < len(resume.education) and await _visible(add_education):
+                    current_stage = "EDUCATION"
                     visited_screens.append("education-list")
                     await human_click(page, add_education)
                     expected = page.locator(
                         'textarea[name="institution"], [data-qa*="education-institution" i]'
                     ).first
                     if not await _wait_visible(expected):
-                        return self._form_changed("education-list")
+                        return self._form_changed("education-list", visited_screens)
                     continue
 
                 institution = page.locator(
@@ -818,6 +945,7 @@ class HHResumeManager(HHAccountClient):
                     'textarea[placeholder*="заведение"], input[name="institution"]'
                 ).first
                 if await _visible(institution):
+                    current_stage = "EDUCATION"
                     visited_screens.append("education")
                     if education_index < len(resume.education):
                         item = resume.education[education_index]
@@ -841,6 +969,7 @@ class HHResumeManager(HHAccountClient):
                     '[data-qa*="language" i] input, input[name*="language" i]'
                 ).first
                 if await _visible(language_input):
+                    current_stage = "LANGUAGES"
                     visited_screens.append("languages")
                     languages = (draft_data or {}).get("languages") or []
                     for language in languages:
@@ -856,6 +985,7 @@ class HHResumeManager(HHAccountClient):
                     'input[type="url"], input[name*="url" i], [data-qa*="portfolio" i] input'
                 ).first
                 if await _visible(link_input):
+                    current_stage = "LINKS"
                     visited_screens.append("links")
                     links = ((draft_data or {}).get("about") or {}).get("links") or []
                     if link_index < len(links):
@@ -881,6 +1011,7 @@ class HHResumeManager(HHAccountClient):
                     ).first
                     if not await _visible(detail_input):
                         continue
+                    current_stage = key.upper()
                     visited_screens.append(key)
                     items = additional.get(key) or []
                     index = additional_indexes[key]
@@ -911,6 +1042,7 @@ class HHResumeManager(HHAccountClient):
                     '[data-qa*="driving" i], [data-qa*="driver" i]'
                 ).first
                 if await _visible(driving_block):
+                    current_stage = "DRIVING"
                     visited_screens.append("driving")
                     for license_name in additional.get("driving_licenses") or []:
                         choice = driving_block.get_by_text(str(license_name), exact=True).first
@@ -930,6 +1062,7 @@ class HHResumeManager(HHAccountClient):
                     re.compile(r"уровень владения|оцените навык", re.IGNORECASE)
                 ).first
                 if await _visible(skill_level_heading):
+                    current_stage = "SKILL_LEVELS"
                     visited_screens.append("skill-levels")
                     for skill in (draft_data or {}).get("skills") or []:
                         level = str(skill.get("level") or "")
@@ -953,6 +1086,7 @@ class HHResumeManager(HHAccountClient):
                     'input[placeholder*="Поиск"], input[name*="skill"]'
                 ).first
                 if await _visible(skill_input):
+                    current_stage = "SKILLS"
                     visited_screens.append("skills")
                     for skill in resume.skills:
                         await self._replace_value(page, skill_input, skill)
@@ -970,6 +1104,7 @@ class HHResumeManager(HHAccountClient):
                     'textarea[placeholder*="О себе"]'
                 ).first
                 if await _visible(about):
+                    current_stage = "ABOUT"
                     visited_screens.append("about")
                     await self._fill_empty(page, about, resume.about)
                     if not await self._click_continue(page, scope=about):
@@ -981,6 +1116,7 @@ class HHResumeManager(HHAccountClient):
                     'button:has-text("Опубликовать"), button:has-text("Сохранить и опубликовать")'
                 ).first
                 if await _visible(publish):
+                    current_stage = "PUBLISH"
                     visited_screens.append("publish")
                     visibility = str(
                         ((draft_data or {}).get("publication") or {}).get("visibility") or ""
@@ -1004,15 +1140,90 @@ class HHResumeManager(HHAccountClient):
                     await human_click(page, publish)
                     return {"status": "SUBMITTED", "recognized_screens": visited_screens}
 
-                if re.search(r"/resume/[A-Za-z0-9_-]{6,64}", page.url):
+                if _resume_id_from_url(page.url):
                     return {"status": "SUBMITTED", "recognized_screens": visited_screens}
-                return self._form_changed("unknown")
-            return self._form_changed("loop-limit")
-        except HumanizationError:
-            return {"status": "ERROR", "message": "Мастер hh.ru не подтвердил действие в форме."}
+                return self._form_changed("unknown", visited_screens)
+            return self._form_changed("loop-limit", visited_screens)
+        except PatchrightTimeoutError:
+            code = "HH_NAVIGATION_TIMEOUT" if current_stage == "OPEN" else "HH_STEP_TIMEOUT"
+            result_uncertain = current_stage == "PUBLISH" or bool(
+                _resume_id_from_url(page.url, allow_edit=True)
+            )
+            logger.warning(
+                "Resume wizard timeout code=%s stage=%s path=%s recognized=%s",
+                code,
+                current_stage,
+                _safe_page_path(page),
+                visited_screens,
+            )
+            return {
+                "status": "UNCERTAIN" if result_uncertain else "NEEDS_ACTION",
+                "code": "EXTERNAL_RESULT_UNCERTAIN" if result_uncertain else code,
+                "stage": current_stage,
+                "message": (
+                    "hh.ru мог сохранить резюме. Перед повтором выполните сверку результата."
+                    if result_uncertain
+                    else
+                    "hh.ru не ответил при открытии мастера. Черновик сохранён; повторите публикацию."
+                    if current_stage == "OPEN"
+                    else f"hh.ru не подтвердил переход на этапе «{current_stage}». Черновик сохранён."
+                ),
+                "retryable": not result_uncertain,
+                "required_action": "RECONCILE" if result_uncertain else "RETRY_PUBLICATION",
+                "recognized_screens": visited_screens,
+            }
+        except HumanizationError as exc:
+            result_uncertain = current_stage == "PUBLISH" or bool(
+                _resume_id_from_url(page.url, allow_edit=True)
+            )
+            logger.warning(
+                "Resume wizard action not confirmed operation=%s reason=%s stage=%s path=%s",
+                exc.operation,
+                exc.reason,
+                current_stage,
+                _safe_page_path(page),
+            )
+            return {
+                "status": "UNCERTAIN" if result_uncertain else "NEEDS_ACTION",
+                "code": (
+                    "EXTERNAL_RESULT_UNCERTAIN"
+                    if result_uncertain
+                    else "HH_ACTION_NOT_CONFIRMED"
+                ),
+                "stage": current_stage,
+                "message": (
+                    "hh.ru мог сохранить резюме. Перед повтором выполните сверку результата."
+                    if result_uncertain
+                    else "hh.ru не подтвердил действие в форме. Черновик сохранён."
+                ),
+                "retryable": not result_uncertain,
+                "required_action": "RECONCILE" if result_uncertain else "RETRY_PUBLICATION",
+                "recognized_screens": visited_screens,
+            }
         except Exception as exc:
-            logger.error("Step-by-step resume wizard failed: %s", type(exc).__name__)
-            return {"status": "ERROR", "message": "Мастер hh.ru остановился на обязательном поле."}
+            result_uncertain = current_stage == "PUBLISH" or bool(
+                _resume_id_from_url(page.url, allow_edit=True)
+            )
+            logger.error(
+                "Resume wizard failed code=HH_BROWSER_ERROR exception=%s stage=%s path=%s recognized=%s",
+                type(exc).__name__,
+                current_stage,
+                _safe_page_path(page),
+                visited_screens,
+            )
+            return {
+                "status": "UNCERTAIN" if result_uncertain else "ERROR",
+                "code": "EXTERNAL_RESULT_UNCERTAIN" if result_uncertain else "HH_BROWSER_ERROR",
+                "stage": current_stage,
+                "message": (
+                    "hh.ru мог сохранить резюме. Перед повтором выполните сверку результата."
+                    if result_uncertain
+                    else "Не удалось обработать текущий экран hh.ru. Черновик сохранён."
+                ),
+                "retryable": False,
+                "required_action": "RECONCILE" if result_uncertain else "RETRY_AFTER_UPDATE",
+                "recognized_screens": visited_screens,
+            }
 
     @staticmethod
     async def _replace_value(page: Page, locator: Locator, value: str) -> None:
@@ -1038,7 +1249,7 @@ class HHResumeManager(HHAccountClient):
                 await human_type(page, locator, value)
 
     @staticmethod
-    def _form_changed(screen: str) -> dict[str, Any]:
+    def _form_changed(screen: str, recognized_screens: list[str] | None = None) -> dict[str, Any]:
         return {
             "status": "NEEDS_ACTION",
             "code": "HH_FORM_CHANGED",
@@ -1047,6 +1258,7 @@ class HHResumeManager(HHAccountClient):
             "message": "Разметка мастера hh.ru изменилась. Черновик сохранён; случайные кнопки не нажимались.",
             "required_action": "RETRY_AFTER_UPDATE",
             "retryable": True,
+            "recognized_screens": list(recognized_screens or []),
         }
 
     @staticmethod

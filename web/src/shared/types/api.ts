@@ -159,6 +159,13 @@ export type ResumeParseError = {
   required_action: string;
 };
 
+export type ResumeExtractionSummary = {
+  source_sections: Partial<Record<"experiences" | "education" | "skills" | "about", boolean>>;
+  extracted_counts: Partial<Record<"experiences" | "education" | "skills" | "about", number>>;
+  current_counts: Partial<Record<"experiences" | "education" | "skills" | "about", number>>;
+  inferred_birth_date_removed: boolean;
+};
+
 export type ResumeDraft = {
   id: number;
   account_id: number;
@@ -168,7 +175,13 @@ export type ResumeDraft = {
   current_step: string;
   status: "DRAFT" | "PARSING" | "READY" | "PUBLISHING" | "COMPLETED" | "NEEDS_INPUT" | "NEEDS_REVIEW" | "FAILED";
   data: ResumeDraftData;
-  validation: { valid?: boolean; field_errors?: ResumeFieldError[]; parse_error?: ResumeParseError };
+  validation: {
+    valid?: boolean;
+    field_errors?: ResumeFieldError[];
+    parse_error?: ResumeParseError;
+    extraction_summary?: ResumeExtractionSummary;
+    extraction_warnings?: ResumeFieldError[];
+  };
   preflight: {
     conflicts?: Array<{ path: string; draft_value: string; profile_value: string }>;
     profile_changes?: Array<{ path: string; draft_value: string; profile_value: string }>;
@@ -179,6 +192,9 @@ export type ResumeDraft = {
   hh_resume_id: string;
   hh_resume_url: string;
   hh_status: string;
+  latest_publish_attempt_id?: string | null;
+  latest_publish_status?: string | null;
+  latest_publish_stage?: string | null;
   updated_at: string;
 };
 

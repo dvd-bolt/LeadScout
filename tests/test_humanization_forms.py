@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
+from patchright.async_api import TimeoutError as PatchrightTimeoutError
 from patchright.async_api import async_playwright
 
 import utils.humanization as humanization
 from ai_handler import StructuredResume
+from leadscout.integrations.resumes import HHResumeManager as ResumeManagerImpl
+from leadscout.integrations.resumes import _read_resume_profile_fields, _resume_id_from_url
 from parsers.hh_applicant import _open_letter_and_fill, handle_resume_selection_if_needed
 from parsers.hh_resume import HHResumeManager
 
@@ -127,3 +132,55 @@ async def test_resume_wizard_waits_for_delayed_profession_field(monkeypatch):
     finally:
         await browser.close()
         await playwright.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_profile_uses_displayed_city_instead_of_numeric_area_id():
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True)
+    try:
+        page = await browser.new_page()
+        await page.set_content(
+            """
+            <input type="hidden" name="area" value="53">
+            <div data-qa="profile-area"><input value="Москва"></div>
+            """
+        )
+
+        profile = await _read_resume_profile_fields(page)
+
+        assert profile["city"] == "Москва"
+        assert profile["city_id"] == "53"
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_wizard_reports_open_timeout_as_retryable_without_verify_stage():
+    page = AsyncMock()
+    page.url = "https://hh.ru/profile/resume/professional_role?private=value"
+    page.goto.side_effect = PatchrightTimeoutError("navigation timeout")
+    manager = object.__new__(ResumeManagerImpl)
+
+    result = await manager._fill_step_by_step_resume(page, StructuredResume())
+
+    assert result == {
+        "status": "NEEDS_ACTION",
+        "code": "HH_NAVIGATION_TIMEOUT",
+        "stage": "OPEN",
+        "message": "hh.ru не ответил при открытии мастера. Черновик сохранён; повторите публикацию.",
+        "retryable": True,
+        "required_action": "RETRY_PUBLICATION",
+        "recognized_screens": [],
+    }
+
+
+def test_resume_id_url_never_treats_professional_role_as_external_resume():
+    assert _resume_id_from_url("https://hh.ru/profile/resume/professional_role") == ""
+    assert _resume_id_from_url("https://hh.ru/resume/real_resume_123") == "real_resume_123"
+    assert _resume_id_from_url("https://hh.ru/resume/real_resume_123/edit") == ""
+    assert (
+        _resume_id_from_url("https://hh.ru/resume/real_resume_123/edit", allow_edit=True)
+        == "real_resume_123"
+    )

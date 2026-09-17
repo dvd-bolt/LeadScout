@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import re
 from datetime import date
 from typing import Any
 
@@ -19,6 +21,8 @@ from leadscout.storage.repositories.resume_drafts import DraftRevisionConflict
 
 from .common import _await, _mapping, _Service
 from .errors import ServiceError
+
+logger = logging.getLogger(__name__)
 
 
 def _fingerprint(value: Any) -> str:
@@ -38,6 +42,105 @@ def _merge_missing(current: Any, extracted: Any) -> Any:
     if current not in (None, ""):
         return current
     return extracted if extracted is not None else current
+
+
+def _birth_date_is_present_in_source(value: str, source_text: str) -> bool:
+    """Reject dates inferred from an age instead of copied from the PDF."""
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return False
+    months = (
+        "января",
+        "февраля",
+        "марта",
+        "апреля",
+        "мая",
+        "июня",
+        "июля",
+        "августа",
+        "сентября",
+        "октября",
+        "ноября",
+        "декабря",
+    )
+    haystack = " ".join(source_text.casefold().split())
+    candidates = {
+        value.casefold(),
+        f"{parsed.day:02d}.{parsed.month:02d}.{parsed.year}",
+        f"{parsed.day:02d}/{parsed.month:02d}/{parsed.year}",
+        f"{parsed.day:02d}-{parsed.month:02d}-{parsed.year}",
+        f"{parsed.day} {months[parsed.month - 1]} {parsed.year}",
+    }
+    return any(candidate in haystack for candidate in candidates)
+
+
+def _sanitize_extracted_facts(extracted: dict, source_text: str) -> bool:
+    """Remove a high-risk inferred birth date while leaving user data untouched."""
+    personal = extracted.get("personal") or {}
+    birth_date = str(personal.get("birth_date") or "")
+    if birth_date and not _birth_date_is_present_in_source(birth_date, source_text):
+        personal["birth_date"] = ""
+        return True
+    return False
+
+
+def _source_sections(source_text: str) -> dict[str, bool]:
+    patterns = {
+        "experiences": r"(?im)^\s*опыт\s+работы\b",
+        "education": r"(?im)^\s*(?:высшее\s+)?образование\b",
+        "skills": r"(?im)^\s*(?:ключевые\s+)?навыки\b",
+        "about": r"(?im)^\s*обо\s+мне\b",
+    }
+    sections = {name: bool(re.search(pattern, source_text)) for name, pattern in patterns.items()}
+    if re.search(r"(?i)\b(?:нет|без)\s+опыта\b", source_text):
+        sections["experiences"] = False
+    return sections
+
+
+def _draft_counts(data: dict) -> dict[str, int]:
+    return {
+        "experiences": len(data.get("experiences") or []),
+        "education": len(data.get("education") or []),
+        "skills": len(data.get("skills") or []),
+        "about": int(bool(str((data.get("about") or {}).get("text") or "").strip())),
+    }
+
+
+def _extraction_warnings(summary: dict, data: dict) -> list[dict[str, str]]:
+    sections = dict(summary.get("source_sections") or {})
+    counts = _draft_counts(data)
+    labels = {
+        "experiences": ("experiences", "опыт работы"),
+        "education": ("education", "образование"),
+        "skills": ("skills", "навыки"),
+        "about": ("about.text", "раздел «О себе»"),
+    }
+    return [
+        {
+            "path": labels[name][0],
+            "code": "PDF_SECTION_MISSING",
+            "message": f"В PDF найден {labels[name][1]}, но раздел остался пустым. Повторите распознавание или заполните его вручную.",
+        }
+        for name in labels
+        if sections.get(name) and counts[name] == 0
+    ]
+
+
+def _with_extraction_diagnostics(validation: dict, previous_validation: dict, data: dict) -> dict:
+    summary = dict(previous_validation.get("extraction_summary") or {})
+    if not summary:
+        return validation
+    warnings = _extraction_warnings(summary, data)
+    field_errors = list(validation.get("field_errors") or [])
+    field_errors.extend(warning for warning in warnings if warning not in field_errors)
+    return {
+        **validation,
+        "valid": not field_errors,
+        "field_errors": field_errors,
+        "extraction_summary": {**summary, "current_counts": _draft_counts(data)},
+        "extraction_warnings": warnings,
+    }
 
 
 def _parse_error(
@@ -222,11 +325,23 @@ class ResumeDraftService(_Service):
             payload = ResumeDraftData.model_validate(data).model_dump()
         except ValidationError as exc:
             raise ServiceError("INVALID_INPUT", "Черновик содержит некорректные данные.") from exc
-        self._require_editable(await self._draft(user_id, account_id, draft_id))
+        draft = await self._draft(user_id, account_id, draft_id)
+        self._require_editable(draft)
+        validation = _with_extraction_diagnostics(
+            validate_draft(ResumeDraftData.model_validate(payload)),
+            draft.get("validation") or {},
+            payload,
+        )
         try:
             result = await _await(
                 self.db.update_resume_draft(
-                    user_id, account_id, draft_id, expected_revision, payload, current_step
+                    user_id,
+                    account_id,
+                    draft_id,
+                    expected_revision,
+                    payload,
+                    current_step,
+                    validation=validation,
                 )
             )
         except DraftRevisionConflict as exc:
@@ -258,10 +373,22 @@ class ResumeDraftService(_Service):
             else:
                 structured = await self.ai.extract_full_structured_resume(text, strict=True)
                 extracted = structured_to_draft(structured)
+            inferred_birth_date_removed = _sanitize_extracted_facts(extracted, text)
             current_data = draft["data"]
             combined = extracted if current_data == empty_resume_draft() else _merge_missing(current_data, extracted)
             merged = ResumeDraftData.model_validate(combined)
             validation = validate_draft(merged)
+            extraction_summary = {
+                "source_sections": _source_sections(text),
+                "extracted_counts": _draft_counts(extracted),
+                "current_counts": _draft_counts(merged.model_dump()),
+                "inferred_birth_date_removed": inferred_birth_date_removed,
+            }
+            validation = _with_extraction_diagnostics(
+                validation,
+                {"extraction_summary": extraction_summary},
+                merged.model_dump(),
+            )
             status = "READY" if validation["valid"] else "NEEDS_INPUT"
             updated = await _await(
                 self.db.replace_resume_draft_data(
@@ -276,6 +403,15 @@ class ResumeDraftService(_Service):
             )
             if not updated:
                 raise ServiceError("NOT_FOUND", "Черновик резюме не найден.")
+            logger.info(
+                "PDF resume parsed draft_id=%s experiences=%s education=%s skills=%s about=%s birth_date_removed=%s",
+                draft_id,
+                extraction_summary["extracted_counts"]["experiences"],
+                extraction_summary["extracted_counts"]["education"],
+                extraction_summary["extracted_counts"]["skills"],
+                extraction_summary["extracted_counts"]["about"],
+                inferred_birth_date_removed,
+            )
             return {
                 "status": "SUCCESS",
                 "code": "PDF_PARSED",
@@ -283,6 +419,7 @@ class ResumeDraftService(_Service):
                 "draft_id": draft_id,
                 "revision": updated["revision"],
                 "field_errors": validation["field_errors"],
+                "extraction_summary": extraction_summary,
             }
         except PDFValidationError as exc:
             error = _parse_error(
@@ -338,7 +475,9 @@ class ResumeDraftService(_Service):
         draft = await self._draft(user_id, account_id, draft_id)
         self._require_editable(draft)
         data = ResumeDraftData.model_validate(draft["data"])
-        validation = validate_draft(data)
+        validation = _with_extraction_diagnostics(
+            validate_draft(data), draft.get("validation") or {}, data.model_dump()
+        )
         updated = await _await(
             self.db.set_resume_draft_status(
                 user_id,
@@ -354,7 +493,9 @@ class ResumeDraftService(_Service):
         draft = await self._draft(user_id, account_id, draft_id)
         self._require_editable(draft)
         data = ResumeDraftData.model_validate(draft["data"])
-        validation = validate_draft(data)
+        validation = _with_extraction_diagnostics(
+            validate_draft(data), draft.get("validation") or {}, data.model_dump()
+        )
         if not validation["valid"]:
             await _await(
                 self.db.set_resume_draft_status(
@@ -529,11 +670,12 @@ class ResumeDraftService(_Service):
             attempt_status, draft_status = "UNCERTAIN", "NEEDS_REVIEW"
         else:
             attempt_status, draft_status = "FAILED", "FAILED"
+        result_stage = str(result.get("stage") or "HH_WIZARD")
         await _await(
             self.db.update_resume_publish_attempt(
                 user_id,
                 attempt_id,
-                stage=str(result.get("stage") or "VERIFY"),
+                stage=result_stage,
                 status=attempt_status,
                 result=result,
                 hh_resume_id=str(result.get("hh_resume_id") or ""),
@@ -544,7 +686,7 @@ class ResumeDraftService(_Service):
         await _await(
             self.db.record_resume_publish_event(
                 attempt_id,
-                str(result.get("stage") or "VERIFY"),
+                result_stage,
                 str(result.get("code") or status),
                 {
                     "status": status,
@@ -589,7 +731,16 @@ class ResumeDraftService(_Service):
         attempt = await _await(self.db.get_latest_resume_publish_attempt(user_id, account_id, draft_id))
         if not attempt:
             raise ServiceError("NOT_FOUND", "Незавершённая публикация не найдена.")
-        if attempt["status"] not in {"NEEDS_ACTION", "UNCERTAIN", "PARTIAL"}:
+        if attempt["status"] == "UNCERTAIN":
+            return {
+                "status": "NEEDS_ACTION",
+                "code": "RECONCILE_REQUIRED",
+                "stage": "RECONCILE",
+                "message": "Сначала проверьте результат на hh.ru. Повторная отправка заблокирована.",
+                "required_action": "RECONCILE",
+                "attempt_id": attempt["id"],
+            }
+        if attempt["status"] not in {"NEEDS_ACTION", "PARTIAL"}:
             return {"status": attempt["status"], "attempt_id": attempt["id"], **attempt.get("result", {})}
         return await self.run_publish(user_id, attempt["id"])
 

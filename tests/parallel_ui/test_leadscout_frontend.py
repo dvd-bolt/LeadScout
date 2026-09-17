@@ -697,6 +697,61 @@ async def test_pdf_failure_stays_on_list_and_retry_reuses_the_draft(browser_app,
     assert mock.import_count == 2
 
 
+async def test_incomplete_pdf_draft_shows_warning_and_retries_same_draft(browser_app, tmp_path):
+    page, mock, base_url = browser_app.page, browser_app.mock, browser_app.base_url
+    pdf = tmp_path / "resume.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nmock resume")
+    data = resume_draft_data()
+    data["profession"].update(title="Python-разработчик", hh_profession="Разработчик")
+    mock.resume_drafts[1] = [
+        {
+            "id": 7,
+            "account_id": 1,
+            "source": "PDF",
+            "schema_version": 1,
+            "revision": 2,
+            "current_step": "review",
+            "status": "NEEDS_INPUT",
+            "data": data,
+            "validation": {
+                "valid": False,
+                "field_errors": [
+                    {
+                        "path": "experiences",
+                        "code": "PDF_SECTION_MISSING",
+                        "message": "В PDF найден опыт работы, но раздел остался пустым.",
+                    }
+                ],
+                "extraction_warnings": [
+                    {
+                        "path": "experiences",
+                        "code": "PDF_SECTION_MISSING",
+                        "message": "В PDF найден опыт работы, но раздел остался пустым.",
+                    }
+                ],
+            },
+            "preflight": {},
+            "preflight_revision": None,
+            "preflight_fingerprint": "",
+            "hh_resume_id": "",
+            "hh_resume_url": "",
+            "hh_status": "",
+            "updated_at": "2026-09-11 08:00:00",
+        }
+    ]
+    mock.draft_counter = 7
+
+    await page.goto(f"{base_url}/#/resumes", wait_until="networkidle")
+    await expect(page.get_by_text("PDF распознан не полностью", exact=True)).to_be_visible()
+    await page.get_by_label("Повторить распознавание PDF в текущем черновике").set_input_files(
+        str(pdf)
+    )
+
+    await expect(page.get_by_role("heading", name="Python-разработчик")).to_be_visible()
+    assert len(mock.resume_drafts[1]) == 1
+    assert mock.resume_drafts[1][0]["id"] == 7
+
+
 async def test_independent_audit_details_and_text_or_url_match_payload(browser_app):
     page, mock, base_url = browser_app.page, browser_app.mock, browser_app.base_url
     mock.accounts = []

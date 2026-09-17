@@ -95,6 +95,7 @@ export function ResumeImport({ accountId }: { accountId: number }) {
       onRefresh={refresh}
       onSaved={rememberDraft}
       onClose={() => setSelectedId(null)}
+      onRetryPdf={selected.source === "PDF" ? (file) => startPdf(file, selected.id) : undefined}
       onDelete={() => {
         if (window.confirm("Удалить локальный черновик? Резюме на hh.ru удалено не будет.")) remove.mutate(selected.id);
       }}

@@ -43,8 +43,9 @@ function TextArea({ label, value, onChange, hint }: { label: string; value: stri
   </label>;
 }
 
-export function ResumeWizard({ accountId, draft, onRefresh, onSaved, onClose, onDelete }: {
+export function ResumeWizard({ accountId, draft, onRefresh, onSaved, onClose, onDelete, onRetryPdf }: {
   accountId: number; draft: ResumeDraft; onRefresh: () => Promise<unknown>; onSaved?: (draft: ResumeDraft) => void; onClose: () => void; onDelete: () => void;
+  onRetryPdf?: (file: File) => Promise<void>;
 }) {
   const initialStep = Math.max(0, STEPS.findIndex(([key]) => key === draft.current_step));
   const [data, setData] = useState<ResumeDraftData>(draft.data);
@@ -161,6 +162,14 @@ export function ResumeWizard({ accountId, draft, onRefresh, onSaved, onClose, on
   };
 
   const busy = operation.isPending || validate.isPending || operationActive || saveState === "saving";
+  const canResumeAttempt = ["NEEDS_ACTION", "PARTIAL"].includes(draft.latest_publish_status || "");
+  const canReconcileAttempt = draft.latest_publish_status === "UNCERTAIN" || Boolean(
+    draft.hh_resume_id && ["FAILED", "NEEDS_REVIEW"].includes(draft.status),
+  );
+  const extractionWarnings = draft.validation?.extraction_warnings || [];
+  const ordinaryFieldErrors = (draft.validation?.field_errors || []).filter(
+    (item) => item.code !== "PDF_SECTION_MISSING",
+  );
 
   if (draft.status === "COMPLETED") {
     return <div className={styles.wizard}>
@@ -306,9 +315,29 @@ export function ResumeWizard({ accountId, draft, onRefresh, onSaved, onClose, on
           <div><strong>{data.profession.title || "Без названия"}</strong><div className={styles.meta}>{data.personal.last_name} {data.personal.first_name} · {data.personal.city || "город не указан"}</div></div>
           <div className={styles.meta}>{data.experiences.filter((item) => item.selected).length} мест работы · {data.education.filter((item) => item.selected).length} образований · {data.skills.length} навыков</div>
         </div>
-        {(draft.validation?.field_errors || []).length ? <div className={`${styles.notice} ${styles.error}`}>
-          <div><strong>Исправьте данные перед публикацией</strong><ul>{draft.validation.field_errors?.map((item) => <li key={`${item.path}-${item.code}`}>{item.message}</li>)}</ul></div>
+        {extractionWarnings.length ? <div className={`${styles.notice} ${styles.error}`}>
+          <div><strong>PDF распознан не полностью</strong><ul>{extractionWarnings.map((item) => <li key={`${item.path}-${item.code}`}>{item.message}</li>)}</ul>
+            {onRetryPdf ? <label aria-disabled={busy} className={`${styles.button} ${styles.secondary} ${styles.fileAction}`}>
+              Повторить распознавание в этом черновике
+              <input disabled={busy} aria-label="Повторить распознавание PDF в текущем черновике" type="file" accept="application/pdf" onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (file) void onRetryPdf(file);
+                event.target.value = "";
+              }} />
+            </label> : null}
+          </div>
         </div> : null}
+        {ordinaryFieldErrors.length ? <div className={`${styles.notice} ${styles.error}`}>
+          <div><strong>Исправьте данные перед публикацией</strong><ul>{ordinaryFieldErrors.map((item) => <li key={`${item.path}-${item.code}`}>{item.message}</li>)}</ul></div>
+        </div> : null}
+        {onRetryPdf && !extractionWarnings.length ? <label aria-disabled={busy} className={`${styles.button} ${styles.secondary} ${styles.fileAction}`}>
+          Повторно распознать PDF в этом черновике
+          <input disabled={busy} aria-label="Повторно распознать PDF в текущем черновике" type="file" accept="application/pdf" onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) void onRetryPdf(file);
+            event.target.value = "";
+          }} />
+        </label> : null}
         {draft.preflight.conflicts?.length ? <div className={`${styles.notice} ${styles.warningNotice}`}>
           <div><strong>Конфликты с профилем hh.ru</strong><ul>{draft.preflight.conflicts.map((item) => <li key={item.path}>{item.path}: «{item.profile_value}» → «{item.draft_value}»</li>)}</ul>
             <label className={styles.switch}><input type="checkbox" checked={conflictsConfirmed} onChange={(event) => setConflictsConfirmed(event.target.checked)} />Я подтверждаю эти изменения для текущей версии черновика</label>
@@ -319,10 +348,10 @@ export function ResumeWizard({ accountId, draft, onRefresh, onSaved, onClose, on
         <div className={styles.actionRow}>
           <Button disabled={busy} className={styles.secondary} onClick={() => validate.mutate()}>Проверить поля</Button>
           <Button disabled={busy} className={styles.secondary} onClick={() => operation.mutate("preflight")}>Сравнить с hh.ru</Button>
-          <Button disabled={busy || dirty || !data.publication.target_account_confirmed || draft.preflight_revision !== revisionRef.current || Boolean(draft.preflight.conflicts?.length && !conflictsConfirmed)} onClick={() => operation.mutate("publish")}>Создать на hh.ru</Button>
+          <Button disabled={busy || dirty || canResumeAttempt || !data.publication.target_account_confirmed || draft.preflight_revision !== revisionRef.current || Boolean(draft.preflight.conflicts?.length && !conflictsConfirmed)} onClick={() => operation.mutate("publish")}>Создать на hh.ru</Button>
         </div>
-        {draft.status === "NEEDS_INPUT" && draft.hh_resume_id ? <Button disabled={busy} onClick={() => operation.mutate("resume")}>Продолжить перенос в созданное резюме</Button> : null}
-        {draft.status === "NEEDS_REVIEW" || draft.status === "FAILED" ? <Button disabled={busy} className={styles.secondary} onClick={() => operation.mutate("reconcile")}>Сверить результат на hh.ru</Button> : null}
+        {canResumeAttempt ? <Button disabled={busy} onClick={() => operation.mutate("resume")}>{draft.hh_resume_id ? "Продолжить перенос в созданное резюме" : "Повторить публикацию сохранённого черновика"}</Button> : null}
+        {canReconcileAttempt ? <Button disabled={busy} className={styles.secondary} onClick={() => operation.mutate("reconcile")}>Сверить результат на hh.ru</Button> : null}
         {draft.hh_resume_url ? <a href={draft.hh_resume_url} target="_blank" rel="noreferrer">Открыть созданное резюме на hh.ru</a> : null}
       </> : null}
     </div>
