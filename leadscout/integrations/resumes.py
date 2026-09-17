@@ -35,8 +35,11 @@ _DETAIL_BLOCKED_MESSAGE = (
 _PROFESSION_INPUT_SELECTOR = (
     'input[data-qa="resume-profile-position-input"], '
     '[data-qa="resume-profile-position-input"] input, '
+    '[data-qa="resume-profile-position-input"][contenteditable="true"], '
+    '[data-qa="resume-profile-position-input"] [contenteditable="true"], '
     'input[data-qa="professional-role-search-input"], '
     '[data-qa="professional-role-search-input"] input, '
+    '[data-qa="professional-role-search-input"] [contenteditable="true"], '
     'input[data-qa="resume-title-input"], [data-qa="resume-title-input"] input, '
     'input[placeholder*="профессию"], input[placeholder*="Должность"]'
 )
@@ -54,6 +57,11 @@ def extract_text_from_pdf(pdf_path: str | os.PathLike[str]) -> str:
 
 async def _visible(locator: Locator) -> bool:
     return await locator.count() > 0 and await locator.is_visible()
+
+
+def _first_visible(locator: Locator) -> Locator:
+    """Select the rendered copy when hh.ru keeps hidden desktop/mobile duplicates."""
+    return locator.filter(visible=True).first
 
 
 async def _wait_visible(locator: Locator, timeout: int = DEFAULT_TRANSITION_TIMEOUT_MS) -> bool:
@@ -125,6 +133,14 @@ async def _page_gate(page: Page) -> dict | None:
                 /(?:подтвердите (?:номер|телефон|почту|email)|код подтверждения)/i.test(text)) {
                 return {code: 'CONTACT_CONFIRMATION_REQUIRED', message: 'hh.ru требует подтверждение контакта.'};
             }
+            // A stale applicant session is currently redirected to the public
+            // regional home page. That page uses a phone sign-up form rather
+            // than a password field or the old "Вход на hh.ru" heading.
+            if ((location.pathname === '/' || location.pathname === '') &&
+                visible('[data-qa="login"], [data-qa="mainmenu_profile-link"]') &&
+                visible('[data-qa="auth-form"], [data-qa="account-signup-email"], [data-qa="signup"]')) {
+                return {code: 'LOGIN_REQUIRED', message: 'Сессия hh.ru истекла. Войдите заново.'};
+            }
             return null;
         }"""
     )
@@ -194,6 +210,37 @@ def _safe_page_path(page: Page) -> str:
     """Return a diagnostic hh path without query data or user content."""
     match = re.match(r"https?://[^/]+(?P<path>/[^?#]*)", page.url or "")
     return match.group("path") if match else ""
+
+
+async def _resume_screen_diagnostic(page: Page) -> dict[str, Any]:
+    """Collect selector-only diagnostics without values, page text, or query data."""
+    try:
+        controls = await page.evaluate(
+            r"""() => {
+                const visible = (node) => {
+                    if (!node || node.closest('[hidden], [aria-hidden="true"]')) return false;
+                    const style = getComputedStyle(node);
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                        node.getClientRects().length > 0;
+                };
+                return [...document.querySelectorAll('[data-qa], input, textarea, select, button, [role]')]
+                    .filter(visible)
+                    .slice(0, 40)
+                    .map((node) => ({
+                        tag: node.tagName.toLowerCase(),
+                        qa: (node.getAttribute('data-qa') || '').slice(0, 100),
+                        role: (node.getAttribute('role') || '').slice(0, 40),
+                        type: (node.getAttribute('type') || '').slice(0, 40)
+                    }));
+            }"""
+        )
+    except Exception:
+        controls = []
+    return {
+        "path": _safe_page_path(page),
+        "frames": len(page.frames),
+        "controls": controls,
+    }
 
 
 def _resume_id_from_url(url: str, *, allow_edit: bool = False) -> str:
@@ -777,7 +824,7 @@ class HHResumeManager(HHAccountClient):
                     "recognized_screens": visited_screens,
                 }
             if not page_ready:
-                return self._form_changed("initial", visited_screens)
+                return await self._form_changed(page, "initial", visited_screens)
             experience_index = 0
             education_index = 0
             link_index = 0
@@ -797,20 +844,20 @@ class HHResumeManager(HHAccountClient):
                         "required_action": gate["code"],
                         "recognized_screens": visited_screens,
                     }
-                manual = page.get_by_role(
-                    "button", name="Укажу профессию", exact=True
-                ).first
+                manual = _first_visible(
+                    page.get_by_role("button", name="Укажу профессию", exact=True)
+                )
                 if not await _visible(manual):
-                    manual = page.get_by_text("Укажу профессию", exact=True).first
+                    manual = _first_visible(page.get_by_text("Укажу профессию", exact=True))
                 if await _visible(manual):
                     current_stage = "PROFESSION"
                     await human_click(page, manual)
-                    title_wait = page.locator(_PROFESSION_INPUT_SELECTOR).first
+                    title_wait = _first_visible(page.locator(_PROFESSION_INPUT_SELECTOR))
                     if not await _wait_visible(title_wait):
-                        return self._form_changed("profession", visited_screens)
+                        return await self._form_changed(page, "profession", visited_screens)
                     continue
 
-                title_input = page.locator(_PROFESSION_INPUT_SELECTOR).first
+                title_input = _first_visible(page.locator(_PROFESSION_INPUT_SELECTOR))
                 if await _visible(title_input):
                     current_stage = "PROFESSION"
                     visited_screens.append("profession")
@@ -818,7 +865,10 @@ class HHResumeManager(HHAccountClient):
                         ((draft_data or {}).get("profession") or {}).get("hh_profession") or resume.title
                     )
                     await self._replace_value(page, title_input, profession_value)
-                    options = page.locator('[role="option"], [data-qa="suggest-item-cell"], [data-qa="professional-role-item"]')
+                    options = page.locator(
+                        '[role="option"], [data-qa="suggest-item-cell"], '
+                        '[data-qa="professional-role-item"]'
+                    ).filter(visible=True)
                     if not await _wait_visible(options.first):
                         return {
                             "status": "NEEDS_ACTION",
@@ -1030,7 +1080,7 @@ class HHResumeManager(HHAccountClient):
                         '[data-qa^="resume-profile-experience-specific-company-input"], input[name="company"]'
                     ).first
                     if not await _wait_visible(expected):
-                        return self._form_changed("experience-list", visited_screens)
+                        return await self._form_changed(page, "experience-list", visited_screens)
                     continue
 
                 experience_field = page.locator(
@@ -1084,7 +1134,7 @@ class HHResumeManager(HHAccountClient):
                         'textarea[name="institution"], [data-qa*="education-institution" i]'
                     ).first
                     if not await _wait_visible(expected):
-                        return self._form_changed("education-list", visited_screens)
+                        return await self._form_changed(page, "education-list", visited_screens)
                     continue
 
                 institution = page.locator(
@@ -1328,8 +1378,8 @@ class HHResumeManager(HHAccountClient):
                 # made otherwise valid imports stop at random transitions.
                 if await _wait_for_resume_page_signal(page):
                     continue
-                return self._form_changed("unknown", visited_screens)
-            return self._form_changed("loop-limit", visited_screens)
+                return await self._form_changed(page, "unknown", visited_screens)
+            return await self._form_changed(page, "loop-limit", visited_screens)
         except PatchrightTimeoutError:
             code = "HH_NAVIGATION_TIMEOUT" if current_stage == "OPEN" else "HH_STEP_TIMEOUT"
             result_uncertain = current_stage == "PUBLISH" or bool(
@@ -1435,7 +1485,18 @@ class HHResumeManager(HHAccountClient):
                 await human_type(page, locator, value)
 
     @staticmethod
-    def _form_changed(screen: str, recognized_screens: list[str] | None = None) -> dict[str, Any]:
+    async def _form_changed(
+        page: Page, screen: str, recognized_screens: list[str] | None = None
+    ) -> dict[str, Any]:
+        diagnostic = await _resume_screen_diagnostic(page)
+        logger.warning(
+            "Resume wizard form changed screen=%s path=%s frames=%s recognized=%s controls=%s",
+            screen,
+            diagnostic["path"],
+            diagnostic["frames"],
+            list(recognized_screens or []),
+            diagnostic["controls"],
+        )
         return {
             "status": "NEEDS_ACTION",
             "code": "HH_FORM_CHANGED",
@@ -1445,6 +1506,7 @@ class HHResumeManager(HHAccountClient):
             "required_action": "RETRY_AFTER_UPDATE",
             "retryable": True,
             "recognized_screens": list(recognized_screens or []),
+            "diagnostic": diagnostic,
         }
 
     @staticmethod

@@ -9,7 +9,7 @@ from patchright.async_api import async_playwright
 import utils.humanization as humanization
 from ai_handler import StructuredResume
 from leadscout.integrations.resumes import HHResumeManager as ResumeManagerImpl
-from leadscout.integrations.resumes import _read_resume_profile_fields, _resume_id_from_url
+from leadscout.integrations.resumes import _page_gate, _read_resume_profile_fields, _resume_id_from_url
 from parsers.hh_applicant import _open_letter_and_fill, handle_resume_selection_if_needed
 from parsers.hh_resume import HHResumeManager
 
@@ -84,6 +84,10 @@ async def test_resume_wizard_supports_current_profession_wrapper_and_transient_s
             lambda route: route.fulfill(
                 body="""
                 <meta charset="utf-8">
+                <div hidden>
+                  <button>Укажу профессию</button>
+                  <input data-qa="resume-profile-position-input">
+                </div>
                 <div id="app"><button id="manual">Укажу профессию</button></div>
                 <script>
                   const app = document.querySelector('#app');
@@ -133,6 +137,38 @@ async def test_resume_wizard_supports_current_profession_wrapper_and_transient_s
             "recognized_screens": ["profession", "personal", "skills", "publish"],
         }
         assert await page.evaluate("window.published === true", isolated_context=False)
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_gate_detects_current_anonymous_hh_homepage():
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True)
+    try:
+        page = await browser.new_page()
+        await page.route(
+            "https://hh.ru/",
+            lambda route: route.fulfill(
+                body="""
+                <a data-qa="login">Войти</a>
+                <form data-qa="auth-form">
+                  <input data-qa="account-signup-email">
+                  <button data-qa="account-signup-submit">Продолжить</button>
+                </form>
+                """,
+                content_type="text/html",
+            ),
+        )
+        await page.goto("https://hh.ru/")
+
+        gate = await _page_gate(page)
+
+        assert gate == {
+            "code": "LOGIN_REQUIRED",
+            "message": "Сессия hh.ru истекла. Войдите заново.",
+        }
     finally:
         await browser.close()
         await playwright.stop()
