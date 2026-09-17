@@ -769,6 +769,7 @@ class ResumeDraftService(_Service):
                     "status": status,
                     "external_saved": bool(result.get("hh_resume_id")),
                     "app_version": config.APP_VERSION,
+                    "recognized_screen": str(result.get("recognized_screen") or ""),
                     "recognized_screens": list(result.get("recognized_screens") or []),
                 },
             )

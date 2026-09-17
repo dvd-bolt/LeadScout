@@ -73,7 +73,7 @@ async def test_resume_selection_never_falls_back_to_the_first_resume(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_resume_wizard_waits_for_delayed_profession_field(monkeypatch):
+async def test_resume_wizard_supports_current_profession_wrapper_and_transient_steps(monkeypatch):
     monkeypatch.setattr(humanization.random, "uniform", lambda _low, _high: 0)
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(headless=True)
@@ -87,8 +87,12 @@ async def test_resume_wizard_waits_for_delayed_profession_field(monkeypatch):
                 <div id="app"><button id="manual">Укажу профессию</button></div>
                 <script>
                   const app = document.querySelector('#app');
+                  function transition(next) {
+                    app.innerHTML = '<span>Сохраняем…</span>';
+                    setTimeout(next, 200);
+                  }
                   function skills() {
-                    app.innerHTML = '<input placeholder="навык"><button data-qa="resume-submit" onclick="publish()">Продолжить</button>';
+                    app.innerHTML = '<input placeholder="навык"><button data-qa="resume-submit" onclick="transition(publish)">Продолжить</button>';
                   }
                   function publish() {
                     app.innerHTML = '<button data-qa="resume-publish" onclick="window.published=true">Опубликовать</button>';
@@ -99,7 +103,7 @@ async def test_resume_wizard_waits_for_delayed_profession_field(monkeypatch):
                       <input data-qa="resume-person-area" oninput="cityOption()">
                       <input data-qa="resume-person-birth-day"><input data-qa="resume-person-birth-year">
                       <select data-qa="resume-person-birth-month">${'<option></option>'.repeat(13)}</select>
-                      <button data-qa="resume-submit" onclick="skills()">Продолжить</button>`;
+                      <button data-qa="resume-submit" onclick="transition(skills)">Продолжить</button>`;
                   }
                   function cityOption() {
                     if (!document.querySelector('#city-option')) {
@@ -107,7 +111,7 @@ async def test_resume_wizard_waits_for_delayed_profession_field(monkeypatch):
                     }
                   }
                   function profession() {
-                    app.innerHTML = '<input data-qa="professional-role-search-input"><div role="option">Разработчик</div><button data-qa="professional-role-submit" onclick="personal()">Продолжить</button>';
+                    app.innerHTML = '<div data-qa="resume-profile-position-input"><input></div><div role="option">Разработчик</div><button data-qa="professional-role-submit" onclick="transition(personal)">Продолжить</button>';
                   }
                   document.querySelector('#manual').onclick = () => setTimeout(profession, 200);
                 </script>

@@ -32,6 +32,14 @@ _DETAIL_BLOCKED_MESSAGE = (
     "hh.ru запросил вход или проверку при открытии резюме. "
     "Локальный текст сохранён; войдите заново и повторите синхронизацию."
 )
+_PROFESSION_INPUT_SELECTOR = (
+    'input[data-qa="resume-profile-position-input"], '
+    '[data-qa="resume-profile-position-input"] input, '
+    'input[data-qa="professional-role-search-input"], '
+    '[data-qa="professional-role-search-input"] input, '
+    'input[data-qa="resume-title-input"], [data-qa="resume-title-input"] input, '
+    'input[placeholder*="профессию"], input[placeholder*="Должность"]'
+)
 
 
 def extract_text_from_pdf(pdf_path: str | os.PathLike[str]) -> str:
@@ -134,10 +142,19 @@ async def _wait_for_resume_page_signal(page: Page, timeout: int = DEFAULT_TRANSI
         await page.wait_for_function(
             r"""() => {
                 const text = (document.body?.innerText || '').replace(/\s+/g, ' ');
+                const visible = (node) => {
+                    if (!node || node.closest('[hidden], [aria-hidden="true"]')) return false;
+                    const style = getComputedStyle(node);
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                        node.getClientRects().length > 0;
+                };
                 const selectors = [
-                    '[data-qa="resume-profile-position-input"]',
-                    '[data-qa="professional-role-search-input"]',
-                    '[data-qa="resume-title-input"]',
+                    'input[data-qa="resume-profile-position-input"]',
+                    '[data-qa="resume-profile-position-input"] input',
+                    'input[data-qa="professional-role-search-input"]',
+                    '[data-qa="professional-role-search-input"] input',
+                    'input[data-qa="resume-title-input"]',
+                    '[data-qa="resume-title-input"] input',
                     'input[placeholder*="профессию"]',
                     '[data-qa="resume-person-first-name"]',
                     'input[name*="firstName"]',
@@ -161,7 +178,9 @@ async def _wait_for_resume_page_signal(page: Page, timeout: int = DEFAULT_TRANSI
                     'input[type="password"]',
                     'input[autocomplete="one-time-code"]'
                 ];
-                return selectors.some((selector) => document.querySelector(selector)) ||
+                return selectors.some((selector) =>
+                    [...document.querySelectorAll(selector)].some(visible)
+                ) ||
                     /(?:Укажу профессию|Добавить (?:место работы|опыт|образование|учебное заведение)|уровень владения|оцените навык|войти в аккаунт|вход на hh\.ru|captcha|капч|не робот|код подтверждения)/i.test(text);
             }""",
             timeout=timeout,
@@ -778,24 +797,20 @@ class HHResumeManager(HHAccountClient):
                         "required_action": gate["code"],
                         "recognized_screens": visited_screens,
                     }
-                manual = page.get_by_text("Укажу профессию", exact=True).first
+                manual = page.get_by_role(
+                    "button", name="Укажу профессию", exact=True
+                ).first
+                if not await _visible(manual):
+                    manual = page.get_by_text("Укажу профессию", exact=True).first
                 if await _visible(manual):
                     current_stage = "PROFESSION"
                     await human_click(page, manual)
-                    title_wait = page.locator(
-                        '[data-qa="resume-profile-position-input"], '
-                        '[data-qa="professional-role-search-input"], [data-qa="resume-title-input"]'
-                    ).first
+                    title_wait = page.locator(_PROFESSION_INPUT_SELECTOR).first
                     if not await _wait_visible(title_wait):
                         return self._form_changed("profession", visited_screens)
                     continue
 
-                title_input = page.locator(
-                    '[role="dialog"] [data-qa="resume-profile-position-input"], '
-                    '[data-qa="resume-profile-position-input"], '
-                    '[data-qa="professional-role-search-input"], [data-qa="resume-title-input"], '
-                    'input[placeholder*="профессию"], input[placeholder*="Должность"]'
-                ).first
+                title_input = page.locator(_PROFESSION_INPUT_SELECTOR).first
                 if await _visible(title_input):
                     current_stage = "PROFESSION"
                     visited_screens.append("profession")
@@ -1308,6 +1323,11 @@ class HHResumeManager(HHAccountClient):
 
                 if _resume_id_from_url(page.url):
                     return {"status": "SUBMITTED", "recognized_screens": visited_screens}
+                # React briefly removes the old step before hydrating the next
+                # one.  Treating that loading frame as a changed hh.ru form
+                # made otherwise valid imports stop at random transitions.
+                if await _wait_for_resume_page_signal(page):
+                    continue
                 return self._form_changed("unknown", visited_screens)
             return self._form_changed("loop-limit", visited_screens)
         except PatchrightTimeoutError:
