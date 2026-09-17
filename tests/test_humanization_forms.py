@@ -11,7 +11,12 @@ import leadscout.integrations.resumes as resumes_module
 import utils.humanization as humanization
 from ai_handler import StructuredResume
 from leadscout.integrations.resumes import HHResumeManager as ResumeManagerImpl
-from leadscout.integrations.resumes import _page_gate, _read_resume_profile_fields, _resume_id_from_url
+from leadscout.integrations.resumes import (
+    _page_gate,
+    _read_resume_profile_fields,
+    _resume_id_from_url,
+    _resume_screen_diagnostic,
+)
 from parsers.hh_applicant import _open_letter_and_fill, handle_resume_selection_if_needed
 from parsers.hh_resume import HHResumeManager
 
@@ -143,6 +148,78 @@ async def test_resume_wizard_supports_current_profession_wrapper_and_transient_s
         }
         assert await page.locator("#cookies").is_hidden()
         assert await page.evaluate("window.published === true", isolated_context=False)
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_wizard_prefers_profession_submit_over_generic_visible_button(monkeypatch):
+    monkeypatch.setattr(humanization.random, "uniform", lambda _low, _high: 0)
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True)
+    try:
+        page = await browser.new_page()
+        await page.route(
+            "https://hh.ru/profile/resume/professional_role",
+            lambda route: route.fulfill(
+                body="""
+                <meta charset="utf-8">
+                <button data-qa="resume-submit" onclick="window.wrongClicks += 1">Чужая кнопка</button>
+                <main id="app">
+                  <input data-qa="resume-profile-position-input">
+                  <div role="option" onclick="this.hidden=true">Разработчик</div>
+                  <button data-qa="professional-role-submit"
+                    onclick="document.querySelector('#app').innerHTML = window.publishHtml">
+                    Продолжить
+                  </button>
+                </main>
+                <script>
+                  window.wrongClicks = 0;
+                  window.publishHtml = '<button data-qa="resume-publish" onclick="window.published=true">Опубликовать</button>';
+                </script>
+                """,
+                content_type="text/html",
+            ),
+        )
+
+        result = await HHResumeManager._fill_step_by_step_resume(
+            page,
+            StructuredResume(title="Разработчик"),
+        )
+
+        assert result == {"status": "SUBMITTED", "recognized_screens": ["profession", "publish"]}
+        assert await page.evaluate("window.wrongClicks", isolated_context=False) == 0
+        assert await page.evaluate("window.published", isolated_context=False)
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_diagnostic_prioritizes_wizard_controls_without_field_values():
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True)
+    try:
+        page = await browser.new_page()
+        await page.set_content(
+            """
+            <header><button data-qa="header-action">Шапка</button></header>
+            <main>
+              <input data-qa="resume-profile-position-input" value="Секретное значение">
+              <button data-qa="professional-role-submit" type="submit">Продолжить</button>
+            </main>
+            """
+        )
+
+        diagnostic = await _resume_screen_diagnostic(page)
+
+        assert diagnostic["diagnostic_failures"] == []
+        assert diagnostic["wizard"]["profession_input_visible"] is True
+        assert diagnostic["wizard"]["profession_input_has_value"] is True
+        assert diagnostic["wizard"]["continue_qa"] == "professional-role-submit"
+        assert diagnostic["controls"][0]["qa"] == "resume-profile-position-input"
+        assert "Секретное значение" not in str(diagnostic)
     finally:
         await browser.close()
         await playwright.stop()
