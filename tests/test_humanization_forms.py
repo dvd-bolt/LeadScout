@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
 from patchright.async_api import TimeoutError as PatchrightTimeoutError
 from patchright.async_api import async_playwright
 
+import leadscout.integrations.resumes as resumes_module
 import utils.humanization as humanization
 from ai_handler import StructuredResume
 from leadscout.integrations.resumes import HHResumeManager as ResumeManagerImpl
@@ -137,6 +139,72 @@ async def test_resume_wizard_supports_current_profession_wrapper_and_transient_s
             "recognized_screens": ["profession", "personal", "skills", "publish"],
         }
         assert await page.evaluate("window.published === true", isolated_context=False)
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("submit_action", "expected_event", "expected_message"),
+    [
+        (
+            "window.continueClicks += 1;",
+            "event=continue_no_transition",
+            "Не удалось сохранить профессию.",
+        ),
+        (
+            "window.continueClicks += 1; document.querySelector('#error').hidden = false;",
+            "event=continue_validation_error",
+            "Выберите специализацию",
+        ),
+    ],
+)
+async def test_resume_wizard_stops_after_unconfirmed_profession_submit(
+    monkeypatch,
+    caplog,
+    submit_action,
+    expected_event,
+    expected_message,
+):
+    monkeypatch.setattr(humanization.random, "uniform", lambda _low, _high: 0)
+    monkeypatch.setattr(resumes_module, "DEFAULT_TRANSITION_TIMEOUT_MS", 250)
+    caplog.set_level(logging.INFO, logger="leadscout.integrations.resumes")
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True)
+    try:
+        page = await browser.new_page()
+        await page.route(
+            "https://hh.ru/profile/resume/professional_role",
+            lambda route: route.fulfill(
+                body=f"""
+                <meta charset="utf-8">
+                <input data-qa="resume-profile-position-input">
+                <div role="option">Секретная профессия</div>
+                <button id="continue" data-qa="professional-role-submit">Продолжить</button>
+                <div id="error" role="alert" hidden>Выберите специализацию</div>
+                <script>
+                  window.continueClicks = 0;
+                  document.querySelector('#continue').onclick = () => {{ {submit_action} }};
+                </script>
+                """,
+                content_type="text/html",
+            ),
+        )
+
+        result = await HHResumeManager._fill_step_by_step_resume(
+            page,
+            StructuredResume(title="Секретная профессия"),
+        )
+
+        assert result["status"] == "NEEDS_INPUT"
+        assert result["code"] == "HH_VALIDATION_ERROR"
+        assert result["stage"] == "PROFESSION"
+        assert result["message"] == expected_message
+        assert await page.evaluate("window.continueClicks", isolated_context=False) == 1
+        assert f"{expected_event} stage=PROFESSION" in caplog.text
+        assert "event=step_failed stage=PROFESSION" in caplog.text
+        assert "Секретная профессия" not in caplog.text
     finally:
         await browser.close()
         await playwright.stop()

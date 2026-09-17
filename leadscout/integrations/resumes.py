@@ -206,10 +206,14 @@ async def _wait_for_resume_page_signal(page: Page, timeout: int = DEFAULT_TRANSI
         return False
 
 
-def _safe_page_path(page: Page) -> str:
-    """Return a diagnostic hh path without query data or user content."""
-    match = re.match(r"https?://[^/]+(?P<path>/[^?#]*)", page.url or "")
+def _safe_url_path(url: str) -> str:
+    """Return a diagnostic URL path without query data or user content."""
+    match = re.match(r"https?://[^/]+(?P<path>/[^?#]*)", url or "")
     return match.group("path") if match else ""
+
+
+def _safe_page_path(page: Page) -> str:
+    return _safe_url_path(page.url)
 
 
 async def _resume_screen_diagnostic(page: Page) -> dict[str, Any]:
@@ -915,7 +919,9 @@ class HHResumeManager(HHAccountClient):
                         choice = page.get_by_text(str(specialization), exact=True).first
                         if await _visible(choice):
                             await human_click(page, choice)
-                    if not await self._click_continue(page, scope=title_input):
+                    if not await self._click_continue(
+                        page, scope=title_input, stage="PROFESSION"
+                    ):
                         return await self._form_failure(page, "PROFESSION", "Не удалось сохранить профессию.")
                     continue
 
@@ -1009,7 +1015,9 @@ class HHResumeManager(HHAccountClient):
                             choice = page.get_by_text(str(value), exact=True).first
                             if await _visible(choice):
                                 await human_click(page, choice)
-                    if not await self._click_continue(page, scope=first_name):
+                    if not await self._click_continue(
+                        page, scope=first_name, stage="PERSONAL"
+                    ):
                         return await self._form_failure(page, "PERSONAL", "Не удалось сохранить личные данные.")
                     continue
 
@@ -1035,7 +1043,7 @@ class HHResumeManager(HHAccountClient):
                             if await _visible(choice):
                                 await human_click(page, choice)
                     scope = phone if await _visible(phone) else email
-                    if not await self._click_continue(page, scope=scope):
+                    if not await self._click_continue(page, scope=scope, stage="CONTACTS"):
                         return await self._form_failure(page, "CONTACTS", "Не удалось сохранить контакты.")
                     continue
 
@@ -1065,7 +1073,9 @@ class HHResumeManager(HHAccountClient):
                         choice = page.get_by_text(str(value), exact=True).first
                         if await _visible(choice):
                             await human_click(page, choice)
-                    if not await self._click_continue(page, scope=salary):
+                    if not await self._click_continue(
+                        page, scope=salary, stage="CONDITIONS"
+                    ):
                         return await self._form_failure(page, "CONDITIONS", "Не удалось сохранить условия работы.")
                     continue
 
@@ -1091,7 +1101,9 @@ class HHResumeManager(HHAccountClient):
                     current_stage = "EXPERIENCE"
                     visited_screens.append("experience")
                     if experience_index >= len(resume.experiences):
-                        if not await self._click_continue(page, scope=experience_field):
+                        if not await self._click_continue(
+                            page, scope=experience_field, stage="EXPERIENCE"
+                        ):
                             return await self._form_failure(page, "EXPERIENCE", "Не удалось пропустить опыт.")
                         continue
                     item = resume.experiences[experience_index]
@@ -1118,7 +1130,9 @@ class HHResumeManager(HHAccountClient):
                     ).first
                     if item.is_current and await _visible(current_job) and not await current_job.is_checked():
                         await human_click(page, current_job)
-                    if not await self._click_continue(page, scope=experience_field):
+                    if not await self._click_continue(
+                        page, scope=experience_field, stage="EXPERIENCE"
+                    ):
                         return await self._form_failure(page, "EXPERIENCE", "Не удалось сохранить опыт работы.")
                     experience_index += 1
                     continue
@@ -1163,7 +1177,9 @@ class HHResumeManager(HHAccountClient):
                             ),
                         ):
                             await self._fill_empty(page, locator, str(value or ""))
-                    if not await self._click_continue(page, scope=institution):
+                    if not await self._click_continue(
+                        page, scope=institution, stage="EDUCATION"
+                    ):
                         return await self._form_failure(page, "EDUCATION", "Не удалось сохранить образование.")
                     education_index += 1
                     continue
@@ -1180,7 +1196,9 @@ class HHResumeManager(HHAccountClient):
                         exact = page.get_by_text(str(language.get("name") or ""), exact=True).first
                         if await _visible(exact):
                             await human_click(page, exact)
-                    if not await self._click_continue(page, scope=language_input):
+                    if not await self._click_continue(
+                        page, scope=language_input, stage="LANGUAGES"
+                    ):
                         return await self._form_failure(page, "LANGUAGES", "Не удалось сохранить языки.")
                     continue
 
@@ -1195,7 +1213,7 @@ class HHResumeManager(HHAccountClient):
                         await self._fill_empty(
                             page, link_input, str(links[link_index].get("url") or "")
                         )
-                    if not await self._click_continue(page, scope=link_input):
+                    if not await self._click_continue(page, scope=link_input, stage="LINKS"):
                         return await self._form_failure(page, "LINKS", "Не удалось сохранить профессиональные ссылки.")
                     link_index += 1
                     continue
@@ -1231,7 +1249,9 @@ class HHResumeManager(HHAccountClient):
                         await self._fill_empty(page, organization, str(item.get("organization") or ""))
                         await self._fill_empty(page, year, str(item.get("year") or ""))
                         await self._fill_empty(page, description, str(item.get("description") or ""))
-                    if not await self._click_continue(page, scope=detail_input):
+                    if not await self._click_continue(
+                        page, scope=detail_input, stage=key.upper()
+                    ):
                         return await self._form_failure(
                             page, key.upper(), f"Не удалось сохранить раздел «{key}»."
                         )
@@ -1255,7 +1275,9 @@ class HHResumeManager(HHAccountClient):
                         car = page.get_by_text(re.compile(r"есть автомобиль", re.IGNORECASE)).first
                         if await _visible(car):
                             await human_click(page, car)
-                    if not await self._click_continue(page, scope=driving_block):
+                    if not await self._click_continue(
+                        page, scope=driving_block, stage="DRIVING"
+                    ):
                         return await self._form_failure(
                             page, "DRIVING", "Не удалось сохранить водительские сведения."
                         )
@@ -1278,7 +1300,9 @@ class HHResumeManager(HHAccountClient):
                         option = block.get_by_text(level, exact=True).first
                         if await _visible(option):
                             await human_click(page, option)
-                    if not await self._click_continue(page, scope=skill_level_heading):
+                    if not await self._click_continue(
+                        page, scope=skill_level_heading, stage="SKILL_LEVELS"
+                    ):
                         return await self._form_failure(
                             page, "SKILL_LEVELS", "Не удалось сохранить уровни навыков."
                         )
@@ -1298,7 +1322,9 @@ class HHResumeManager(HHAccountClient):
                             await human_click(page, exact)
                         else:
                             await skill_input.press("Enter")
-                    if not await self._click_continue(page, scope=skill_input):
+                    if not await self._click_continue(
+                        page, scope=skill_input, stage="SKILLS"
+                    ):
                         return await self._form_failure(page, "SKILLS", "Не удалось сохранить навыки.")
                     continue
 
@@ -1310,7 +1336,7 @@ class HHResumeManager(HHAccountClient):
                     current_stage = "ABOUT"
                     visited_screens.append("about")
                     await self._fill_empty(page, about, resume.about)
-                    if not await self._click_continue(page, scope=about):
+                    if not await self._click_continue(page, scope=about, stage="ABOUT"):
                         return await self._form_failure(page, "ABOUT", "Не удалось сохранить раздел «О себе».")
                     continue
 
@@ -1511,10 +1537,48 @@ class HHResumeManager(HHAccountClient):
 
     @staticmethod
     async def _form_failure(page: Page, stage: str, fallback: str) -> dict[str, Any]:
-        errors = await page.locator(
+        error_locator = page.locator(
             '[aria-invalid="true"], [data-qa*="error" i], [role="alert"]'
-        ).all_inner_texts()
-        messages = list(dict.fromkeys(text.strip() for text in errors if text.strip()))
+        )
+        diagnostic = await _resume_screen_diagnostic(page)
+        try:
+            visible_errors = await error_locator.evaluate_all(
+                r"""nodes => nodes.filter((node) => {
+                    if (node.closest('[hidden], [aria-hidden="true"]')) return false;
+                    const style = getComputedStyle(node);
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                        node.getClientRects().length > 0;
+                }).slice(0, 20).map((node) => ({
+                    message: (node.innerText || '').trim(),
+                    tag: node.tagName.toLowerCase(),
+                    qa: (node.getAttribute('data-qa') || '').slice(0, 100),
+                    role: (node.getAttribute('role') || '').slice(0, 40),
+                    invalid: (node.getAttribute('aria-invalid') || '').slice(0, 10)
+                }))"""
+            )
+        except Exception:
+            visible_errors = []
+        messages = list(
+            dict.fromkeys(
+                str(item.get("message") or "").strip()
+                for item in visible_errors
+                if str(item.get("message") or "").strip()
+            )
+        )
+        error_controls = [
+            {key: value for key, value in item.items() if key != "message"}
+            for item in visible_errors
+        ]
+        logger.warning(
+            "HH_RESUME event=step_failed stage=%s path=%s frames=%s "
+            "validation_count=%s validation_controls=%s controls=%s",
+            stage,
+            diagnostic["path"],
+            diagnostic["frames"],
+            len(error_controls),
+            error_controls,
+            diagnostic["controls"],
+        )
         return {
             "status": "NEEDS_INPUT",
             "code": "HH_VALIDATION_ERROR",
@@ -1525,7 +1589,12 @@ class HHResumeManager(HHAccountClient):
         }
 
     @staticmethod
-    async def _click_continue(page: Page, scope: Locator | None = None) -> bool:
+    async def _click_continue(
+        page: Page,
+        scope: Locator | None = None,
+        *,
+        stage: str = "HH_WIZARD",
+    ) -> bool:
         root = page.locator("body")
         if scope is not None:
             form = scope.locator("xpath=ancestor::form[1]")
@@ -1535,25 +1604,92 @@ class HHResumeManager(HHAccountClient):
             '[data-qa="resume-submit"], [data-qa="professional-role-submit"], '
             'button:has-text("Сохранить и продолжить"), button:has-text("Продолжить"), '
             'button:has-text("Далее"), button[type="submit"]'
-        ).first
+        ).filter(visible=True).first
         if not await _wait_visible(button):
+            diagnostic = await _resume_screen_diagnostic(page)
+            logger.warning(
+                "HH_RESUME event=continue_control_missing stage=%s path=%s "
+                "frames=%s controls=%s",
+                stage,
+                diagnostic["path"],
+                diagnostic["frames"],
+                diagnostic["controls"],
+            )
             return False
-        previous_text = await page.locator("body").inner_text()
+        previous_url = page.url
+        scope_handle = await scope.element_handle() if scope is not None else None
+        button_handle = await button.element_handle()
         try:
             await human_click(page, button)
-        except HumanizationError:
+        except HumanizationError as exc:
+            diagnostic = await _resume_screen_diagnostic(page)
+            logger.warning(
+                "HH_RESUME event=continue_click_failed stage=%s operation=%s reason=%s "
+                "path=%s frames=%s controls=%s",
+                stage,
+                exc.operation,
+                exc.reason,
+                diagnostic["path"],
+                diagnostic["frames"],
+                diagnostic["controls"],
+            )
             return False
         try:
-            await page.wait_for_function(
-                "previous => (document.body?.innerText || '') !== previous",
-                previous_text,
+            transition = await page.wait_for_function(
+                r"""args => {
+                    const visible = (node) => {
+                        if (!node || !node.isConnected ||
+                            node.closest('[hidden], [aria-hidden="true"]')) return false;
+                        const style = getComputedStyle(node);
+                        return style.display !== 'none' && style.visibility !== 'hidden' &&
+                            node.getClientRects().length > 0;
+                    };
+                    const invalid = [...document.querySelectorAll(
+                        '[aria-invalid="true"], [data-qa*="error" i], [role="alert"]'
+                    )].some(visible);
+                    if (invalid) return 'validation';
+                    if (location.href !== args.previousUrl ||
+                        (args.scope && !visible(args.scope)) ||
+                        (args.button && !visible(args.button))) return 'transition';
+                    return false;
+                }""",
+                arg={
+                    "previousUrl": previous_url,
+                    "scope": scope_handle,
+                    "button": button_handle,
+                },
                 timeout=DEFAULT_TRANSITION_TIMEOUT_MS,
             )
+            outcome = await transition.json_value()
         except Exception:
-            # Some React transitions keep the same labels. The caller detects
-            # the next supported screen and will stop safely if nothing changed.
-            pass
-        return not bool(await page.locator('[aria-invalid="true"]').count())
+            diagnostic = await _resume_screen_diagnostic(page)
+            logger.warning(
+                "HH_RESUME event=continue_no_transition stage=%s path=%s "
+                "frames=%s controls=%s",
+                stage,
+                diagnostic["path"],
+                diagnostic["frames"],
+                diagnostic["controls"],
+            )
+            return False
+        if outcome == "validation":
+            diagnostic = await _resume_screen_diagnostic(page)
+            logger.warning(
+                "HH_RESUME event=continue_validation_error stage=%s path=%s "
+                "frames=%s controls=%s",
+                stage,
+                diagnostic["path"],
+                diagnostic["frames"],
+                diagnostic["controls"],
+            )
+            return False
+        logger.info(
+            "HH_RESUME event=continue_transition_confirmed stage=%s from_path=%s to_path=%s",
+            stage,
+            _safe_url_path(previous_url),
+            _safe_page_path(page),
+        )
+        return True
 
     @serialize_account
     async def delete_resume_on_hh(self, user_id: int, resume_id: str, account_id: int | None = None) -> dict[str, Any]:
