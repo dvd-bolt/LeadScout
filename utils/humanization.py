@@ -288,7 +288,13 @@ async def human_click(page: Page, selector_or_locator: str | Locator, *, timeout
         # navigate. A later locator click still revalidates its own target.
         if state.url == page.url:
             try:
-                box = await locator.bounding_box(timeout=_remaining_ms(deadline, "click"))
+                if await locator.count() == 0 or not await locator.is_visible():
+                    state.position = None
+                    state.url = page.url
+                    return
+                box = await locator.bounding_box(
+                    timeout=min(250, _remaining_ms(deadline, "click"))
+                )
                 viewport = page.viewport_size
                 if box and viewport:
                     state.position = (

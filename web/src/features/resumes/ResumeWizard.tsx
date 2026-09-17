@@ -44,6 +44,7 @@ export function ResumeWizard({ accountId, draft, onRefresh, onSaved, onClose, on
   const [operationActive, setOperationActive] = useState(() => Boolean(sessionStorage.getItem(operationKey)));
   const [conflictsConfirmed, setConflictsConfirmed] = useState(false);
   const [professionOptions, setProfessionOptions] = useState<ReferenceOption[]>([]);
+  const [specializationOptions, setSpecializationOptions] = useState<string[]>([]);
   const [cityOptions, setCityOptions] = useState<ReferenceOption[]>([]);
   const activeOperations = useQuery({
     queryKey: ["operations", "resume-draft", accountId, draft.id],
@@ -217,7 +218,8 @@ export function ResumeWizard({ accountId, draft, onRefresh, onSaved, onClose, on
     void activeOperations.refetch();
     await onRefresh();
     const message = typeof item.result.message === "string" ? item.result.message : item.error_text;
-    const options = (item.result as Record<string, unknown>).options;
+    const operationResult = item.result as Record<string, unknown>;
+    const options = operationResult.options;
     if (Array.isArray(options)) {
       const normalized = options.flatMap((value: unknown) => {
         if (typeof value === "string") return [{ id: value, label: value }];
@@ -228,8 +230,18 @@ export function ResumeWizard({ accountId, draft, onRefresh, onSaved, onClose, on
         }
         return [];
       });
-      if ((item.result as Record<string, unknown>).code === "AMBIGUOUS_CITY") setCityOptions(normalized);
+      if (operationResult.code === "AMBIGUOUS_CITY") setCityOptions(normalized);
       else setProfessionOptions(normalized);
+    }
+    const specializations = operationResult.specialization_options;
+    if (Array.isArray(specializations)) {
+      const normalized = specializations
+        .map((value) => String(value).trim())
+        .filter((value, index, values) => value && values.indexOf(value) === index);
+      setSpecializationOptions(normalized);
+      if (["SPECIALIZATION_REQUIRED", "SPECIALIZATION_NOT_FOUND"].includes(String(operationResult.code))) {
+        setStepIndex(STEPS.findIndex(([key]) => key === "profession"));
+      }
     }
     setNotice(message ? { text: message, error: !operationSucceeded(item), tone: operationSucceeded(item) ? "success" : "warning" } : null);
   };
@@ -295,6 +307,7 @@ export function ResumeWizard({ accountId, draft, onRefresh, onSaved, onClose, on
         errors={errors}
         backupKey={backupKey}
         professionOptions={professionOptions}
+        specializationOptions={specializationOptions}
         cityOptions={cityOptions}
         mutateData={mutateData}
       />

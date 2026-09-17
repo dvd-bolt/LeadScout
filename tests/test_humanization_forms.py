@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from patchright.async_api import TimeoutError as PatchrightTimeoutError
@@ -86,6 +86,9 @@ async def test_resume_wizard_supports_current_profession_wrapper_and_transient_s
             lambda route: route.fulfill(
                 body="""
                 <meta charset="utf-8">
+                <div id="cookies" data-qa="cookies-policy-informer">
+                  <button data-qa="cookies-policy-informer-accept" onclick="this.parentElement.hidden=true">Принять</button>
+                </div>
                 <div hidden>
                   <button>Укажу профессию</button>
                   <input data-qa="resume-profile-position-input">
@@ -117,7 +120,7 @@ async def test_resume_wizard_supports_current_profession_wrapper_and_transient_s
                     }
                   }
                   function profession() {
-                    app.innerHTML = '<div data-qa="resume-profile-position-input"><input></div><div role="option">Разработчик</div><button data-qa="professional-role-submit" onclick="transition(personal)">Продолжить</button>';
+                    app.innerHTML = '<div data-qa="resume-profile-position-input"><input></div><div role="option" onclick="this.hidden=true">Разработчик</div><button data-qa="professional-role-submit" onclick="transition(personal)">Продолжить</button>';
                   }
                   document.querySelector('#manual').onclick = () => setTimeout(profession, 200);
                 </script>
@@ -138,7 +141,149 @@ async def test_resume_wizard_supports_current_profession_wrapper_and_transient_s
             "status": "SUBMITTED",
             "recognized_screens": ["profession", "personal", "skills", "publish"],
         }
+        assert await page.locator("#cookies").is_hidden()
         assert await page.evaluate("window.published === true", isolated_context=False)
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_wizard_selects_specialization_matching_resume_title(monkeypatch, caplog):
+    monkeypatch.setattr(humanization.random, "uniform", lambda _low, _high: 0)
+    caplog.set_level(logging.INFO, logger="leadscout.integrations.resumes")
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True)
+    try:
+        page = await browser.new_page()
+        await page.route(
+            "https://hh.ru/profile/resume/professional_role",
+            lambda route: route.fulfill(
+                body="""
+                <meta charset="utf-8">
+                <main id="app">
+                  <input data-qa="resume-profile-position-input">
+                  <div id="profession" role="option" onclick="chooseProfession()">Программист, разработчик</div>
+                  <section id="specializations" hidden>
+                    <h2>Специализация</h2>
+                    <label><input name="specialization" type="checkbox">Программист 1С</label>
+                    <label><input name="specialization" type="checkbox">Frontend-разработчик</label>
+                  </section>
+                  <button data-qa="professional-role-submit" onclick="continueWizard()">Продолжить</button>
+                </main>
+                <script>
+                  function chooseProfession() {
+                    document.querySelector('#profession').hidden = true;
+                    document.querySelector('#specializations').hidden = false;
+                  }
+                  function continueWizard() {
+                    if (!document.querySelector('input[name="specialization"]:checked')) return;
+                    document.querySelector('#app').innerHTML =
+                      '<button data-qa="resume-publish" onclick="window.published=true">Опубликовать</button>';
+                  }
+                </script>
+                """,
+                content_type="text/html",
+            ),
+        )
+
+        result = await HHResumeManager._fill_step_by_step_resume(
+            page,
+            StructuredResume(title="Программист 1С"),
+            draft_data={"profession": {"hh_profession": "Программист, разработчик"}},
+        )
+
+        assert result == {"status": "SUBMITTED", "recognized_screens": ["profession", "publish"]}
+        assert await page.evaluate("window.published === true", isolated_context=False)
+        assert "event=profession_specialization_selected source=resume_title count=1" in caplog.text
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_wizard_requests_ambiguous_required_specialization(monkeypatch, caplog):
+    monkeypatch.setattr(humanization.random, "uniform", lambda _low, _high: 0)
+    caplog.set_level(logging.INFO, logger="leadscout.integrations.resumes")
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True)
+    try:
+        page = await browser.new_page()
+        await page.route(
+            "https://hh.ru/profile/resume/professional_role",
+            lambda route: route.fulfill(
+                body="""
+                <meta charset="utf-8">
+                <main>
+                  <input data-qa="resume-profile-position-input">
+                  <div id="profession" role="option" onclick="this.hidden=true; choices.hidden=false">Разработчик</div>
+                  <fieldset id="choices" hidden>
+                    <legend>Специализации</legend>
+                    <label><input name="specialization" type="checkbox">Backend</label>
+                    <label><input name="specialization" type="checkbox">Frontend</label>
+                  </fieldset>
+                  <button data-qa="professional-role-submit" onclick="window.continueClicks += 1">Продолжить</button>
+                </main>
+                <script>window.continueClicks = 0;</script>
+                """,
+                content_type="text/html",
+            ),
+        )
+
+        result = await HHResumeManager._fill_step_by_step_resume(
+            page,
+            StructuredResume(title="Разработчик"),
+        )
+
+        assert result["status"] == "NEEDS_INPUT"
+        assert result["code"] == "SPECIALIZATION_REQUIRED"
+        assert result["stage"] == "PROFESSION"
+        assert result["specialization_options"] == ["Backend", "Frontend"]
+        assert await page.evaluate("window.continueClicks", isolated_context=False) == 0
+        assert "event=profession_specialization_required" in caplog.text
+    finally:
+        await browser.close()
+        await playwright.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_wizard_reports_unconfirmed_profession_suggestion(monkeypatch, caplog):
+    monkeypatch.setattr(humanization.random, "uniform", lambda _low, _high: 0)
+    monkeypatch.setattr(resumes_module, "_PROFESSION_SELECTION_TIMEOUT_MS", 250)
+    caplog.set_level(logging.INFO, logger="leadscout.integrations.resumes")
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(headless=True)
+    try:
+        page = await browser.new_page()
+        await page.route(
+            "https://hh.ru/profile/resume/professional_role",
+            lambda route: route.fulfill(
+                body="""
+                <meta charset="utf-8">
+                <main>
+                  <input data-qa="resume-profile-position-input">
+                  <div role="option">Разработчик</div>
+                  <button data-qa="professional-role-submit" onclick="window.continueClicks += 1">
+                    Продолжить
+                  </button>
+                </main>
+                <script>window.continueClicks = 0;</script>
+                """,
+                content_type="text/html",
+            ),
+        )
+
+        result = await HHResumeManager._fill_step_by_step_resume(
+            page,
+            StructuredResume(title="Разработчик"),
+        )
+
+        assert result["status"] == "NEEDS_ACTION"
+        assert result["code"] == "PROFESSION_SELECTION_NOT_CONFIRMED"
+        assert result["stage"] == "PROFESSION"
+        assert result["retryable"] is True
+        assert await page.evaluate("window.continueClicks", isolated_context=False) == 0
+        assert "event=profession_selection_not_confirmed" in caplog.text
     finally:
         await browser.close()
         await playwright.stop()
@@ -149,7 +294,7 @@ async def test_resume_wizard_supports_current_profession_wrapper_and_transient_s
     ("submit_action", "expected_event", "expected_message"),
     [
         (
-            "window.continueClicks += 1;",
+            "window.continueClicks += 1; fetch('/profile/resume/save');",
             "event=continue_no_transition",
             "Не удалось сохранить профессию.",
         ),
@@ -180,7 +325,7 @@ async def test_resume_wizard_stops_after_unconfirmed_profession_submit(
                 body=f"""
                 <meta charset="utf-8">
                 <input data-qa="resume-profile-position-input">
-                <div role="option">Секретная профессия</div>
+                <div role="option" onclick="this.hidden = true">Секретная профессия</div>
                 <button id="continue" data-qa="professional-role-submit">Продолжить</button>
                 <div id="error" role="alert" hidden>Выберите специализацию</div>
                 <script>
@@ -190,6 +335,10 @@ async def test_resume_wizard_stops_after_unconfirmed_profession_submit(
                 """,
                 content_type="text/html",
             ),
+        )
+        await page.route(
+            "https://hh.ru/profile/resume/save",
+            lambda route: route.fulfill(status=500, body="failed"),
         )
 
         result = await HHResumeManager._fill_step_by_step_resume(
@@ -204,6 +353,9 @@ async def test_resume_wizard_stops_after_unconfirmed_profession_submit(
         assert await page.evaluate("window.continueClicks", isolated_context=False) == 1
         assert f"{expected_event} stage=PROFESSION" in caplog.text
         assert "event=step_failed stage=PROFESSION" in caplog.text
+        if expected_event == "event=continue_no_transition":
+            assert "'path': '/profile/resume/save'" in caplog.text
+            assert "'status': 500" in caplog.text
         assert "Секретная профессия" not in caplog.text
     finally:
         await browser.close()
@@ -267,6 +419,7 @@ async def test_resume_profile_uses_displayed_city_instead_of_numeric_area_id():
 @pytest.mark.asyncio
 async def test_resume_wizard_reports_open_timeout_as_retryable_without_verify_stage():
     page = AsyncMock()
+    page.on = Mock()
     page.url = "https://hh.ru/profile/resume/professional_role?private=value"
     page.goto.side_effect = PatchrightTimeoutError("navigation timeout")
     manager = object.__new__(ResumeManagerImpl)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 import pytest_asyncio
@@ -59,6 +60,19 @@ async def test_click_reports_an_overlay_instead_of_clicking_through_it(chromium_
     with pytest.raises(HumanizationError, match="click:action_not_confirmed"):
         await human_click(chromium_page, "#target", timeout_ms=300)
     assert await chromium_page.evaluate("window.targetClicks || 0", isolated_context=False) == 0
+
+
+@pytest.mark.asyncio
+async def test_click_does_not_wait_for_coordinates_after_target_disappears(chromium_page):
+    await chromium_page.set_content(
+        '<button id="target" onclick="this.hidden=true;window.clicked=true">target</button>'
+    )
+
+    started = time.monotonic()
+    await human_click(chromium_page, "#target", timeout_ms=2_000)
+
+    assert time.monotonic() - started < 1
+    assert await chromium_page.evaluate("window.clicked", isolated_context=False)
 
 
 @pytest.mark.asyncio

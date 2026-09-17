@@ -152,6 +152,7 @@ export function ResumeEditorStep({
   errors,
   backupKey,
   professionOptions,
+  specializationOptions,
   cityOptions,
   mutateData,
 }: {
@@ -161,6 +162,7 @@ export function ResumeEditorStep({
   errors: Map<string, string>;
   backupKey: string;
   professionOptions: ReferenceOption[];
+  specializationOptions: string[];
   cityOptions: ReferenceOption[];
   mutateData: MutateDraft;
 }) {
@@ -194,12 +196,21 @@ export function ResumeEditorStep({
           })}
         />
       )}
-      <ListField
-        storageKey={`${backupKey}:raw:specializations`}
-        label="Специализации, через запятую"
-        value={data.profession.specializations}
-        onCommit={(value) => mutateData((next) => { next.profession.specializations = value; })}
-      />
+      {specializationOptions.length ? (
+        <MultiChoiceField
+          label="Выберите специализации, которые предложил hh.ru"
+          value={data.profession.specializations}
+          options={specializationOptions}
+          onChange={(value) => mutateData((next) => { next.profession.specializations = value; })}
+        />
+      ) : (
+        <ListField
+          storageKey={`${backupKey}:raw:specializations`}
+          label="Специализации, через запятую"
+          value={data.profession.specializations}
+          onCommit={(value) => mutateData((next) => { next.profession.specializations = value; })}
+        />
+      )}
     </>;
   }
 

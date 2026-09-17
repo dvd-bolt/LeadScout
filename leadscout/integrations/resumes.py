@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import weakref
 from datetime import date
 from typing import Any
 
@@ -42,6 +43,15 @@ _PROFESSION_INPUT_SELECTOR = (
     '[data-qa="professional-role-search-input"] [contenteditable="true"], '
     'input[data-qa="resume-title-input"], [data-qa="resume-title-input"] input, '
     'input[placeholder*="профессию"], input[placeholder*="Должность"]'
+)
+_COOKIE_ACCEPT_SELECTOR = (
+    '[data-qa="cookies-policy-informer-accept"], '
+    'button:has-text("Принять cookies"), button:has-text("Принять cookie")'
+)
+_VALIDATION_SELECTOR = '[aria-invalid="true"], [data-qa*="error" i], [role="alert"]'
+_PROFESSION_SELECTION_TIMEOUT_MS = 5_000
+_RESUME_NETWORK_EVENTS: weakref.WeakKeyDictionary[Page, list[dict[str, Any]]] = (
+    weakref.WeakKeyDictionary()
 )
 
 
@@ -216,10 +226,84 @@ def _safe_page_path(page: Page) -> str:
     return _safe_url_path(page.url)
 
 
+def _install_resume_network_diagnostics(page: Page) -> None:
+    """Remember failed hh.ru requests without retaining query strings or payloads."""
+    events: list[dict[str, Any]] = []
+    _RESUME_NETWORK_EVENTS[page] = events
+
+    def append(event: dict[str, Any]) -> None:
+        events.append(event)
+        del events[:-20]
+
+    def hh_target(url: str) -> tuple[str, str] | None:
+        match = re.match(r"https?://(?P<host>[^/:?#]+)(?P<path>/[^?#]*)?", url or "")
+        if not match:
+            return None
+        host = match.group("host").lower()
+        if host != "hh.ru" and not host.endswith(".hh.ru"):
+            return None
+        return host, match.group("path") or "/"
+
+    def on_response(response: Any) -> None:
+        try:
+            if response.status < 400 or not (target := hh_target(response.url)):
+                return
+            append(
+                {
+                    "kind": "response",
+                    "host": target[0],
+                    "path": target[1],
+                    "method": response.request.method,
+                    "resource": response.request.resource_type,
+                    "status": response.status,
+                }
+            )
+        except Exception:
+            return
+
+    def on_request_failed(request: Any) -> None:
+        try:
+            if not (target := hh_target(request.url)):
+                return
+            append(
+                {
+                    "kind": "request_failed",
+                    "host": target[0],
+                    "path": target[1],
+                    "method": request.method,
+                    "resource": request.resource_type,
+                }
+            )
+        except Exception:
+            return
+
+    page.on("response", on_response)
+    page.on("requestfailed", on_request_failed)
+
+
+async def _dismiss_hh_cookie_notice(page: Page) -> None:
+    button = _first_visible(page.locator(_COOKIE_ACCEPT_SELECTOR))
+    if not await _visible(button):
+        return
+    await human_click(page, button)
+    try:
+        await button.wait_for(state="hidden", timeout=3_000)
+    except Exception:
+        diagnostic = await _resume_screen_diagnostic(page)
+        logger.warning(
+            "HH_RESUME event=cookie_notice_remained path=%s wizard=%s controls=%s",
+            diagnostic["path"],
+            diagnostic["wizard"],
+            diagnostic["controls"],
+        )
+        return
+    logger.info("HH_RESUME event=cookie_notice_dismissed path=%s", _safe_page_path(page))
+
+
 async def _resume_screen_diagnostic(page: Page) -> dict[str, Any]:
     """Collect selector-only diagnostics without values, page text, or query data."""
     try:
-        controls = await page.evaluate(
+        snapshot = await page.evaluate(
             r"""() => {
                 const visible = (node) => {
                     if (!node || node.closest('[hidden], [aria-hidden="true"]')) return false;
@@ -227,23 +311,264 @@ async def _resume_screen_diagnostic(page: Page) -> dict[str, Any]:
                     return style.display !== 'none' && style.visibility !== 'hidden' &&
                         node.getClientRects().length > 0;
                 };
-                return [...document.querySelectorAll('[data-qa], input, textarea, select, button, [role]')]
-                    .filter(visible)
-                    .slice(0, 40)
-                    .map((node) => ({
+                const summary = (node) => ({
                         tag: node.tagName.toLowerCase(),
                         qa: (node.getAttribute('data-qa') || '').slice(0, 100),
                         role: (node.getAttribute('role') || '').slice(0, 40),
-                        type: (node.getAttribute('type') || '').slice(0, 40)
-                    }));
+                        type: (node.getAttribute('type') || '').slice(0, 40),
+                        disabled: Boolean(node.disabled) || node.getAttribute('aria-disabled') === 'true',
+                        checked: Boolean(node.checked) || node.getAttribute('aria-checked') === 'true',
+                        expanded: (node.getAttribute('aria-expanded') || '').slice(0, 10),
+                        invalid: (node.getAttribute('aria-invalid') || '').slice(0, 10)
+                    });
+                const all = [...document.querySelectorAll(
+                    '[data-qa], input, textarea, select, button, [role]'
+                )].filter(visible);
+                const relevant = all.filter((node) => {
+                    const marker = [
+                        node.getAttribute('data-qa'), node.getAttribute('name'),
+                        node.getAttribute('aria-label'), node.getAttribute('role')
+                    ].filter(Boolean).join(' ');
+                    return /resume|profession|speciali|ошиб|error|alert/i.test(marker) ||
+                        Boolean(node.closest('main form, main [data-qa*="resume" i], main'));
+                });
+                const controls = [...new Set([...relevant, ...all])].slice(0, 80).map(summary);
+                const professionInput = [...document.querySelectorAll(
+                    'input[data-qa="resume-profile-position-input"], '
+                    '[data-qa="resume-profile-position-input"] input, '
+                    'input[data-qa="professional-role-search-input"], '
+                    '[data-qa="professional-role-search-input"] input, '
+                    'input[data-qa="resume-title-input"], [data-qa="resume-title-input"] input'
+                )].find(visible);
+                const continueButton = [...document.querySelectorAll(
+                    '[data-qa="professional-role-submit"], [data-qa="resume-submit"], button[type="submit"]'
+                )].find(visible);
+                const visibleOptions = [...document.querySelectorAll(
+                    '[role="option"], [data-qa="suggest-item-cell"], [data-qa="professional-role-item"]'
+                )].filter(visible);
+                const specializationMarkers = [...document.querySelectorAll(
+                    '[data-qa*="specialization" i], [name*="specialization" i], h1, h2, h3, h4, legend'
+                )].filter((node) => visible(node) && (
+                    /specialization/i.test((node.getAttribute('data-qa') || '') + ' ' +
+                        (node.getAttribute('name') || '')) ||
+                    /специализац/i.test((node.textContent || '').trim())
+                ));
+                return {
+                    controls,
+                    wizard: {
+                        profession_input_visible: Boolean(professionInput),
+                        profession_input_has_value: Boolean(
+                            professionInput && String(professionInput.value || '').trim()
+                        ),
+                        profession_input_expanded: professionInput?.getAttribute('aria-expanded') || '',
+                        continue_visible: Boolean(continueButton),
+                        continue_disabled: Boolean(continueButton?.disabled) ||
+                            continueButton?.getAttribute('aria-disabled') === 'true',
+                        suggestion_count: visibleOptions.length,
+                        specialization_section_visible: specializationMarkers.length > 0,
+                        cookie_notice_visible: [...document.querySelectorAll(
+                            '[data-qa="cookies-policy-informer-accept"]'
+                        )].some(visible),
+                        active: document.activeElement ? summary(document.activeElement) : null
+                    }
+                };
             }"""
         )
     except Exception:
-        controls = []
+        snapshot = {"controls": [], "wizard": {}}
     return {
         "path": _safe_page_path(page),
         "frames": len(page.frames),
-        "controls": controls,
+        "controls": snapshot.get("controls") or [],
+        "wizard": snapshot.get("wizard") or {},
+        "network": list(_RESUME_NETWORK_EVENTS.get(page, [])),
+    }
+
+
+async def _select_and_confirm_profession_option(
+    page: Page, title_input: Locator, selected_option: Locator
+) -> bool:
+    input_handle = await title_input.element_handle()
+    option_handle = await selected_option.element_handle()
+    await human_click(page, selected_option)
+    try:
+        await page.wait_for_function(
+            r"""args => {
+                const visible = (node) => {
+                    if (!node || !node.isConnected ||
+                        node.closest('[hidden], [aria-hidden="true"]')) return false;
+                    const style = getComputedStyle(node);
+                    return style.display !== 'none' && style.visibility !== 'hidden' &&
+                        node.getClientRects().length > 0;
+                };
+                if (!visible(args.option)) return true;
+                if (args.option.getAttribute('aria-selected') === 'true' ||
+                    args.option.getAttribute('aria-checked') === 'true' ||
+                    args.option.getAttribute('data-state') === 'checked') return true;
+                const expanded = args.input?.getAttribute('aria-expanded');
+                return expanded === 'false' && ![...document.querySelectorAll(
+                    '[role="option"], [data-qa="suggest-item-cell"], [data-qa="professional-role-item"]'
+                )].some(visible);
+            }""",
+            arg={"input": input_handle, "option": option_handle},
+            timeout=_PROFESSION_SELECTION_TIMEOUT_MS,
+        )
+        return True
+    except Exception:
+        diagnostic = await _resume_screen_diagnostic(page)
+        logger.warning(
+            "HH_RESUME event=profession_selection_not_confirmed path=%s "
+            "wizard=%s network=%s controls=%s",
+            diagnostic["path"],
+            diagnostic["wizard"],
+            diagnostic["network"],
+            diagnostic["controls"],
+        )
+        return False
+
+
+async def _profession_specialization_state(page: Page) -> dict[str, Any]:
+    """Read visible specialization choices without logging their labels."""
+    try:
+        return dict(
+            await page.evaluate(
+                r"""() => {
+                    const visible = (node) => {
+                        if (!node || node.closest('[hidden], [aria-hidden="true"]')) return false;
+                        const style = getComputedStyle(node);
+                        return style.display !== 'none' && style.visibility !== 'hidden' &&
+                            node.getClientRects().length > 0;
+                    };
+                    const selectable = [
+                        'input[type="checkbox"]', 'input[type="radio"]',
+                        '[role="checkbox"]', '[role="radio"]', '[role="option"]',
+                        'button[aria-pressed]', '[data-qa*="specialization" i]'
+                    ].join(',');
+                    const direct = [...document.querySelectorAll(
+                        '[data-qa*="specialization" i], [name*="specialization" i]'
+                    )].filter(visible);
+                    const markers = [...document.querySelectorAll('h1,h2,h3,h4,legend,label,span,p')]
+                        .filter((node) => {
+                            const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+                            return visible(node) && text.length <= 120 && /специализац/i.test(text);
+                        });
+                    const roots = [...direct];
+                    for (const marker of markers) {
+                        let root = marker;
+                        for (let depth = 0; root && depth < 5; depth += 1, root = root.parentElement) {
+                            if (root.querySelector?.(selectable)) {
+                                roots.push(root);
+                                break;
+                            }
+                        }
+                    }
+                    const nodes = [...new Set(roots.flatMap((root) =>
+                        root.matches?.(selectable) ? [root] : [...root.querySelectorAll(selectable)]
+                    ))].filter(visible);
+                    const choices = [];
+                    for (const node of nodes) {
+                        const control = node.matches('input') ? node :
+                            node.querySelector?.('input[type="checkbox"],input[type="radio"]') || node;
+                        const ownLabel = node.getAttribute('aria-label') ||
+                            control.getAttribute?.('aria-label') || '';
+                        const htmlLabel = control.labels?.[0]?.innerText ||
+                            control.closest?.('label')?.innerText || '';
+                        const label = (ownLabel || htmlLabel || node.innerText || node.textContent || '')
+                            .replace(/\s+/g, ' ').trim();
+                        if (!label || label.length > 200 ||
+                            /^(?:продолжить|далее|сохранить)/i.test(label)) continue;
+                        const selected = Boolean(control.checked) ||
+                            ['aria-checked', 'aria-selected', 'aria-pressed'].some((name) =>
+                                node.getAttribute(name) === 'true' || control.getAttribute?.(name) === 'true'
+                            ) || node.getAttribute('data-state') === 'checked';
+                        if (!choices.some((item) => item.label === label)) choices.push({label, selected});
+                    }
+                    return {
+                        section_present: direct.length > 0 || markers.length > 0,
+                        choices: choices.slice(0, 30)
+                    };
+                }"""
+            )
+        )
+    except Exception:
+        return {"section_present": False, "choices": []}
+
+
+async def _click_named_choice(page: Page, label: str) -> bool:
+    for role in ("checkbox", "radio", "option", "button"):
+        choice = _first_visible(page.get_by_role(role, name=label, exact=True))
+        if await _visible(choice):
+            await human_click(page, choice)
+            return True
+    choice = _first_visible(page.get_by_text(label, exact=True))
+    if await _visible(choice):
+        await human_click(page, choice)
+        return True
+    return False
+
+
+async def _prepare_profession_specializations(
+    page: Page,
+    resume_title: str,
+    requested: list[str],
+) -> dict[str, Any] | None:
+    state = await _profession_specialization_state(page)
+    if not state.get("section_present"):
+        return None
+    choices = list(state.get("choices") or [])
+    if any(bool(item.get("selected")) for item in choices):
+        return None
+
+    normalized = {
+        re.sub(r"\s+", " ", str(item.get("label") or "")).strip().casefold(): item
+        for item in choices
+        if str(item.get("label") or "").strip()
+    }
+    desired = [value for value in requested if value.strip()]
+    source = "draft"
+    if not desired and resume_title.strip():
+        desired = [resume_title]
+        source = "resume_title"
+
+    selected = 0
+    missing: list[str] = []
+    for value in desired:
+        item = normalized.get(re.sub(r"\s+", " ", value).strip().casefold())
+        if not item or not await _click_named_choice(page, str(item["label"])):
+            missing.append(value)
+            continue
+        selected += 1
+
+    if selected and not missing:
+        logger.info(
+            "HH_RESUME event=profession_specialization_selected source=%s count=%s path=%s",
+            source,
+            selected,
+            _safe_page_path(page),
+        )
+        return None
+
+    diagnostic = await _resume_screen_diagnostic(page)
+    logger.warning(
+        "HH_RESUME event=profession_specialization_required requested_count=%s "
+        "available_count=%s path=%s wizard=%s network=%s",
+        len(desired),
+        len(choices),
+        diagnostic["path"],
+        diagnostic["wizard"],
+        diagnostic["network"],
+    )
+    return {
+        "status": "NEEDS_INPUT",
+        "code": "SPECIALIZATION_NOT_FOUND" if missing and requested else "SPECIALIZATION_REQUIRED",
+        "stage": "PROFESSION",
+        "message": (
+            "Сохранённая специализация не найдена на hh.ru. Выберите актуальную специализацию в черновике."
+            if missing and requested
+            else "hh.ru требует специализацию. Укажите её на шаге «Профессия» в черновике."
+        ),
+        "required_action": "EDIT_DRAFT",
+        "specialization_options": [str(item.get("label") or "") for item in choices],
     }
 
 
@@ -816,6 +1141,7 @@ class HHResumeManager(HHAccountClient):
         visited_screens: list[str] = []
         current_stage = "OPEN"
         try:
+            _install_resume_network_diagnostics(page)
             await page.goto(start_url, wait_until="commit", timeout=30_000)
             page_ready = await _wait_for_resume_page_signal(page)
             gate = await _page_gate(page)
@@ -829,6 +1155,7 @@ class HHResumeManager(HHAccountClient):
                 }
             if not page_ready:
                 return await self._form_changed(page, "initial", visited_screens)
+            await _dismiss_hh_cookie_notice(page)
             experience_index = 0
             education_index = 0
             link_index = 0
@@ -839,6 +1166,7 @@ class HHResumeManager(HHAccountClient):
                 "recommendations": 0,
             }
             for _ in range(40):
+                await _dismiss_hh_cookie_notice(page)
                 gate = await _page_gate(page)
                 if gate:
                     return {
@@ -900,11 +1228,11 @@ class HHResumeManager(HHAccountClient):
                         if text.casefold() == profession_value.casefold()
                     ]
                     if id_indexes:
-                        await human_click(page, options.nth(id_indexes[0]))
+                        selected_option = options.nth(id_indexes[0])
                     elif exact_indexes:
-                        await human_click(page, options.nth(exact_indexes[0]))
+                        selected_option = options.nth(exact_indexes[0])
                     elif len(option_texts) == 1:
-                        await human_click(page, options.first)
+                        selected_option = options.first
                     else:
                         return {
                             "status": "NEEDS_ACTION",
@@ -913,12 +1241,28 @@ class HHResumeManager(HHAccountClient):
                             "message": "Профессия неоднозначна. Подтвердите вариант перед продолжением.",
                             "options": option_items[:20],
                         }
-                    for specialization in ((draft_data or {}).get("profession") or {}).get(
-                        "specializations"
-                    ) or []:
-                        choice = page.get_by_text(str(specialization), exact=True).first
-                        if await _visible(choice):
-                            await human_click(page, choice)
+                    if not await _select_and_confirm_profession_option(
+                        page, title_input, selected_option
+                    ):
+                        return {
+                            "status": "NEEDS_ACTION",
+                            "code": "PROFESSION_SELECTION_NOT_CONFIRMED",
+                            "stage": "PROFESSION",
+                            "message": (
+                                "hh.ru не подтвердил выбор профессии из подсказки. "
+                                "Черновик сохранён; повторите перенос."
+                            ),
+                            "required_action": "RETRY_PUBLICATION",
+                            "retryable": True,
+                        }
+                    profession_data = (draft_data or {}).get("profession") or {}
+                    specialization_failure = await _prepare_profession_specializations(
+                        page,
+                        resume.title,
+                        [str(value) for value in profession_data.get("specializations") or []],
+                    )
+                    if specialization_failure:
+                        return specialization_failure
                     if not await self._click_continue(
                         page, scope=title_input, stage="PROFESSION"
                     ):
@@ -1516,11 +1860,14 @@ class HHResumeManager(HHAccountClient):
     ) -> dict[str, Any]:
         diagnostic = await _resume_screen_diagnostic(page)
         logger.warning(
-            "Resume wizard form changed screen=%s path=%s frames=%s recognized=%s controls=%s",
+            "Resume wizard form changed screen=%s path=%s frames=%s recognized=%s "
+            "wizard=%s network=%s controls=%s",
             screen,
             diagnostic["path"],
             diagnostic["frames"],
             list(recognized_screens or []),
+            diagnostic["wizard"],
+            diagnostic["network"],
             diagnostic["controls"],
         )
         return {
@@ -1537,9 +1884,7 @@ class HHResumeManager(HHAccountClient):
 
     @staticmethod
     async def _form_failure(page: Page, stage: str, fallback: str) -> dict[str, Any]:
-        error_locator = page.locator(
-            '[aria-invalid="true"], [data-qa*="error" i], [role="alert"]'
-        )
+        error_locator = page.locator(_VALIDATION_SELECTOR)
         diagnostic = await _resume_screen_diagnostic(page)
         try:
             visible_errors = await error_locator.evaluate_all(
@@ -1571,12 +1916,14 @@ class HHResumeManager(HHAccountClient):
         ]
         logger.warning(
             "HH_RESUME event=step_failed stage=%s path=%s frames=%s "
-            "validation_count=%s validation_controls=%s controls=%s",
+            "validation_count=%s validation_controls=%s wizard=%s network=%s controls=%s",
             stage,
             diagnostic["path"],
             diagnostic["frames"],
             len(error_controls),
             error_controls,
+            diagnostic["wizard"],
+            diagnostic["network"],
             diagnostic["controls"],
         )
         return {
@@ -1609,10 +1956,12 @@ class HHResumeManager(HHAccountClient):
             diagnostic = await _resume_screen_diagnostic(page)
             logger.warning(
                 "HH_RESUME event=continue_control_missing stage=%s path=%s "
-                "frames=%s controls=%s",
+                "frames=%s wizard=%s network=%s controls=%s",
                 stage,
                 diagnostic["path"],
                 diagnostic["frames"],
+                diagnostic["wizard"],
+                diagnostic["network"],
                 diagnostic["controls"],
             )
             return False
@@ -1625,12 +1974,14 @@ class HHResumeManager(HHAccountClient):
             diagnostic = await _resume_screen_diagnostic(page)
             logger.warning(
                 "HH_RESUME event=continue_click_failed stage=%s operation=%s reason=%s "
-                "path=%s frames=%s controls=%s",
+                "path=%s frames=%s wizard=%s network=%s controls=%s",
                 stage,
                 exc.operation,
                 exc.reason,
                 diagnostic["path"],
                 diagnostic["frames"],
+                diagnostic["wizard"],
+                diagnostic["network"],
                 diagnostic["controls"],
             )
             return False
@@ -1665,10 +2016,12 @@ class HHResumeManager(HHAccountClient):
             diagnostic = await _resume_screen_diagnostic(page)
             logger.warning(
                 "HH_RESUME event=continue_no_transition stage=%s path=%s "
-                "frames=%s controls=%s",
+                "frames=%s wizard=%s network=%s controls=%s",
                 stage,
                 diagnostic["path"],
                 diagnostic["frames"],
+                diagnostic["wizard"],
+                diagnostic["network"],
                 diagnostic["controls"],
             )
             return False
@@ -1676,10 +2029,12 @@ class HHResumeManager(HHAccountClient):
             diagnostic = await _resume_screen_diagnostic(page)
             logger.warning(
                 "HH_RESUME event=continue_validation_error stage=%s path=%s "
-                "frames=%s controls=%s",
+                "frames=%s wizard=%s network=%s controls=%s",
                 stage,
                 diagnostic["path"],
                 diagnostic["frames"],
+                diagnostic["wizard"],
+                diagnostic["network"],
                 diagnostic["controls"],
             )
             return False
